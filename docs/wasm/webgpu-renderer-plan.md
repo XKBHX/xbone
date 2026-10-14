@@ -191,6 +191,15 @@ Phase 0 notes:
   and macOS as cross builds, where Meson's CMake probing doesn't work
   reliably. When Dawn comes from CMake on macOS, `meson.build` adds the
   `-framework` entries Meson drops from Dawn's link interface.
+- The prebuilt macOS archives are built without Tint's SPIR-V reader
+  (`TINT_BUILD_SPV_READER` follows `DAWN_ENABLE_VULKAN`), which the
+  GLSL → SPIR-V shader path needs. `scripts/build-dawn.py` builds the same
+  pinned revision from source with the reader enabled and installs it with
+  the same layout and `dawn.pc`, for example
+  `scripts/build-dawn.py --source build/dawn-src --output build/dawn-sdk-spv`,
+  then `meson configure -Dcmake_prefix_path=$PWD/build/dawn-sdk-spv` (or put
+  its `lib/pkgconfig` on `PKG_CONFIG_PATH`). A Release build takes about
+  15 minutes on an M1 Pro.
 - `webgpu/instance.c` creates the instance with `TimedWaitAny`, requests the
   adapter and device with `WGPUCallbackMode_WaitAnyOnly` futures, and logs
   the adapter and its features with a `[WebGPU]` prefix.
