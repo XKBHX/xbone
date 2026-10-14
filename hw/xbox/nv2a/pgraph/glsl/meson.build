@@ -7,3 +7,6 @@ specific_ss.add([files(
 	'vsh-ff.c',
 	'vsh-prog.c',
 	)])
+if libglslang.found()
+  specific_ss.add([libglslang, files('spirv.c')])
+endif

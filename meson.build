@@ -2416,7 +2416,7 @@ elif not get_option('webgpu').disabled()
   endif
 endif
 
-if vulkan.found()
+if vulkan.found() or (webgpu.found() and host_os != 'emscripten')
   libglslang = dependency('glslang', version: '>=15.0.0', required: false)
   if not libglslang.found()
     # FIXME: Get spirv-tools to enable opt.
@@ -2431,7 +2431,9 @@ if vulkan.found()
         ], include_directories: glslang_subpro.include_directories('glslang')
       )
   endif
+endif
 
+if vulkan.found()
   volk_opts = cmake.subproject_options()
   volk_opts.add_cmake_defines({'VOLK_STATIC_DEFINES': 'VK_NO_PROTOTYPES'})
   if host_os == 'windows'

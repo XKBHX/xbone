@@ -30,9 +30,9 @@
 #include "hw/xbox/nv2a/pgraph/surface.h"
 #include "hw/xbox/nv2a/pgraph/texture.h"
 #include "hw/xbox/nv2a/pgraph/glsl/shaders.h"
+#include "hw/xbox/nv2a/pgraph/glsl/spirv.h"
 
 #include <vulkan/vulkan.h>
-#include <glslang/Include/glslang_c_interface.h>
 #include <volk.h>
 #include <spirv_reflect.h>
 #include <vk_mem_alloc.h>
@@ -456,10 +456,6 @@ uint32_t pgraph_vk_get_memory_type(PGRAPHState *pg, uint32_t type_bits,
                                    VkMemoryPropertyFlags properties);
 
 // glsl.c
-void pgraph_vk_init_glsl_compiler(void);
-void pgraph_vk_finalize_glsl_compiler(void);
-GByteArray *pgraph_vk_compile_glsl_to_spv(glslang_stage_t stage,
-                                          const char *glsl_source);
 VkShaderModule pgraph_vk_create_shader_module_from_spv(PGRAPHVkState *r,
                                                        GByteArray *spv);
 ShaderModuleInfo *pgraph_vk_create_shader_module_from_glsl(
