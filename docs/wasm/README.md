@@ -17,8 +17,9 @@ manual under `docs/` (which only builds `.rst`).
 ## Current WASM status in this tree
 
 The tree inherits upstream QEMU's Emscripten host support and adds a native
-WebAssembly TCG backend. Nothing else xemu-specific (UI, NV2A renderer) has
-been ported yet.
+WebAssembly TCG backend. The xemu UI has not been ported yet. A WebGPU NV2A
+renderer is in progress natively (Dawn); see the status table in
+[webgpu-renderer-plan.md](webgpu-renderer-plan.md#implementation-status).
 
 What exists:
 
@@ -35,6 +36,10 @@ What exists:
   a WebAssembly module, with the soft-TLB fast path inline. `meson.build`
   selects it on `wasm32`; `--enable-tcg-interpreter` still selects TCI. See
   [tcg-wasm-backend.md](tcg-wasm-backend.md).
+- `hw/xbox/nv2a/pgraph/webgpu` is a skeleton WebGPU renderer
+  (`-Dwebgpu=enabled`). On Emscripten it builds against the `emdawnwebgpu`
+  port and is the only renderer offered. It creates a device but does not
+  draw yet.
 
 What blocks an xemu WASM build today:
 
@@ -44,6 +49,7 @@ What blocks an xemu WASM build today:
 - Both GPU renderers (`hw/xbox/nv2a/pgraph/gl`, `.../vk`) need desktop
   OpenGL. The Vulkan renderer still shows its frames through OpenGL by
   importing them with `GL_EXT_memory_object`.
+- `subprojects/dsp56300` rejects `host_os=emscripten` at configure time.
 - Guest CPU performance is not yet real time for a 733 MHz Pentium III. The
   wasm backend removes the interpreter, but still compiles one module per TB
   and returns to C between TBs. See [cpu-realtime.md](cpu-realtime.md).

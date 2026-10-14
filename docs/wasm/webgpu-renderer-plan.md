@@ -168,6 +168,46 @@ How the `PGRAPHRenderer` ops map to the Vulkan implementation they model:
 
 Each phase ends with a demonstrable exit criterion.
 
+### Implementation status
+
+| Phase | Status |
+| --- | --- |
+| 0. Groundwork | Done. Natively on macOS arm64 (Dawn Metal backend, Apple M1 Pro), `display.renderer = "WEBGPU"` creates a device and boots with a black screen and no asserts. Not yet run on Linux or Windows. |
+| 1. Native bring-up | Not started. |
+| 2. Feature completeness | Not started. |
+| 3. WGSL generator | Not started. |
+| 4. Performance | Not started. |
+| 5. WebGPU UI and browser | Not started. |
+
+Phase 0 notes:
+
+- Dawn is pinned to `v20261013.193955` in `scripts/download-dawn.py`
+  (SHA-256 per archive). CI installs it on Linux x86_64, Windows x86_64 and
+  macOS x86_64/arm64 and builds with `--enable-webgpu`. Meson finds Dawn
+  through `pkg-config` (`dawn`), then CMake (`Dawn`, target
+  `dawn::webgpu_dawn`), then `webgpu_dawn`. On macOS, Meson drops the
+  `-framework` entries from Dawn's CMake link interface; linking needs
+  [#6](https://github.com/XKBHX/xbone/pull/6), which adds them back through
+  `appleframeworks`.
+- `webgpu/instance.c` creates the instance with `TimedWaitAny`, requests the
+  adapter and device with `WGPUCallbackMode_WaitAnyOnly` futures, and logs
+  the adapter and its features with a `[WebGPU]` prefix.
+- The generator option is now `PgraphGlslTarget target`
+  (`PGRAPH_GLSL_TARGET_GL`, `_VULKAN`, `_WEBGPU`). For WebGPU, uniform
+  blocks use `layout(set = 0, binding = N)`. Push constants are opt-in
+  (`use_push_constants_for_uniform_attrs`) and the generator never emits
+  `gl_ClipDistance`, so neither needs extra gating. Texture samplers still
+  use `layout(binding = N)` with the implicit set 0; the phase 1 bind-group
+  layout decides whether textures move to their own set.
+- glslang now lives in `glsl/spirv.c` (`pgraph_glsl_compile_to_spirv`),
+  shared by Vulkan and WebGPU. Meson looks for glslang when Vulkan is found
+  or when WebGPU is found outside Emscripten. The WebGPU target compiles for
+  the Vulkan 1.1 / SPIR-V 1.3 environment that Tint accepts; Vulkan keeps
+  Vulkan 1.3 / SPIR-V 1.6.
+- The Emscripten configure step still stops at
+  `subprojects/dsp56300/meson.build` (`Unsupported host OS: emscripten`).
+  This is outside the renderer and tracked with the phase 5 prerequisites.
+
 ### Phase 0: groundwork and refactors (small, landable on its own)
 
 1. **Config and build plumbing.**
