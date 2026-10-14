@@ -72,9 +72,9 @@ jobs:
     - name: Install pinned Dawn SDK
       if: ${{ matrix.arch == 'x86_64' }}
       run: |
-        python3 src/scripts/download-dawn.py \
-          --platform linux --arch x86_64 --output "$GITHUB_WORKSPACE/dawn"
-        echo "CMAKE_PREFIX_PATH=$GITHUB_WORKSPACE/dawn" >> "$GITHUB_ENV"
+        pc_dir=$(python3 src/scripts/download-dawn.py \
+          --platform linux --arch x86_64 --output "$GITHUB_WORKSPACE/dawn" | tail -n1)
+        echo "PKG_CONFIG_PATH=$pc_dir" >> "$GITHUB_ENV"
         echo "XEMU_BUILD_OPTIONS=$XEMU_BUILD_OPTIONS --enable-webgpu" >> "$GITHUB_ENV"
     - name: Create debian changelog
       run: |

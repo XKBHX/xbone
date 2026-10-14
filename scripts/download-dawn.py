@@ -25,10 +25,6 @@ ARTIFACTS = {
         f"Dawn-{DAWN_REVISION}-macos-latest-Release.tar.gz",
         "84b9c613db994933f53764258b93d3b5a179538ec02d551270185e712b0f42de",
     ),
-    ("windows", "x86_64"): (
-        f"Dawn-{DAWN_REVISION}-windows-latest-Release.tar.gz",
-        "5e6a5c6f05069bec6f77cf326e47af21a138bfaf283a8ea79602466b7c2bcea7",
-    ),
 }
 
 
@@ -71,12 +67,51 @@ def extract(path: Path, destination: Path) -> None:
                 archive.extract(member, destination)
 
 
+PLATFORM_LIBS = {
+    "linux": "-ldl -lrt -lpthread",
+    "macos": " ".join(
+        f"-framework {framework}"
+        for framework in (
+            "CoreFoundation",
+            "Foundation",
+            "IOSurface",
+            "QuartzCore",
+            "Cocoa",
+            "IOKit",
+            "Metal",
+        )
+    ),
+}
+
+
+def write_pkgconfig(destination: Path, platform: str) -> Path:
+    prefix = destination.resolve()
+    libdir = next(
+        d for d in (prefix / "lib", prefix / "lib64")
+        if (d / "libwebgpu_dawn.a").is_file()
+    )
+    pkgconfig = libdir / "pkgconfig"
+    pkgconfig.mkdir(exist_ok=True)
+    (pkgconfig / "dawn.pc").write_text(
+        f"prefix={prefix}\n"
+        f"libdir={libdir}\n"
+        "includedir=${prefix}/include\n"
+        "\n"
+        "Name: dawn\n"
+        "Description: Dawn WebGPU implementation\n"
+        f"Version: {DAWN_VERSION.lstrip('v')}\n"
+        "Cflags: -I${includedir}\n"
+        f"Libs: -L${{libdir}} -lwebgpu_dawn {PLATFORM_LIBS[platform]}\n"
+    )
+    return pkgconfig
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Download the pinned Dawn SDK used by xemu"
     )
     parser.add_argument(
-        "--platform", choices=["linux", "macos", "windows"], required=True
+        "--platform", choices=["linux", "macos"], required=True
     )
     parser.add_argument("--arch", choices=["x86_64", "arm64"], required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -97,6 +132,7 @@ def main() -> None:
         download(url, archive)
         verify(archive, checksum)
         extract(archive, args.output)
+    print(write_pkgconfig(args.output, args.platform))
 
 
 if __name__ == "__main__":

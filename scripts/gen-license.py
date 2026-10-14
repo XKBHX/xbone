@@ -333,7 +333,8 @@ LIBS = [
         "https://dawn.googlesource.com/dawn",
         bsd_3clause,
         "https://dawn.googlesource.com/dawn/+/refs/heads/main/LICENSE?format=TEXT",
-        ships_static=all_platforms,
+        ships_static={macos, linux},
+        platform={macos, linux},
         version="v20261013.193955",
     ),
     Lib(
