@@ -69,6 +69,13 @@ jobs:
       run: |
         mkdir src
         tar -xf xemu-${{ inputs.pkg_version }}.tar.zst -C src --strip-components=2
+    - name: Install pinned Dawn SDK
+      if: ${{ matrix.arch == 'x86_64' }}
+      run: |
+        python3 src/scripts/download-dawn.py \
+          --platform linux --arch x86_64 --output "$GITHUB_WORKSPACE/dawn"
+        echo "CMAKE_PREFIX_PATH=$GITHUB_WORKSPACE/dawn" >> "$GITHUB_ENV"
+        echo "XEMU_BUILD_OPTIONS=$XEMU_BUILD_OPTIONS --enable-webgpu" >> "$GITHUB_ENV"
     - name: Create debian changelog
       run: |
         pushd src

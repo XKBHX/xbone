@@ -742,9 +742,18 @@ void MainMenuDisplayView::Draw()
     SectionTitle("Renderer");
     ChevronCombo("Backend", &g_config.display.renderer,
                  "Null\0"
+#ifdef CONFIG_OPENGL
                  "OpenGL\0"
+#elif defined(CONFIG_VULKAN) || defined(CONFIG_WEBGPU)
+                 "OpenGL (Unavailable)\0"
+#endif
 #ifdef CONFIG_VULKAN
                  "Vulkan\0"
+#elif defined(CONFIG_WEBGPU)
+                 "Vulkan (Unavailable)\0"
+#endif
+#ifdef CONFIG_WEBGPU
+                 "WebGPU\0"
 #endif
                  ,
                  "Select desired renderer implementation");

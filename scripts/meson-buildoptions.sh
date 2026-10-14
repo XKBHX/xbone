@@ -228,6 +228,7 @@ meson_options_help() {
   printf "%s\n" '  vpc             vpc image format support'
   printf "%s\n" '  vte             vte support for the gtk UI'
   printf "%s\n" '  vvfat           vvfat image format support'
+  printf "%s\n" '  webgpu          WebGPU support through Dawn'
   printf "%s\n" '  werror          Treat warnings as errors'
   printf "%s\n" '  whpx            WHPX acceleration support'
   printf "%s\n" '  xen             Xen backend support'
@@ -582,6 +583,8 @@ _meson_option_parse() {
     --vtune=*) quote_sh "-Dvtune=$2" ;;
     --enable-vvfat) printf "%s" -Dvvfat=enabled ;;
     --disable-vvfat) printf "%s" -Dvvfat=disabled ;;
+    --enable-webgpu) printf "%s" -Dwebgpu=enabled ;;
+    --disable-webgpu) printf "%s" -Dwebgpu=disabled ;;
     --enable-werror) printf "%s" -Dwerror=true ;;
     --disable-werror) printf "%s" -Dwerror=false ;;
     --enable-whpx) printf "%s" -Dwhpx=enabled ;;

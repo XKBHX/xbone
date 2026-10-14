@@ -95,7 +95,7 @@ void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state);
 DECL_UNIFORM_TYPES(PshUniform, PSH_UNIFORM_DECL_X)
 
 typedef struct GenPshGlslOptions {
-    bool vulkan;
+    PgraphGlslTarget target;
     int ubo_binding;
     int tex_binding;
 } GenPshGlslOptions;

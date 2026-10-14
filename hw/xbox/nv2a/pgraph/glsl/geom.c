@@ -111,6 +111,8 @@ bool pgraph_glsl_need_geom(const GeomState *state)
 
 MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts)
 {
+    bool spirv = pgraph_glsl_target_uses_spirv(opts.target);
+
     /* FIXME: Missing support for 2-sided-poly mode */
     assert(state->polygon_front_mode == state->polygon_back_mode);
     enum ShaderPolygonMode polygon_mode = state->polygon_front_mode;
@@ -304,10 +306,10 @@ MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts)
                          "\n"
                          "#define v_vtxPos v_vtxPos0\n"
                          "\n",
-                         opts.vulkan ? 450 : 400, layout_in, layout_out);
-    pgraph_glsl_get_vtx_header(output, opts.vulkan, state->smooth_shading, true,
+                         spirv ? 450 : 400, layout_in, layout_out);
+    pgraph_glsl_get_vtx_header(output, spirv, state->smooth_shading, true,
                                true, true);
-    pgraph_glsl_get_vtx_header(output, opts.vulkan, state->smooth_shading,
+    pgraph_glsl_get_vtx_header(output, spirv, state->smooth_shading,
                                false, false, false);
 
     char vertex_order_buf[80];

@@ -161,7 +161,8 @@ void pgraph_glsl_set_vsh_state(PGRAPHState *pg, VshState *vsh)
 MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
 {
     MString *uniforms = mstring_new();
-    const char *u = opts.vulkan ? "" : "uniform ";
+    bool spirv = pgraph_glsl_target_uses_spirv(opts.target);
+    const char *u = spirv ? "" : "uniform ";
     for (int i = 0; i < ARRAY_SIZE(VshUniformInfo); i++) {
         const UniformInfo *info = &VshUniformInfo[i];
         const char *type_str = uniform_element_type_to_str[info->type];
@@ -232,7 +233,7 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
         "  return trunc(pos * 16.0f) / 16.0f;\n"
         "}\n");
 
-    pgraph_glsl_get_vtx_header(header, opts.vulkan, state->smooth_shading,
+    pgraph_glsl_get_vtx_header(header, spirv, state->smooth_shading,
                                false, opts.prefix_outputs, false);
 
     if (opts.prefix_outputs) {
@@ -431,7 +432,7 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
         );
     }
 
-    if (opts.vulkan) {
+    if (spirv) {
         mstring_append(body,
                    "  gl_Position = oPos;\n"
         );
@@ -445,9 +446,9 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
 
     /* Return combined header + source */
     MString *output =
-        mstring_from_fmt("#version %d\n\n", opts.vulkan ? 450 : 400);
+        mstring_from_fmt("#version %d\n\n", spirv ? 450 : 400);
 
-    if (opts.vulkan) {
+    if (spirv) {
         // FIXME: Optimize uniforms
         if (num_uniform_attrs > 0 &&
             opts.use_push_constants_for_uniform_attrs) {
@@ -459,10 +460,12 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
         }
         mstring_append_fmt(
             output,
-            "layout(binding = %d, std140) uniform VshUniforms {\n"
-            "%s"
-            "};\n\n",
-            opts.ubo_binding, mstring_get_str(uniforms));
+            opts.target == PGRAPH_GLSL_TARGET_WEBGPU
+                ? "layout(set = 0, binding = %d, std140) uniform VshUniforms {\n"
+                : "layout(binding = %d, std140) uniform VshUniforms {\n",
+            opts.ubo_binding);
+        mstring_append(output, mstring_get_str(uniforms));
+        mstring_append(output, "};\n\n");
     } else {
         mstring_append(
             output, mstring_get_str(uniforms));
