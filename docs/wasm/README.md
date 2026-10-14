@@ -38,9 +38,11 @@ What exists:
   [tcg-wasm-backend.md](tcg-wasm-backend.md).
 - `hw/xbox/nv2a/pgraph/webgpu` is an early WebGPU renderer
   (`-Dwebgpu=enabled`). On Emscripten it builds against the `emdawnwebgpu`
-  port and is the only renderer offered. It has the surface cache, clears,
-  image blits and the download-to-RAM display path, but does not draw
-  geometry yet.
+  port and is the only renderer offered. Natively it has the surface
+  cache, clears, image blits, the draw path, textures and the
+  download-to-RAM display path, and it renders the dashboard. It still
+  compiles shaders through SPIR-V, so it can't draw under Emscripten until
+  the WGSL generator exists.
 
 What blocks an xemu WASM build today:
 

@@ -21,6 +21,10 @@ static void pgraph_wgpu_flush(NV2AState *d)
 
     pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_FLUSH, false);
     pgraph_wgpu_surface_flush(d);
+    pgraph_wgpu_mark_textures_possibly_dirty(d, 0, memory_region_size(d->vram));
+    for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
+        pg->texture_dirty[i] = true;
+    }
 
     qatomic_set(&pg->flush_pending, false);
     qemu_event_set(&pg->flush_complete);

@@ -13,11 +13,13 @@
 #define HW_XBOX_NV2A_PGRAPH_WEBGPU_RENDERER_H
 
 #include "qemu/osdep.h"
+#include "qemu/lru.h"
 #include "qemu/queue.h"
 #include "qemu/thread.h"
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "hw/xbox/nv2a/nv2a_regs.h"
 #include "hw/xbox/nv2a/pgraph/surface.h"
+#include "hw/xbox/nv2a/pgraph/texture.h"
 #include "hw/xbox/nv2a/pgraph/glsl/shaders.h"
 
 #include <webgpu/webgpu.h>
@@ -35,7 +37,6 @@ typedef struct WgpuTextureLayout {
     PshTextureType types[NV2A_MAX_TEXTURES];
     WGPUBindGroupLayout bind_group_layout;
     WGPUPipelineLayout pipeline_layout;
-    WGPUBindGroup dummy_bind_group;
 } WgpuTextureLayout;
 
 typedef struct ShaderBinding {
@@ -129,6 +130,28 @@ typedef struct SurfaceBinding {
     bool initialized;
 } SurfaceBinding;
 
+typedef struct TextureKey {
+    TextureShape state;
+    hwaddr texture_vram_offset;
+    hwaddr texture_length;
+    hwaddr palette_vram_offset;
+    hwaddr palette_length;
+    uint32_t filter;
+    uint32_t address;
+    uint32_t max_anisotropy;
+} TextureKey;
+
+typedef struct TextureBinding {
+    LruNode node;
+    TextureKey key;
+    PshTextureType type;
+    WGPUTexture texture;
+    WGPUTextureView view;
+    WGPUSampler sampler;
+    uint64_t hash;
+    bool possibly_dirty;
+} TextureBinding;
+
 typedef struct ClearPipelineKey {
     WGPUTextureFormat color_format;
     WGPUTextureFormat zeta_format;
@@ -173,6 +196,7 @@ typedef struct PGRAPHWgpuState {
     WGPURenderPipeline depth_upload_pipeline;
 
     bool depth_clip_control;
+    bool float32_filterable;
 
     WgpuStreamBuffer stream_buffers[WGPU_STREAM__COUNT];
 
@@ -192,6 +216,13 @@ typedef struct PGRAPHWgpuState {
     WGPUTexture dummy_textures[PSH_TEXTURE_TYPE_CUBE + 1];
     WGPUTextureView dummy_texture_views[PSH_TEXTURE_TYPE_CUBE + 1];
     WGPUSampler dummy_sampler;
+
+    Lru texture_cache;
+    TextureBinding *texture_cache_entries;
+    TextureBinding *texture_bindings[NV2A_MAX_TEXTURES];
+    bool texture_bindings_changed;
+    WGPUBindGroup texture_bind_group;
+    const WgpuTextureLayout *texture_bind_group_layout;
 
     GHashTable *pipeline_cache; // PipelineKey -> WGPURenderPipeline
     WGPUTexture scratch_zeta;
@@ -248,9 +279,11 @@ void pgraph_wgpu_update_uniforms(PGRAPHState *pg, bool *vsh_changed,
 // texture.c
 void pgraph_wgpu_init_textures(PGRAPHState *pg);
 void pgraph_wgpu_finalize_textures(PGRAPHState *pg);
-WGPUBindGroup pgraph_wgpu_create_dummy_texture_bind_group(
-    PGRAPHWgpuState *r, WGPUBindGroupLayout layout,
-    const PshTextureType types[NV2A_MAX_TEXTURES]);
+void pgraph_wgpu_bind_textures(NV2AState *d);
+WGPUBindGroup pgraph_wgpu_get_texture_bind_group(PGRAPHWgpuState *r,
+                                                 const WgpuTextureLayout *l);
+void pgraph_wgpu_mark_textures_possibly_dirty(NV2AState *d, hwaddr addr,
+                                              hwaddr size);
 
 // vertex.c
 bool pgraph_wgpu_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
@@ -282,8 +315,7 @@ SurfaceBinding *pgraph_wgpu_surface_get_within(NV2AState *d, hwaddr addr);
 void pgraph_wgpu_wait_for_surface_download(SurfaceBinding *surface);
 void pgraph_wgpu_download_dirty_surfaces(NV2AState *d);
 void pgraph_wgpu_download_surfaces_in_range_if_dirty(PGRAPHState *pg,
-                                                     hwaddr start,
-                                                     hwaddr size);
+                                                     hwaddr start, hwaddr size);
 void pgraph_wgpu_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
                                      bool force);
 void pgraph_wgpu_surface_update(NV2AState *d, bool upload, bool color_write,

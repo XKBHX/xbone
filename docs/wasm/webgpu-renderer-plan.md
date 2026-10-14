@@ -173,7 +173,7 @@ Each phase ends with a demonstrable exit criterion.
 | Phase | Status |
 | --- | --- |
 | 0. Groundwork | Done. Natively on macOS arm64 (Dawn Metal backend, Apple M1 Pro), `display.renderer = "WEBGPU"` creates a device and boots with a black screen and no asserts. Not yet run on Linux or Windows. |
-| 1. Native bring-up | In progress. Steps 1 (command lifecycle), 2 (surface cache), 3 (clears), 4 (draw path) and 6 (display) are done, plus the NV09F image blit. The dashboard boots on macOS arm64 and draws its geometry with no WebGPU validation errors. Every texture samples a zeroed dummy, so textured geometry is black. Step 4 needs a Dawn built with the SPIR-V reader (see the step 4 notes). Step 5 (textures) is not started. |
+| 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 needs a Dawn built with the SPIR-V reader (see the step 4 notes). |
 | 2. Feature completeness | Not started. |
 | 3. WGSL generator | Not started. |
 | 4. Performance | Not started. |
@@ -318,6 +318,55 @@ Phase 1 notes (step 4, draw path):
   draws are skipped). Constant-alpha blend factors use the blend constant
   with alpha in every channel. Emscripten can't use this path until the
   phase 3 WGSL generator exists.
+
+Phase 1 notes (step 5, textures):
+
+- `webgpu/texture.c` is a port of `vk/texture.c`. It has the same
+  1024-entry LRU cache, keyed on the texture shape, address, length,
+  palette, filter, address mode and anisotropy. It uses the same
+  `DIRTY_MEMORY_NV2A_TEX` page tracking with content hashing. The flush op
+  marks every cached texture as possibly dirty, as in Vulkan.
+- Decoding runs on the CPU. The shared decoders in `pgraph/texture.c`
+  handle palette, YUV and `R6G5B5`, `s3tc_decompress_*` handles DXT1/3/5,
+  and `unswizzle_rect`/`unswizzle_box` handle swizzled 2D, cube and 3D
+  textures. Then `kelvin_color_format_wgpu_map` turns every format into a
+  core WebGPU format:
+  - `A8R8G8B8`, `I8`, `A8B8G8R8`, DXT and YUV are copied unchanged into
+    `bgra8unorm` or `rgba8unorm`. The X8Y24 depth formats are copied
+    unchanged into `r32uint`.
+  - Every other colour format (the 16-bit packed formats, `Y8`, `A8`,
+    `G8B8`, `R8B8` and the reordered 32-bit formats) is expanded to
+    `rgba8unorm`. `R6G5B5` becomes `rgba8snorm`.
+  - Core WebGPU has no view swizzle, so each format's component mapping
+    (the `VkComponentMapping` in `vk/constants.h`) is applied while
+    decoding. This includes the depth flag channels that the shadow-map
+    code reads.
+  - `Y16` and the Y16 depth formats become `rgba32float` when
+    `float32-filterable` is available (requested at device creation), and
+    `rgba16float` otherwise. Norm16 formats aren't used, because Dawn only
+    makes them filterable with a Dawn-specific feature.
+- Uploads use `wgpuQueueWriteTexture`, one call per layer and mip level.
+  Queue writes run before commands that haven't been submitted yet, so when
+  a texture's contents change it gets a new `WGPUTexture`. The old one is
+  only released, never written. Draws don't stall.
+- Each cache entry owns its sampler. Address modes map directly, except
+  `BORDER` and `CLAMP_OGL`, which clamp to edge. Anisotropy is only
+  enabled when every filter is linear, as WebGPU requires. X8Y24 textures
+  use a non-filtering sampler.
+- The texture bind group (group 1) is rebuilt only when the bound textures
+  or the shader's texture layout change. A stage is bound to the dummy of
+  the declared type when its texture is disabled, or when its type
+  (2D, 2D uint, 3D, cube) doesn't match what the shader declares.
+- Render targets reach textures through guest RAM: any dirty surface in
+  the texture's range is downloaded first, as Vulkan does for incompatible
+  surfaces. Sampling surfaces directly is phase 2 step 5.
+- Border textures are allocated at the doubled border size that the shader's
+  border adjustment expects.
+- Not yet handled: border colour, LOD bias, the signed-channel filter bits
+  (also unimplemented in Vulkan) and convolution filters. They belong to
+  phase 2 step 3. Only the dashboard's formats have been checked on screen.
+  The depth, `Y16`, `R6G5B5`, cube and 3D paths compile, but nothing has
+  exercised them yet.
 
 ### Phase 0: groundwork and refactors (small, landable on its own)
 
