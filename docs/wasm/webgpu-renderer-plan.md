@@ -173,7 +173,7 @@ Each phase ends with a demonstrable exit criterion.
 | Phase | Status |
 | --- | --- |
 | 0. Groundwork | Done. Natively on macOS arm64 (Dawn Metal backend, Apple M1 Pro), `display.renderer = "WEBGPU"` creates a device and boots with a black screen and no asserts. Not yet run on Linux or Windows. |
-| 1. Native bring-up | Not started. |
+| 1. Native bring-up | In progress. Steps 1 (command lifecycle), 2 (surface cache), 3 (clears) and 6 (display) are done, plus the NV09F image blit. The dashboard boots on macOS arm64 with clears and surface readback working and no WebGPU validation errors, but geometry isn't drawn yet, so the screen stays black. Step 4 (draw path) is blocked on the shader-path finding below. Step 5 (textures) is not started. |
 | 2. Feature completeness | Not started. |
 | 3. WGSL generator | Not started. |
 | 4. Performance | Not started. |
@@ -209,6 +209,58 @@ Phase 0 notes:
 - The Emscripten configure step still stops at
   `subprojects/dsp56300/meson.build` (`Unsupported host OS: emscripten`).
   This is outside the renderer and tracked with the phase 5 prerequisites.
+
+Phase 1 notes (steps 1, 2, 3 and 6):
+
+- `webgpu/command.c` keeps one open `WGPUCommandEncoder` per batch, plus
+  at most one render pass. `pgraph_wgpu_finish(reason, wait)` ends the pass,
+  submits, and can wait on `wgpuQueueOnSubmittedWorkDone`. `flip_stall`
+  waits; every other reason only submits. `wgpuQueueWriteTexture` runs
+  before any commands that haven't been submitted yet, so every upload
+  submits the open encoder first. Surface textures are only released, never
+  destroyed, because an unsubmitted encoder may still reference them.
+- The device now requires `depth32float-stencil8` (the adapter's feature
+  list is checked first). Uncaptured errors and device loss are logged with
+  the `[WebGPU]` prefix.
+- `webgpu/surface.c` is a port of `vk/surface.c`: the same binding,
+  eviction, expiry and CPU-access-callback logic. Format conversion runs on
+  the CPU for now:
+  - `A8R8G8B8`/`X8R8G8B8` use `bgra8unorm`, `B8` uses `r8unorm` and `G8B8`
+    uses `rg8unorm`. These are byte-identical copies.
+  - `R5G6B5` and `X1R5G5B5` are expanded to `rgba8unorm`. On download they
+    are rounded back down, and alpha becomes the X1 bit at ≥ 128, as with
+    Vulkan's `A1R5G5B5`.
+  - `Z24S8` and `Z16` both use `depth32float-stencil8`. Z24 uses the same
+    conversion as `vk/surface-compute.c` (pack `int(d * 0xffffff)`; unpack
+    `z / 2^24` plus one ULP). Z16 uses `z / 65535` and round-to-nearest.
+  - Downloads copy the colour, or the depth and stencil aspects separately,
+    into one growable `MapRead` buffer (rows aligned to 256 bytes), then
+    wait with `wgpuInstanceWaitAny`.
+  - Depth aspects can't be copy destinations, so a depth upload writes an
+    `r32float` staging texture and draws a fullscreen triangle that outputs
+    `@builtin(frag_depth)`. Stencil is written directly through a
+    stencil-aspect `wgpuQueueWriteTexture`.
+  - The compute pack/unpack pass described in section 3.4 moves to phase 4.
+- Clears always use a fullscreen-triangle draw: blend constant colour, the
+  channel write mask, the viewport depth range set to the clear depth, and
+  stencil `Replace` with the reference value. The scissor is the clear
+  rectangle. Pipelines are cached by format, write mask and depth/stencil
+  write. A load-op clear for full-surface clears is a later optimisation.
+- `blit.c` is the CPU-side NV09F blit from `vk/blit.c`, unchanged.
+  `get_framebuffer_surface` waits for the scanout surface to download and
+  returns `0`, so the UI shows guest RAM through the VGA path.
+  Resolution scaling is fixed at 1×.
+- `draw_begin` binds surfaces (so they are created and uploaded), but
+  `flush_draw` doesn't record anything yet, and `draw_end` doesn't mark
+  surfaces dirty.
+- **Shader-path finding (blocks step 4).** The prebuilt Dawn macOS
+  archives for `v20261013.193955` are built without Tint's SPIR-V reader.
+  The library contains the string "Tint SPIR-V reader is not enabled", and
+  the bundled `tint` CLI rejects SPIR-V input. The Linux archive does include
+  the reader. So the GLSL → SPIR-V → `WGPUShaderSourceSPIRV` bring-up path
+  can't run on macOS with the pinned prebuilt. The alternatives are
+  building Dawn from source with `TINT_BUILD_SPV_READER` for development, or
+  moving the phase 3 WGSL generator ahead of the draw path.
 
 ### Phase 0: groundwork and refactors (small, landable on its own)
 

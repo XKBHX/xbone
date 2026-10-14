@@ -36,10 +36,11 @@ What exists:
   a WebAssembly module, with the soft-TLB fast path inline. `meson.build`
   selects it on `wasm32`; `--enable-tcg-interpreter` still selects TCI. See
   [tcg-wasm-backend.md](tcg-wasm-backend.md).
-- `hw/xbox/nv2a/pgraph/webgpu` is a skeleton WebGPU renderer
+- `hw/xbox/nv2a/pgraph/webgpu` is an early WebGPU renderer
   (`-Dwebgpu=enabled`). On Emscripten it builds against the `emdawnwebgpu`
-  port and is the only renderer offered. It creates a device but does not
-  draw yet.
+  port and is the only renderer offered. It has the surface cache, clears,
+  image blits and the download-to-RAM display path, but does not draw
+  geometry yet.
 
 What blocks an xemu WASM build today:
 

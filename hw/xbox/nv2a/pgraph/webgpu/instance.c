@@ -80,6 +80,28 @@ static WGPUAdapter request_adapter(WGPUInstance instance, Error **errp)
     return state.adapter;
 }
 
+static void uncaptured_error_callback(WGPUDevice const *device,
+                                      WGPUErrorType type,
+                                      WGPUStringView message, void *userdata1,
+                                      void *userdata2)
+{
+    fprintf(stderr, "[WebGPU] Error (%d): %.*s\n", type, (int)message.length,
+            message.data);
+}
+
+static void device_lost_callback(WGPUDevice const *device,
+                                 WGPUDeviceLostReason reason,
+                                 WGPUStringView message, void *userdata1,
+                                 void *userdata2)
+{
+    if (reason == WGPUDeviceLostReason_Destroyed ||
+        reason == WGPUDeviceLostReason_CallbackCancelled) {
+        return;
+    }
+    fprintf(stderr, "[WebGPU] Device lost (%d): %.*s\n", reason,
+            (int)message.length, message.data);
+}
+
 static WGPUDevice request_device(WGPUInstance instance, WGPUAdapter adapter,
                                  Error **errp)
 {
@@ -88,6 +110,22 @@ static WGPUDevice request_device(WGPUInstance instance, WGPUAdapter adapter,
     WGPURequestDeviceCallbackInfo callback =
         WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
     WGPUFutureWaitInfo wait_info = WGPU_FUTURE_WAIT_INFO_INIT;
+    WGPUFeatureName required_features[] = {
+        WGPUFeatureName_Depth32FloatStencil8,
+    };
+
+    for (size_t i = 0; i < ARRAY_SIZE(required_features); i++) {
+        if (!wgpuAdapterHasFeature(adapter, required_features[i])) {
+            error_setg(errp, "WebGPU adapter lacks required feature %d",
+                       required_features[i]);
+            return NULL;
+        }
+    }
+    descriptor.requiredFeatureCount = ARRAY_SIZE(required_features);
+    descriptor.requiredFeatures = required_features;
+    descriptor.uncapturedErrorCallbackInfo.callback = uncaptured_error_callback;
+    descriptor.deviceLostCallbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
+    descriptor.deviceLostCallbackInfo.callback = device_lost_callback;
 
     callback.mode = WGPUCallbackMode_WaitAnyOnly;
     callback.callback = request_device_callback;
@@ -125,6 +163,33 @@ static void log_adapter(WGPUAdapter adapter)
     }
     fprintf(stderr, "\n");
     wgpuSupportedFeaturesFreeMembers(features);
+}
+
+bool pgraph_wgpu_wait(PGRAPHWgpuState *r, WGPUFuture future)
+{
+    WGPUFutureWaitInfo wait_info = WGPU_FUTURE_WAIT_INFO_INIT;
+
+    wait_info.future = future;
+    WGPUWaitStatus status =
+        wgpuInstanceWaitAny(r->instance, 1, &wait_info, UINT64_MAX);
+    if (status != WGPUWaitStatus_Success) {
+        fprintf(stderr, "[WebGPU] Wait failed (%d)\n", status);
+        return false;
+    }
+    return true;
+}
+
+WGPUShaderModule pgraph_wgpu_create_wgsl_module(PGRAPHWgpuState *r,
+                                                const char *label,
+                                                const char *code)
+{
+    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+    WGPUShaderModuleDescriptor descriptor = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+
+    source.code = pgraph_wgpu_str(code);
+    descriptor.nextInChain = &source.chain;
+    descriptor.label = pgraph_wgpu_str(label);
+    return wgpuDeviceCreateShaderModule(r->device, &descriptor);
 }
 
 bool pgraph_wgpu_init_instance(PGRAPHState *pg, Error **errp)
