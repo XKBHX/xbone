@@ -12,6 +12,10 @@
 #ifdef CONFIG_TCG_INTERPRETER
 extern __thread uintptr_t tci_tb_ptr;
 # define GETPC() tci_tb_ptr
+#elif defined(CONFIG_TCG_WASM)
+/* Points into the frame of the translation block being executed. */
+extern __thread uintptr_t *tcg_wasm_ra_ptr;
+# define GETPC() (tcg_wasm_ra_ptr ? *tcg_wasm_ra_ptr : 0)
 #else
 # define GETPC() \
     ((uintptr_t)__builtin_extract_return_addr(__builtin_return_address(0)))

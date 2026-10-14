@@ -142,6 +142,10 @@ static void tcg_out_set_borrow(TCGContext *s);
 static void tcg_out_op(TCGContext *s, TCGOpcode opc, TCGType type,
                        const TCGArg args[TCG_MAX_OP_ARGS],
                        const int const_args[TCG_MAX_OP_ARGS]);
+#ifdef TCG_TARGET_STRUCTURED_CONTROL
+static void tcg_out_set_label(TCGContext *s, TCGLabel *l);
+static int tcg_out_tb_end(TCGContext *s);
+#endif
 #if TCG_TARGET_MAYBE_vec
 static bool tcg_out_dup_vec(TCGContext *s, TCGType type, unsigned vece,
                             TCGReg dst, TCGReg src);
@@ -348,8 +352,9 @@ static __attribute__((unused)) inline void tcg_patch64(tcg_insn_unit *p,
 
 /* label relocation processing */
 
-static void tcg_out_reloc(TCGContext *s, tcg_insn_unit *code_ptr, int type,
-                          TCGLabel *l, intptr_t addend)
+static void G_GNUC_UNUSED
+tcg_out_reloc(TCGContext *s, tcg_insn_unit *code_ptr, int type,
+              TCGLabel *l, intptr_t addend)
 {
     TCGRelocation *r = tcg_malloc(sizeof(TCGRelocation));
 
@@ -7107,6 +7112,9 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
         case INDEX_op_set_label:
             tcg_reg_alloc_bb_end(s, s->reserved_regs);
             tcg_out_label(s, arg_label(op->args[0]));
+#ifdef TCG_TARGET_STRUCTURED_CONTROL
+            tcg_out_set_label(s, arg_label(op->args[0]));
+#endif
             break;
         case INDEX_op_call:
             assert_carry_dead(s);
@@ -7158,6 +7166,12 @@ int tcg_gen_code(TCGContext *s, TranslationBlock *tb, uint64_t pc_start)
     s->gen_insn_end_off[num_insns] = tcg_current_code_size(s);
 
     /* Generate TB finalization at the end of block */
+#ifdef TCG_TARGET_STRUCTURED_CONTROL
+    i = tcg_out_tb_end(s);
+    if (i < 0) {
+        return i;
+    }
+#endif
     i = tcg_out_ldst_finalize(s);
     if (i < 0) {
         return i;
