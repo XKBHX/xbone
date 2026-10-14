@@ -1305,7 +1305,8 @@ endif
 slirp = not_found
 if not get_option('slirp').auto() or have_system
   slirp = dependency('slirp', required: get_option('slirp'),
-                     method: 'pkg-config')
+                     method: 'pkg-config',
+                     default_options: host_os == 'emscripten' ? ['default_library=static'] : [])
   # slirp < 4.7 is incompatible with CFI support in QEMU.  This is because
   # it passes function pointers within libslirp as callbacks for timers.
   # When using a system-wide shared libslirp, the type information for the
@@ -1468,12 +1469,14 @@ if not curl.found()
     curl_platform_opts = ['schannel=enabled', 'sspi=enabled']
   elif host_os == 'darwin'
     curl_platform_opts = ['secure-transport=enabled']
+  elif host_os == 'emscripten'
+    curl_platform_opts = []
   else
     curl_platform_opts = ['openssl=enabled']
   endif
   curl_sub = subproject('curl',
     default_options: [
-      'ssl=enabled',
+      host_os == 'emscripten' ? 'ssl=disabled' : 'ssl=enabled',
       'http=enabled',
       'ftp=enabled',
       'dict=disabled',
@@ -1894,6 +1897,8 @@ if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
     opengl_libs=['-lopengl32', '-lgdi32']
   elif host_os == 'linux'
     opengl_libs=['-lGL']
+  elif host_os == 'emscripten'
+    opengl_libs=['-lGL', '-sMAX_WEBGL_VERSION=2']
   else
     error('Unknown GL platform')
   endif
