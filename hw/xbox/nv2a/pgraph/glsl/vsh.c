@@ -233,7 +233,7 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
         "  return trunc(pos * 16.0f) / 16.0f;\n"
         "}\n");
 
-    pgraph_glsl_get_vtx_header(header, spirv, state->smooth_shading,
+    pgraph_glsl_get_vtx_header(header, opts.target, state->smooth_shading,
                                false, opts.prefix_outputs, false);
 
     if (opts.prefix_outputs) {
@@ -407,11 +407,18 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
                    "  vtxT2 = oT2;\n"
                    "  vtxT3 = oT3;\n"
                    "  vtxPos0 = vtxPos;\n"
-                   "  vtxPos1 = vtxPos;\n"
                    "  vtxPos2 = vtxPos;\n"
                    "  triMZ = 0.0;\n"
-                   "  gl_PointSize = oPts.x;\n"
     );
+
+    /* Tint only accepts a constant point size of 1.0. */
+    if (opts.target == PGRAPH_GLSL_TARGET_WEBGPU) {
+        mstring_append(body, "  vtxPos1 = vec4(1.0 / vtxPos.w);\n");
+    } else {
+        mstring_append(body,
+                       "  vtxPos1 = vtxPos;\n"
+                       "  gl_PointSize = oPts.x;\n");
+    }
 
     if (state->specular_enable) {
         mstring_append(body,
@@ -432,7 +439,12 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
         );
     }
 
-    if (spirv) {
+    if (opts.target == PGRAPH_GLSL_TARGET_WEBGPU) {
+        /* WebGPU normalized device coordinates are y-up */
+        mstring_append(body,
+                   "  gl_Position = vec4(oPos.x, -oPos.y, oPos.z, oPos.w);\n"
+        );
+    } else if (spirv) {
         mstring_append(body,
                    "  gl_Position = oPos;\n"
         );
@@ -447,6 +459,7 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
     /* Return combined header + source */
     MString *output =
         mstring_from_fmt("#version %d\n\n", spirv ? 450 : 400);
+    pgraph_glsl_append_target_header(output, opts.target);
 
     if (spirv) {
         // FIXME: Optimize uniforms

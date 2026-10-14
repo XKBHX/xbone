@@ -559,7 +559,9 @@ static const char* vsh_header =
 //   "#define _in(v) vec4(v)\n"
 //#endif
     "\n"
+    "#ifndef INFINITY\n"
     "#define INFINITY (1.0 / 0.0)\n"
+    "#endif\n"
     "\n"
     "#define MOV(dest, mask, src) dest.mask = _MOV(_in(src)).mask\n"
     "vec4 _MOV(vec4 src)\n"

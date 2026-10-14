@@ -25,11 +25,44 @@ const char *uniform_element_type_to_str[] = {
     UNIFORM_ELEMENT_TYPE_X(DECL_UNIFORM_ELEMENT_NAME)
 };
 
-MString *pgraph_glsl_get_vtx_header(MString *out, bool location, bool smooth,
-                                    bool in, bool prefix, bool array)
+void pgraph_glsl_append_target_header(MString *out, PgraphGlslTarget target)
 {
+    if (target != PGRAPH_GLSL_TARGET_WEBGPU) {
+        return;
+    }
+
+    /* Tint rejects OpIsNan/OpIsInf because WGSL cannot represent NaN, so
+     * test the bit patterns instead. */
+    // clang-format off
+    mstring_append(out,
+        "bool xIsNan(float x) { return (floatBitsToUint(x) & 0x7FFFFFFFu) > 0x7F800000u; }\n"
+        "bvec2 xIsNan(vec2 x) { return greaterThan(floatBitsToUint(x) & 0x7FFFFFFFu, uvec2(0x7F800000u)); }\n"
+        "bvec3 xIsNan(vec3 x) { return greaterThan(floatBitsToUint(x) & 0x7FFFFFFFu, uvec3(0x7F800000u)); }\n"
+        "bvec4 xIsNan(vec4 x) { return greaterThan(floatBitsToUint(x) & 0x7FFFFFFFu, uvec4(0x7F800000u)); }\n"
+        "bool xIsInf(float x) { return (floatBitsToUint(x) & 0x7FFFFFFFu) == 0x7F800000u; }\n"
+        "bvec2 xIsInf(vec2 x) { return equal(floatBitsToUint(x) & 0x7FFFFFFFu, uvec2(0x7F800000u)); }\n"
+        "bvec3 xIsInf(vec3 x) { return equal(floatBitsToUint(x) & 0x7FFFFFFFu, uvec3(0x7F800000u)); }\n"
+        "bvec4 xIsInf(vec4 x) { return equal(floatBitsToUint(x) & 0x7FFFFFFFu, uvec4(0x7F800000u)); }\n"
+        "#define isnan xIsNan\n"
+        "#define isinf xIsInf\n"
+        /* WGSL cannot represent infinite constants either, so derive it from
+         * a value the SPIR-V optimizer cannot fold (vertex stage only). */
+        "#define INFINITY uintBitsToFloat(0x7F800000u + uint(gl_VertexIndex == -1))\n"
+        "\n");
+    // clang-format on
+}
+
+MString *pgraph_glsl_get_vtx_header(MString *out, PgraphGlslTarget target,
+                                    bool smooth, bool in, bool prefix,
+                                    bool array)
+{
+    bool location = pgraph_glsl_target_uses_spirv(target);
     const char *smooth_s = "";
     const char *flat_s = "flat ";
+    /* Without a geometry stage, depth is interpolated linearly in screen
+     * space from vtxPos0 (z) and vtxPos1 (1/w). */
+    const char *pos_s =
+        target == PGRAPH_GLSL_TARGET_WEBGPU ? "noperspective " : flat_s;
     const char *qualifier_s = smooth ? smooth_s : flat_s;
     const char *in_out_s = in ? "in" : "out";
     const char *float_s = "float";
@@ -48,8 +81,8 @@ MString *pgraph_glsl_get_vtx_header(MString *out, bool location, bool smooth,
         { smooth_s,    vec4_s,  "vtxT1"  },
         { smooth_s,    vec4_s,  "vtxT2"  },
         { smooth_s,    vec4_s,  "vtxT3"  },
-        { flat_s,      vec4_s,  "vtxPos0" },
-        { flat_s,      vec4_s,  "vtxPos1" },
+        { pos_s,       vec4_s,  "vtxPos0" },
+        { pos_s,       vec4_s,  "vtxPos1" },
         { flat_s,      vec4_s,  "vtxPos2" },
         { flat_s,      float_s, "triMZ"  },
     };

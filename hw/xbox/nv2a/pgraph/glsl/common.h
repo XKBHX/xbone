@@ -108,8 +108,12 @@ typedef struct UniformInfo {
 
 #define GLSL_DEFINE(a, b) "#define " stringify(a) " " b "\n"
 
-MString *pgraph_glsl_get_vtx_header(MString *out, bool location, bool smooth,
-                                    bool in, bool prefix, bool array);
+/* Target-specific definitions that must follow the #version line. */
+void pgraph_glsl_append_target_header(MString *out, PgraphGlslTarget target);
+
+MString *pgraph_glsl_get_vtx_header(MString *out, PgraphGlslTarget target,
+                                    bool smooth, bool in, bool prefix,
+                                    bool array);
 
 typedef struct PGRAPHState PGRAPHState;
 
