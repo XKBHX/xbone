@@ -18,10 +18,83 @@
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "hw/xbox/nv2a/nv2a_regs.h"
 #include "hw/xbox/nv2a/pgraph/surface.h"
+#include "hw/xbox/nv2a/pgraph/glsl/shaders.h"
 
 #include <webgpu/webgpu.h>
 
 #include "constants.h"
+
+typedef struct WgpuUniformMember {
+    int offset; // -1 if the member is not in the block
+    int column_bytes;
+    int columns;
+    int stride;
+} WgpuUniformMember;
+
+typedef struct WgpuTextureLayout {
+    PshTextureType types[NV2A_MAX_TEXTURES];
+    WGPUBindGroupLayout bind_group_layout;
+    WGPUPipelineLayout pipeline_layout;
+    WGPUBindGroup dummy_bind_group;
+} WgpuTextureLayout;
+
+typedef struct ShaderBinding {
+    ShaderState state;
+    bool valid;
+    WGPUShaderModule vsh;
+    WGPUShaderModule psh;
+    VshUniformLocs vsh_locs;
+    PshUniformLocs psh_locs;
+    WgpuUniformMember vsh_members[VshUniform__COUNT];
+    WgpuUniformMember psh_members[PshUniform__COUNT];
+    size_t vsh_ubo_size;
+    size_t psh_ubo_size;
+    WgpuTextureLayout *texture_layout;
+} ShaderBinding;
+
+typedef struct WgpuVertexAttribute {
+    uint8_t location;
+    uint8_t offset;
+    WGPUVertexFormat format;
+} WgpuVertexAttribute;
+
+typedef struct WgpuVertexLayout {
+    uint32_t stride;
+    uint32_t num_attributes;
+    WgpuVertexAttribute attributes[NV2A_VERTEXSHADER_ATTRIBUTES];
+} WgpuVertexLayout;
+
+typedef struct WgpuVertexSource {
+    const uint8_t *data; // element 0
+    size_t stride;
+    unsigned int format;
+    unsigned int count;
+} WgpuVertexSource;
+
+typedef struct PipelineKey {
+    const ShaderBinding *shader;
+    WGPUTextureFormat color_format;
+    WGPUTextureFormat zeta_format;
+    WGPUPrimitiveTopology topology;
+    WgpuVertexLayout vertex_layout;
+    uint32_t regs[9];
+} PipelineKey;
+
+enum WgpuStreamBufferIndex {
+    WGPU_STREAM_UNIFORM,
+    WGPU_STREAM_INDEX,
+    WGPU_STREAM_VERTEX,
+    WGPU_STREAM__COUNT,
+};
+
+typedef struct WgpuStreamBuffer {
+    const char *label;
+    WGPUBufferUsage usage;
+    WGPUBuffer buffer;
+    uint8_t *data;
+    size_t size;
+    size_t used;
+} WgpuStreamBuffer;
 
 typedef struct SurfaceBinding {
     QTAILQ_ENTRY(SurfaceBinding) entry;
@@ -98,6 +171,34 @@ typedef struct PGRAPHWgpuState {
     WGPUShaderModule depth_upload_module;
     WGPUBindGroupLayout depth_upload_bind_group_layout;
     WGPURenderPipeline depth_upload_pipeline;
+
+    bool depth_clip_control;
+
+    WgpuStreamBuffer stream_buffers[WGPU_STREAM__COUNT];
+
+    GHashTable *shader_cache; // ShaderState -> ShaderBinding
+    ShaderBinding *shader_binding;
+    GArray *texture_layouts; // WgpuTextureLayout *
+    WGPUBindGroupLayout uniform_bind_group_layout;
+    WGPUBindGroup uniform_bind_group;
+    WGPUBuffer uniform_bind_group_buffer;
+    size_t uniform_binding_size;
+    uint8_t *vsh_uniform_data;
+    uint8_t *psh_uniform_data;
+    uint64_t uniform_hashes[2];
+    bool uniforms_valid;
+    uint32_t uniform_offsets[2];
+
+    WGPUTexture dummy_textures[PSH_TEXTURE_TYPE_CUBE + 1];
+    WGPUTextureView dummy_texture_views[PSH_TEXTURE_TYPE_CUBE + 1];
+    WGPUSampler dummy_sampler;
+
+    GHashTable *pipeline_cache; // PipelineKey -> WGPURenderPipeline
+    WGPUTexture scratch_zeta;
+    WGPUTextureView scratch_zeta_view;
+
+    WgpuVertexLayout vertex_layout;
+    WgpuVertexSource vertex_sources[NV2A_VERTEXSHADER_ATTRIBUTES];
 } PGRAPHWgpuState;
 
 typedef enum WgpuFinishReason {
@@ -124,6 +225,42 @@ bool pgraph_wgpu_wait(PGRAPHWgpuState *r, WGPUFuture future);
 WGPUShaderModule pgraph_wgpu_create_wgsl_module(PGRAPHWgpuState *r,
                                                 const char *label,
                                                 const char *code);
+WGPUShaderModule pgraph_wgpu_create_spirv_module(PGRAPHWgpuState *r,
+                                                 const char *label,
+                                                 const uint32_t *code,
+                                                 size_t num_words);
+
+// buffer.c
+void pgraph_wgpu_init_buffers(PGRAPHState *pg);
+void pgraph_wgpu_finalize_buffers(PGRAPHState *pg);
+bool pgraph_wgpu_stream_reserve(PGRAPHState *pg, int index, size_t size);
+size_t pgraph_wgpu_stream_alloc(PGRAPHWgpuState *r, int index, size_t size,
+                                size_t align, void **ptr);
+void pgraph_wgpu_flush_streams(PGRAPHWgpuState *r);
+
+// shaders.c
+void pgraph_wgpu_init_shaders(PGRAPHState *pg);
+void pgraph_wgpu_finalize_shaders(PGRAPHState *pg);
+void pgraph_wgpu_bind_shaders(PGRAPHState *pg);
+void pgraph_wgpu_update_uniforms(PGRAPHState *pg, bool *vsh_changed,
+                                 bool *psh_changed);
+
+// texture.c
+void pgraph_wgpu_init_textures(PGRAPHState *pg);
+void pgraph_wgpu_finalize_textures(PGRAPHState *pg);
+WGPUBindGroup pgraph_wgpu_create_dummy_texture_bind_group(
+    PGRAPHWgpuState *r, WGPUBindGroupLayout layout,
+    const PshTextureType types[NV2A_MAX_TEXTURES]);
+
+// vertex.c
+bool pgraph_wgpu_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
+                                        unsigned int max_element,
+                                        bool inline_data,
+                                        unsigned int inline_stride,
+                                        unsigned int provoking_element);
+void pgraph_wgpu_bind_vertex_attributes_inline(NV2AState *d);
+void pgraph_wgpu_pack_vertices(PGRAPHWgpuState *r, uint8_t *out,
+                               unsigned int first, unsigned int count);
 
 // command.c
 WGPUCommandEncoder pgraph_wgpu_ensure_encoder(PGRAPHState *pg);
