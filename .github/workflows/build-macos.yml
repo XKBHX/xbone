@@ -73,10 +73,10 @@ jobs:
         echo "XEMU_BUILD_OPTIONS=${opts[*]}" >> "$GITHUB_ENV"
     - name: Install pinned Dawn SDK
       run: |
-        python3 scripts/download-dawn.py \
+        pc_dir=$(python3 scripts/download-dawn.py \
           --platform macos --arch ${{ matrix.arch }} \
-          --output "$GITHUB_WORKSPACE/dawn"
-        echo "CMAKE_PREFIX_PATH=$GITHUB_WORKSPACE/dawn" >> "$GITHUB_ENV"
+          --output "$GITHUB_WORKSPACE/dawn" | tail -n1)
+        echo "PKG_CONFIG_PATH=$pc_dir" >> "$GITHUB_ENV"
         echo "XEMU_BUILD_OPTIONS=$XEMU_BUILD_OPTIONS --enable-webgpu" >> "$GITHUB_ENV"
     - name: Compile
       run: ./build.sh -a ${{ matrix.arch }} ${XEMU_BUILD_OPTIONS}

@@ -182,13 +182,15 @@ Each phase ends with a demonstrable exit criterion.
 Phase 0 notes:
 
 - Dawn is pinned to `v20261013.193955` in `scripts/download-dawn.py`
-  (SHA-256 per archive). CI installs it on Linux x86_64, Windows x86_64 and
-  macOS x86_64/arm64 and builds with `--enable-webgpu`. Meson finds Dawn
+  (SHA-256 per archive). CI installs it on Linux x86_64 and macOS
+  x86_64/arm64 and builds with `--enable-webgpu`. Meson finds Dawn
   through `pkg-config` (`dawn`), then CMake (`Dawn`, target
-  `dawn::webgpu_dawn`), then `webgpu_dawn`. On macOS, Meson drops the
-  `-framework` entries from Dawn's CMake link interface; linking needs
-  [#6](https://github.com/XKBHX/xbone/pull/6), which adds them back through
-  `appleframeworks`.
+  `dawn::webgpu_dawn`), then `webgpu_dawn`. The official release only
+  ships CMake files, so `download-dawn.py` also writes a `dawn.pc`; CI
+  uses it through `PKG_CONFIG_PATH`, because `build.sh` configures Linux
+  and macOS as cross builds, where Meson's CMake probing doesn't work
+  reliably. When Dawn comes from CMake on macOS, `meson.build` adds the
+  `-framework` entries Meson drops from Dawn's link interface.
 - `webgpu/instance.c` creates the instance with `TimedWaitAny`, requests the
   adapter and device with `WGPUCallbackMode_WaitAnyOnly` futures, and logs
   the adapter and its features with a `[WebGPU]` prefix.
@@ -383,9 +385,12 @@ WebGPU canvas. Performance is reported, not gated, until the CPU work in
   `display.webgpu.validation` config flag would mirror
   `display.vulkan.validation_layers`.
 - **CI.** Download a pinned prebuilt Dawn release (version and SHA-256 kept
-  in the CI config, with matching archives for Linux, Windows and macOS).
-  Build the native WebGPU backend against it. On Linux, run headless on
-  SwiftShader through Dawn's Vulkan backend, with unit tests plus a small
+  in `scripts/download-dawn.py`, with archives for Linux x86_64 and macOS
+  x86_64/arm64). Build the native WebGPU backend against it. Windows builds
+  cross-compile with MinGW, which can't link the MSVC-built official Dawn
+  release, so Windows needs a MinGW Dawn build before it can join. On
+  Linux, run headless on SwiftShader through Dawn's Vulkan backend, with
+  unit tests plus a small
   golden-image subset. Bumping Dawn is a deliberate PR that updates the pin
   and reruns the golden images.
 

@@ -2431,6 +2431,11 @@ if vulkan.found() or (webgpu.found() and host_os != 'emscripten')
     # FIXME: Get spirv-tools to enable opt.
     glslang_opts = cmake.subproject_options()
     glslang_opts.add_cmake_defines({'ENABLE_OPT': false, 'ENABLE_HLSL': false})
+    if host_os == 'darwin'
+      # CMake's compiler check otherwise builds for the build machine's arch
+      glslang_opts.add_cmake_defines({'CMAKE_OSX_ARCHITECTURES':
+        host_machine.cpu_family() == 'aarch64' ? 'arm64' : host_machine.cpu_family()})
+    endif
     glslang_subpro = cmake.subproject('glslang', options: glslang_opts)
     libglslang = declare_dependency(link_with: [
           glslang_subpro.target('glslang'),
