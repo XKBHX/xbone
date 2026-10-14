@@ -21,6 +21,8 @@ if get_option('tcg_interpreter')
                       method: 'pkg-config')
   tcg_ss.add(libffi)
   tcg_ss.add(files('tci.c'))
+elif tcg_arch == 'wasm'
+  tcg_ss.add(files('wasm.c'))
 endif
 
 tcg_ss.add(when: libdw, if_true: files('debuginfo.c'))

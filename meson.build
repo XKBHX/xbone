@@ -953,9 +953,8 @@ if have_tcg
       error('Unsupported CPU @0@, try --enable-tcg-interpreter'.format(cpu))
     endif
   elif host_arch == 'wasm32'
-    if not get_option('tcg_interpreter')
-      error('WebAssembly host requires --enable-tcg-interpreter')
-    endif
+    # tcg/wasm emits a WebAssembly module per translation block; TCI
+    # remains available with --enable-tcg-interpreter.
   elif get_option('tcg_interpreter')
     warning('Use of the TCG interpreter is not recommended on this host')
     warning('architecture. There is a native TCG execution backend available')
@@ -970,6 +969,8 @@ if have_tcg
     tcg_arch = 'i386'
   elif host_arch == 'ppc64'
     tcg_arch = 'ppc'
+  elif host_arch == 'wasm32'
+    tcg_arch = 'wasm'
   endif
   add_project_arguments('-iquote', meson.current_source_dir() / 'tcg' / tcg_arch,
                         language: all_languages)
@@ -2717,6 +2718,7 @@ config_host_data.set('CONFIG_SOLARIS', host_os == 'sunos')
 if have_tcg
   config_host_data.set('CONFIG_TCG', 1)
   config_host_data.set('CONFIG_TCG_INTERPRETER', tcg_arch == 'tci')
+  config_host_data.set('CONFIG_TCG_WASM', tcg_arch == 'wasm')
 endif
 config_host_data.set('CONFIG_TPM', have_tpm)
 config_host_data.set('CONFIG_TSAN', get_option('tsan'))
@@ -5028,6 +5030,8 @@ summary_info += {'TCG support':       config_all_accel.has_key('CONFIG_TCG')}
 if config_all_accel.has_key('CONFIG_TCG')
   if get_option('tcg_interpreter')
     summary_info += {'TCG backend':   'TCI (TCG with bytecode interpreter, slow)'}
+  elif tcg_arch == 'wasm'
+    summary_info += {'TCG backend':   'native (WebAssembly module per TB)'}
   else
     summary_info += {'TCG backend':   'native (@0@)'.format(cpu)}
   endif
