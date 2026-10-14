@@ -2414,6 +2414,15 @@ elif not get_option('webgpu').disabled()
   if not webgpu.found()
     webgpu = dependency('webgpu_dawn', required: get_option('webgpu'))
   endif
+  if webgpu.found() and host_os == 'darwin'
+    # Meson drops the "-framework X" entries from Dawn's CMake link interface
+    webgpu = declare_dependency(dependencies: [
+      webgpu,
+      dependency('appleframeworks',
+                 modules: ['Cocoa', 'Foundation', 'IOKit', 'IOSurface',
+                           'Metal', 'QuartzCore']),
+    ])
+  endif
 endif
 
 if vulkan.found()
