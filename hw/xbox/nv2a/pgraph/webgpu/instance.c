@@ -102,26 +102,34 @@ static void device_lost_callback(WGPUDevice const *device,
             (int)message.length, message.data);
 }
 
-static WGPUDevice request_device(WGPUInstance instance, WGPUAdapter adapter,
-                                 Error **errp)
+static WGPUDevice request_device(PGRAPHWgpuState *r, Error **errp)
 {
+    WGPUInstance instance = r->instance;
+    WGPUAdapter adapter = r->adapter;
     RequestDeviceState state = { 0 };
     WGPUDeviceDescriptor descriptor = WGPU_DEVICE_DESCRIPTOR_INIT;
     WGPURequestDeviceCallbackInfo callback =
         WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
     WGPUFutureWaitInfo wait_info = WGPU_FUTURE_WAIT_INFO_INIT;
-    WGPUFeatureName required_features[] = {
+    WGPUFeatureName required_features[2] = {
         WGPUFeatureName_Depth32FloatStencil8,
     };
+    size_t num_required_features = 1;
 
-    for (size_t i = 0; i < ARRAY_SIZE(required_features); i++) {
+    for (size_t i = 0; i < num_required_features; i++) {
         if (!wgpuAdapterHasFeature(adapter, required_features[i])) {
             error_setg(errp, "WebGPU adapter lacks required feature %d",
                        required_features[i]);
             return NULL;
         }
     }
-    descriptor.requiredFeatureCount = ARRAY_SIZE(required_features);
+    r->depth_clip_control =
+        wgpuAdapterHasFeature(adapter, WGPUFeatureName_DepthClipControl);
+    if (r->depth_clip_control) {
+        required_features[num_required_features++] =
+            WGPUFeatureName_DepthClipControl;
+    }
+    descriptor.requiredFeatureCount = num_required_features;
     descriptor.requiredFeatures = required_features;
     descriptor.uncapturedErrorCallbackInfo.callback = uncaptured_error_callback;
     descriptor.deviceLostCallbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
@@ -192,12 +200,71 @@ WGPUShaderModule pgraph_wgpu_create_wgsl_module(PGRAPHWgpuState *r,
     return wgpuDeviceCreateShaderModule(r->device, &descriptor);
 }
 
+typedef struct ErrorScopeState {
+    WGPUErrorType type;
+    char *message;
+} ErrorScopeState;
+
+static void pop_error_scope_callback(WGPUPopErrorScopeStatus status,
+                                     WGPUErrorType type, WGPUStringView message,
+                                     void *userdata1, void *userdata2)
+{
+    ErrorScopeState *state = userdata1;
+
+    state->type = status == WGPUPopErrorScopeStatus_Success ?
+                      type :
+                      WGPUErrorType_Unknown;
+    if (type != WGPUErrorType_NoError) {
+        state->message = g_strndup(message.data, message.length);
+    }
+}
+
+WGPUShaderModule pgraph_wgpu_create_spirv_module(PGRAPHWgpuState *r,
+                                                 const char *label,
+                                                 const uint32_t *code,
+                                                 size_t num_words)
+{
+    WGPUShaderSourceSPIRV source = WGPU_SHADER_SOURCE_SPIRV_INIT;
+    WGPUDawnShaderModuleSPIRVOptionsDescriptor options =
+        WGPU_DAWN_SHADER_MODULE_SPIRV_OPTIONS_DESCRIPTOR_INIT;
+    WGPUShaderModuleDescriptor descriptor = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+    WGPUPopErrorScopeCallbackInfo callback =
+        WGPU_POP_ERROR_SCOPE_CALLBACK_INFO_INIT;
+    ErrorScopeState state = { 0 };
+
+    source.code = code;
+    source.codeSize = num_words;
+    /* GLSL allows implicit derivatives in non-uniform control flow */
+    options.allowNonUniformDerivatives = true;
+    source.chain.next = &options.chain;
+    descriptor.nextInChain = &source.chain;
+    descriptor.label = pgraph_wgpu_str(label);
+
+    wgpuDevicePushErrorScope(r->device, WGPUErrorFilter_Validation);
+    WGPUShaderModule module =
+        wgpuDeviceCreateShaderModule(r->device, &descriptor);
+    callback.mode = WGPUCallbackMode_WaitAnyOnly;
+    callback.callback = pop_error_scope_callback;
+    callback.userdata1 = &state;
+    pgraph_wgpu_wait(r, wgpuDevicePopErrorScope(r->device, callback));
+
+    if (state.type != WGPUErrorType_NoError) {
+        fprintf(stderr, "[WebGPU] Failed to create %s shader module: %s\n",
+                label, state.message ?: "unknown error");
+        g_free(state.message);
+        wgpuShaderModuleRelease(module);
+        return NULL;
+    }
+    return module;
+}
+
 bool pgraph_wgpu_init_instance(PGRAPHState *pg, Error **errp)
 {
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
     WGPUInstanceDescriptor descriptor = WGPU_INSTANCE_DESCRIPTOR_INIT;
     WGPUInstanceFeatureName instance_features[] = {
         WGPUInstanceFeatureName_TimedWaitAny,
+        WGPUInstanceFeatureName_ShaderSourceSPIRV,
     };
 
     descriptor.requiredFeatureCount = ARRAY_SIZE(instance_features);
@@ -214,7 +281,7 @@ bool pgraph_wgpu_init_instance(PGRAPHState *pg, Error **errp)
     }
     log_adapter(r->adapter);
 
-    r->device = request_device(r->instance, r->adapter, errp);
+    r->device = request_device(r, errp);
     if (*errp) {
         return false;
     }

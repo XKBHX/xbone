@@ -85,4 +85,65 @@ static const WgpuSurfaceFormatInfo kelvin_surface_zeta_format_wgpu_map[] = {
     },
 };
 
+/* WebGPU has no constant-alpha factors. They use the blend constant, which is
+ * set to the constant alpha splatted across all channels. */
+static const WGPUBlendFactor pgraph_blend_factor_wgpu_map[] = {
+    WGPUBlendFactor_Zero,
+    WGPUBlendFactor_One,
+    WGPUBlendFactor_Src,
+    WGPUBlendFactor_OneMinusSrc,
+    WGPUBlendFactor_SrcAlpha,
+    WGPUBlendFactor_OneMinusSrcAlpha,
+    WGPUBlendFactor_DstAlpha,
+    WGPUBlendFactor_OneMinusDstAlpha,
+    WGPUBlendFactor_Dst,
+    WGPUBlendFactor_OneMinusDst,
+    WGPUBlendFactor_SrcAlphaSaturated,
+    WGPUBlendFactor_Zero,
+    WGPUBlendFactor_Constant,
+    WGPUBlendFactor_OneMinusConstant,
+    WGPUBlendFactor_Constant,
+    WGPUBlendFactor_OneMinusConstant,
+};
+
+#define PGRAPH_BLEND_FACTOR_CONSTANT_ALPHA 14
+#define PGRAPH_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA 15
+
+static const WGPUBlendOperation pgraph_blend_equation_wgpu_map[] = {
+    WGPUBlendOperation_Subtract, WGPUBlendOperation_ReverseSubtract,
+    WGPUBlendOperation_Add,      WGPUBlendOperation_Min,
+    WGPUBlendOperation_Max,      WGPUBlendOperation_ReverseSubtract,
+    WGPUBlendOperation_Add,
+};
+
+/* WebGPU cannot cull both faces; those draws are skipped instead. */
+static const WGPUCullMode pgraph_cull_face_wgpu_map[] = {
+    WGPUCullMode_None,
+    WGPUCullMode_Front,
+    WGPUCullMode_Back,
+    WGPUCullMode_None,
+};
+
+static const WGPUCompareFunction pgraph_depth_func_wgpu_map[] = {
+    WGPUCompareFunction_Never,        WGPUCompareFunction_Less,
+    WGPUCompareFunction_Equal,        WGPUCompareFunction_LessEqual,
+    WGPUCompareFunction_Greater,      WGPUCompareFunction_NotEqual,
+    WGPUCompareFunction_GreaterEqual, WGPUCompareFunction_Always,
+};
+
+static const WGPUCompareFunction pgraph_stencil_func_wgpu_map[] = {
+    WGPUCompareFunction_Never,        WGPUCompareFunction_Less,
+    WGPUCompareFunction_Equal,        WGPUCompareFunction_LessEqual,
+    WGPUCompareFunction_Greater,      WGPUCompareFunction_NotEqual,
+    WGPUCompareFunction_GreaterEqual, WGPUCompareFunction_Always,
+};
+
+static const WGPUStencilOperation pgraph_stencil_op_wgpu_map[] = {
+    WGPUStencilOperation_Keep,           WGPUStencilOperation_Keep,
+    WGPUStencilOperation_Zero,           WGPUStencilOperation_Replace,
+    WGPUStencilOperation_IncrementClamp, WGPUStencilOperation_DecrementClamp,
+    WGPUStencilOperation_Invert,         WGPUStencilOperation_IncrementWrap,
+    WGPUStencilOperation_DecrementWrap,
+};
+
 #endif

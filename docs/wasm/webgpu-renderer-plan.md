@@ -173,7 +173,7 @@ Each phase ends with a demonstrable exit criterion.
 | Phase | Status |
 | --- | --- |
 | 0. Groundwork | Done. Natively on macOS arm64 (Dawn Metal backend, Apple M1 Pro), `display.renderer = "WEBGPU"` creates a device and boots with a black screen and no asserts. Not yet run on Linux or Windows. |
-| 1. Native bring-up | In progress. Steps 1 (command lifecycle), 2 (surface cache), 3 (clears) and 6 (display) are done, plus the NV09F image blit. The dashboard boots on macOS arm64 with clears and surface readback working and no WebGPU validation errors, but geometry isn't drawn yet, so the screen stays black. Step 4 (draw path) is blocked on the shader-path finding below. Step 5 (textures) is not started. |
+| 1. Native bring-up | In progress. Steps 1 (command lifecycle), 2 (surface cache), 3 (clears), 4 (draw path) and 6 (display) are done, plus the NV09F image blit. The dashboard boots on macOS arm64 and draws its geometry with no WebGPU validation errors. Every texture samples a zeroed dummy, so textured geometry is black. Step 4 needs a Dawn built with the SPIR-V reader (see the step 4 notes). Step 5 (textures) is not started. |
 | 2. Feature completeness | Not started. |
 | 3. WGSL generator | Not started. |
 | 4. Performance | Not started. |
@@ -259,17 +259,65 @@ Phase 1 notes (steps 1, 2, 3 and 6):
   `get_framebuffer_surface` waits for the scanout surface to download and
   returns `0`, so the UI shows guest RAM through the VGA path.
   Resolution scaling is fixed at 1×.
-- `draw_begin` binds surfaces (so they are created and uploaded), but
-  `flush_draw` doesn't record anything yet, and `draw_end` doesn't mark
-  surfaces dirty.
-- **Shader-path finding (blocks step 4).** The prebuilt Dawn macOS
+- **Shader-path finding.** The prebuilt Dawn macOS
   archives for `v20261013.193955` are built without Tint's SPIR-V reader.
   The library contains the string "Tint SPIR-V reader is not enabled", and
   the bundled `tint` CLI rejects SPIR-V input. The Linux archive does include
   the reader. So the GLSL → SPIR-V → `WGPUShaderSourceSPIRV` bring-up path
   can't run on macOS with the pinned prebuilt. The alternatives are
   building Dawn from source with `TINT_BUILD_SPV_READER` for development, or
-  moving the phase 3 WGSL generator ahead of the draw path.
+  moving the phase 3 WGSL generator ahead of the draw path. Step 4 takes the
+  first option and keeps the WGSL generator in phase 3.
+
+Phase 1 notes (step 4, draw path):
+
+- Shaders need a Dawn with Tint's SPIR-V reader. `scripts/build-dawn.py`
+  builds one at the pinned revision. The prebuilt macOS archive still
+  advertises `ShaderSourceSPIRV`, so at init the renderer compiles a probe
+  module inside an error scope. If the probe fails, it logs a hint and draws
+  are skipped. Modules are created with Dawn's
+  `allowNonUniformDerivatives`, because GLSL allows implicit derivatives in
+  non-uniform control flow.
+- Tint rejects some SPIR-V that Vulkan accepts, so the WebGPU target of the
+  generator also:
+  - replaces `isnan`/`isinf` with bit-pattern tests, because WGSL can't
+    represent NaN;
+  - derives `INFINITY` from `gl_VertexIndex`, because WGSL can't represent
+    infinite constants and the SPIR-V optimizer would fold `1.0 / 0.0`;
+  - flips `gl_Position.y`, because WebGPU NDC is y-up.
+- Uniforms: one bind group (group 0) holds the vertex and pixel uniform
+  blocks, bound at dynamic offsets into a per-batch uniform stream. The
+  std140 offsets are computed from the generator's X-macro tables rather
+  than from SPIR-V reflection, and values are hashed so that unchanged
+  blocks aren't uploaded again. Textures are in group 1. Each combination of
+  sampler types gets its own bind group layout and pipeline layout, and
+  until step 5 every stage is bound to a 1×1 zeroed dummy texture.
+- Streams: the uniform, index and vertex streams are staged on the CPU and
+  written with `wgpuQueueWriteBuffer` right before each submit. A stream that
+  runs out of space finishes the batch and grows to the next power of two.
+- **No guest-RAM vertex mirror yet.** WebGPU allows at most 8 vertex buffers
+  and has no 3-component 8/16-bit or scaled formats. So each draw packs its
+  active attributes on the CPU into one interleaved buffer:
+  - `UB×3` becomes `unorm8x4`, and `S1×3` becomes `snorm16x4`;
+  - `S32K` is converted to float;
+  - `CMP` stays `sint32` and is decoded in the shader.
+
+  Surfaces that overlap the vertex data are downloaded first. The VRAM
+  mirror with dirty tracking moves to phase 4.
+- Phase 2 primitive expansion was pulled forward, because WebGPU has no
+  fans, quads or polygons. `prim.c` turns fans, polygons, quads, quad
+  strips and line loops into index lists. Triangle and line lists, strips,
+  and points draw directly.
+- Pipelines are cached on the shader binding, attachment formats, topology,
+  vertex layout and the raw register words that feed fixed-function state.
+  WebGPU requires a depth attachment whenever the fragment shader writes
+  depth, so a draw with no zeta surface uses a scratch `depth24plus`
+  attachment (compare Always, no writes).
+- Known gaps: flat-shading provoking vertex, polygon modes, point sprites
+  and point size, `x8y24` uint sampling, and culling of both faces (those
+  draws are skipped). Constant-alpha blend factors use the blend constant
+  with alpha in every channel. Emscripten can't use this path until the
+  phase 3 WGSL generator exists.
 
 ### Phase 0: groundwork and refactors (small, landable on its own)
 

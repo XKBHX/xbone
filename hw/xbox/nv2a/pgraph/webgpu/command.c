@@ -72,6 +72,8 @@ void pgraph_wgpu_finish(PGRAPHState *pg, WgpuFinishReason why, bool wait)
 {
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
 
+    pgraph_wgpu_flush_streams(r);
+
     if (r->encoder) {
         nv2a_profile_inc_counter(finish_reason_to_counter_enum[why]);
 

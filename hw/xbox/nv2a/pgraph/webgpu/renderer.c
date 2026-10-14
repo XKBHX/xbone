@@ -73,6 +73,9 @@ static void pgraph_wgpu_init(NV2AState *d, Error **errp)
     /* Resolution scaling is not supported yet. */
     pg->surface_scale_factor = 1;
 
+    pgraph_wgpu_init_buffers(pg);
+    pgraph_wgpu_init_textures(pg);
+    pgraph_wgpu_init_shaders(pg);
     pgraph_wgpu_init_surfaces(pg);
     pgraph_wgpu_init_pipelines(pg);
 }
@@ -85,8 +88,11 @@ static void pgraph_wgpu_finalize(NV2AState *d)
         return;
     }
     pgraph_wgpu_finalize_pipelines(pg);
+    pgraph_wgpu_finalize_shaders(pg);
+    pgraph_wgpu_finalize_textures(pg);
     pgraph_wgpu_finalize_surfaces(pg);
     pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_FLUSH, true);
+    pgraph_wgpu_finalize_buffers(pg);
     pgraph_wgpu_finalize_instance(pg);
     g_clear_pointer(&pg->wgpu_renderer_state, g_free);
 }
