@@ -151,7 +151,7 @@ static bool is_voice_locked(MCPXAPUState *d, uint16_t v)
 {
     assert(v < MCPX_HW_MAX_VOICES);
     uint64_t mask = 1LL << (v % 64);
-    return (qatomic_read(&d->vp.voice_locked[v / 64]) & mask) != 0;
+    return (qatomic_read_u64(&d->vp.voice_locked[v / 64]) & mask) != 0;
 }
 
 static void set_hrir_coeff_tar(MCPXAPUState *d, int channel, int coeff_idx,
