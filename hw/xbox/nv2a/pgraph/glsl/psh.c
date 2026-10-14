@@ -274,6 +274,11 @@ struct PixelShader {
     char const_refs[32][32];
 };
 
+static bool psh_uses_spirv(const struct PixelShader *ps)
+{
+    return pgraph_glsl_target_uses_spirv(ps->opts.target);
+}
+
 static void add_var_ref(struct PixelShader *ps, const char *var)
 {
     int i;
@@ -633,7 +638,7 @@ static const char *get_sampler_type(struct PixelShader *ps, enum PS_TEXTUREMODES
 
     case PS_TEXTUREMODES_PROJECT2D:
         if (dim == 2) {
-            if (state->tex_x8y24[i] && ps->opts.vulkan) {
+            if (state->tex_x8y24[i] && psh_uses_spirv(ps)) {
                 return "usampler2D";
             }
             if (state->tex_cubemap[i]) {
@@ -661,7 +666,7 @@ static const char *get_sampler_type(struct PixelShader *ps, enum PS_TEXTUREMODES
 
     case PS_TEXTUREMODES_PROJECT3D:
     case PS_TEXTUREMODES_DOT_STR_3D:
-        if (state->tex_x8y24[i] && ps->opts.vulkan) {
+        if (state->tex_x8y24[i] && psh_uses_spirv(ps)) {
             return "usampler2D";
         }
         if (state->shadow_map[i]) {
@@ -720,7 +725,7 @@ static void psh_append_shadowmap(const struct PixelShader *ps, int i, bool compa
 
     const char *comparison = shadow_comparison_map[ps->state->shadow_depth_func];
 
-    bool extract_msb_24b = ps->state->tex_x8y24[i] && ps->opts.vulkan;
+    bool extract_msb_24b = ps->state->tex_x8y24[i] && psh_uses_spirv(ps);
 
     mstring_append_fmt(
         vars, "%svec4 t%d_depth%s = textureProj(texSamp%d, %s(pT%d.xyw));\n",
@@ -811,21 +816,24 @@ static void define_colorkey_comparator(MString *preflight)
 static MString* psh_convert(struct PixelShader *ps)
 {
     MString *preflight = mstring_new();
-    pgraph_glsl_get_vtx_header(preflight, ps->opts.vulkan,
+    pgraph_glsl_get_vtx_header(preflight, psh_uses_spirv(ps),
                              ps->state->smooth_shading, true, false, false);
 
-    if (ps->opts.vulkan) {
+    if (psh_uses_spirv(ps)) {
+        mstring_append(preflight,
+                       "layout(location = 0) out vec4 fragColor;\n");
         mstring_append_fmt(
             preflight,
-            "layout(location = 0) out vec4 fragColor;\n"
-            "layout(binding = %d, std140) uniform PshUniforms {\n",
+            ps->opts.target == PGRAPH_GLSL_TARGET_WEBGPU
+                ? "layout(set = 0, binding = %d, std140) uniform PshUniforms {\n"
+                : "layout(binding = %d, std140) uniform PshUniforms {\n",
             ps->opts.ubo_binding);
     } else {
         mstring_append_fmt(preflight,
                            "layout(location = 0) out vec4 fragColor;\n");
     }
 
-    const char *u = ps->opts.vulkan ? "" : "uniform ";
+    const char *u = psh_uses_spirv(ps) ? "" : "uniform ";
     for (int i = 0; i < ARRAY_SIZE(PshUniformInfo); i++) {
         const UniformInfo *info = &PshUniformInfo[i];
         const char *type_str = uniform_element_type_to_str[info->type];
@@ -844,7 +852,7 @@ static MString* psh_convert(struct PixelShader *ps)
         }
     }
 
-    if (ps->opts.vulkan) {
+    if (psh_uses_spirv(ps)) {
         mstring_append(preflight, "};\n");
     }
 
@@ -1369,7 +1377,7 @@ static MString* psh_convert(struct PixelShader *ps)
         }
 
         if (sampler_type != NULL) {
-            if (ps->opts.vulkan) {
+            if (psh_uses_spirv(ps)) {
                 mstring_append_fmt(preflight, "layout(binding = %d) ", ps->opts.tex_binding + i);
             }
             mstring_append_fmt(preflight, "uniform %s texSamp%d;\n", sampler_type, i);
@@ -1518,7 +1526,8 @@ static MString* psh_convert(struct PixelShader *ps)
     }
 
     MString *final = mstring_new();
-    mstring_append_fmt(final, "#version %d\n\n", ps->opts.vulkan ? 450 : 400);
+    mstring_append_fmt(final, "#version %d\n\n",
+                       psh_uses_spirv(ps) ? 450 : 400);
     mstring_append(final, mstring_get_str(preflight));
     mstring_append(final, "void main() {\n");
     mstring_append(final, mstring_get_str(clip));

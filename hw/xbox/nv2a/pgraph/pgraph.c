@@ -253,6 +253,13 @@ void pgraph_clear_dirty_reg_map(PGRAPHState *pg)
 
 static CONFIG_DISPLAY_RENDERER get_default_renderer(void)
 {
+#ifdef __EMSCRIPTEN__
+#ifdef CONFIG_WEBGPU
+    if (renderers[CONFIG_DISPLAY_RENDERER_WEBGPU]) {
+        return CONFIG_DISPLAY_RENDERER_WEBGPU;
+    }
+#endif
+#else
 #ifdef CONFIG_OPENGL
     if (renderers[CONFIG_DISPLAY_RENDERER_OPENGL]) {
         return CONFIG_DISPLAY_RENDERER_OPENGL;
@@ -262,6 +269,12 @@ static CONFIG_DISPLAY_RENDERER get_default_renderer(void)
     if (renderers[CONFIG_DISPLAY_RENDERER_VULKAN]) {
         return CONFIG_DISPLAY_RENDERER_VULKAN;
     }
+#endif
+#ifdef CONFIG_WEBGPU
+    if (renderers[CONFIG_DISPLAY_RENDERER_WEBGPU]) {
+        return CONFIG_DISPLAY_RENDERER_WEBGPU;
+    }
+#endif
 #endif
     fprintf(stderr, "Warning: No available renderer\n");
     return CONFIG_DISPLAY_RENDERER_NULL;

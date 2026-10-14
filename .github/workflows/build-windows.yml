@@ -75,6 +75,13 @@ jobs:
           opts=()
         fi
         echo "XEMU_BUILD_OPTIONS=${opts[*]}" >> "$GITHUB_ENV"
+    - name: Install pinned Dawn SDK
+      if: ${{ matrix.arch == 'x86_64' }}
+      run: |
+        python3 scripts/download-dawn.py \
+          --platform windows --arch x86_64 --output "$GITHUB_WORKSPACE/dawn"
+        echo "CMAKE_PREFIX_PATH=$GITHUB_WORKSPACE/dawn" >> "$GITHUB_ENV"
+        echo "XEMU_BUILD_OPTIONS=$XEMU_BUILD_OPTIONS --enable-webgpu" >> "$GITHUB_ENV"
     - name: Compile
       run: ./build.sh -p win64-cross ${XEMU_BUILD_OPTIONS}
     - name: Report ccache stats

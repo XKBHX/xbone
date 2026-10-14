@@ -1886,7 +1886,8 @@ endif
 epoxy = dependency('epoxy', required: true)
 
 opengl = not_found
-if not get_option('opengl').auto() or have_system or have_vhost_user_gpu
+if get_option('opengl').enabled() or \
+   (get_option('opengl').auto() and (have_system or have_vhost_user_gpu))
   # FIXME: Use meson's 'gl' dep
   if host_os == 'darwin'
     opengl_libs=['-framework', 'OpenGL']
@@ -2387,11 +2388,32 @@ endif
 
 vulkan = not_found
 libglslang = not_found
+webgpu = not_found
 
 if host_os == 'windows'
   vulkan = declare_dependency(compile_args: ['-DVK_USE_PLATFORM_WIN32_KHR'])
 elif host_os == 'linux'
   vulkan = dependency('vulkan')
+endif
+
+if host_os == 'emscripten' and not get_option('webgpu').disabled()
+  webgpu = declare_dependency(
+    compile_args: ['--use-port=emdawnwebgpu'],
+    link_args: ['--use-port=emdawnwebgpu'],
+  )
+elif not get_option('webgpu').disabled()
+  webgpu = dependency('dawn', method: 'pkg-config', required: false)
+  if not webgpu.found()
+    webgpu = dependency(
+      'Dawn',
+      method: 'cmake',
+      modules: ['dawn::webgpu_dawn'],
+      required: false,
+    )
+  endif
+  if not webgpu.found()
+    webgpu = dependency('webgpu_dawn', required: get_option('webgpu'))
+  endif
 endif
 
 if vulkan.found()
@@ -2699,6 +2721,7 @@ if numa.found()
 endif
 config_host_data.set('CONFIG_OPENGL', opengl.found())
 config_host_data.set('CONFIG_VULKAN', vulkan.found())
+config_host_data.set('CONFIG_WEBGPU', webgpu.found())
 config_host_data.set('CONFIG_PLUGIN', get_option('plugins'))
 config_host_data.set('CONFIG_RBD', rbd.found())
 config_host_data.set('CONFIG_RDMA', rdma.found())
@@ -5121,6 +5144,7 @@ summary(summary_info, bool_yn: true, section: 'User interface')
 summary_info = {}
 summary_info += {'VirGL support':     virgl}
 summary_info += {'Rutabaga support':  rutabaga}
+summary_info += {'WebGPU support':    webgpu}
 summary(summary_info, bool_yn: true, section: 'Graphics backends')
 
 # Audio backends

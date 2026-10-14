@@ -33,6 +33,17 @@ typedef float vec2[2];
 typedef float vec3[3];
 typedef float vec4[4];
 
+typedef enum PgraphGlslTarget {
+    PGRAPH_GLSL_TARGET_GL,
+    PGRAPH_GLSL_TARGET_VULKAN,
+    PGRAPH_GLSL_TARGET_WEBGPU,
+} PgraphGlslTarget;
+
+static inline bool pgraph_glsl_target_uses_spirv(PgraphGlslTarget target)
+{
+    return target != PGRAPH_GLSL_TARGET_GL;
+}
+
 #define UNIFORM_ELEMENT_TYPE_X(DECL) \
     DECL(float)                      \
     DECL(int)                        \

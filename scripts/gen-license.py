@@ -329,6 +329,14 @@ LIBS = [
         submodule=Submodule("subprojects/glslang.wrap"),
     ),
     Lib(
+        "dawn",
+        "https://dawn.googlesource.com/dawn",
+        bsd_3clause,
+        "https://dawn.googlesource.com/dawn/+/refs/heads/main/LICENSE?format=TEXT",
+        ships_static=all_platforms,
+        version="v20261013.193955",
+    ),
+    Lib(
         "NVIDIA NVAPI",
         "https://github.com/NVIDIA/nvapi",
         mit,
