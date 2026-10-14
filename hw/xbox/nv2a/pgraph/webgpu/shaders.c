@@ -175,9 +175,6 @@ get_texture_layout(PGRAPHWgpuState *r,
     pl_desc.bindGroupLayouts = layouts;
     l->pipeline_layout = wgpuDeviceCreatePipelineLayout(r->device, &pl_desc);
 
-    l->dummy_bind_group = pgraph_wgpu_create_dummy_texture_bind_group(
-        r, l->bind_group_layout, types);
-
     g_array_append_val(r->texture_layouts, l);
     return l;
 }
@@ -388,7 +385,6 @@ void pgraph_wgpu_finalize_shaders(PGRAPHState *pg)
         for (guint i = 0; i < r->texture_layouts->len; i++) {
             WgpuTextureLayout *l =
                 g_array_index(r->texture_layouts, WgpuTextureLayout *, i);
-            wgpuBindGroupRelease(l->dummy_bind_group);
             wgpuPipelineLayoutRelease(l->pipeline_layout);
             wgpuBindGroupLayoutRelease(l->bind_group_layout);
             g_free(l);

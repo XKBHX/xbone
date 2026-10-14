@@ -674,8 +674,10 @@ static void set_draw_state(PGRAPHState *pg, WGPURenderPipeline pipeline,
     wgpuRenderPassEncoderSetPipeline(pass, pipeline);
     wgpuRenderPassEncoderSetBindGroup(pass, 0, r->uniform_bind_group, 2,
                                       r->uniform_offsets);
-    wgpuRenderPassEncoderSetBindGroup(
-        pass, 1, r->shader_binding->texture_layout->dummy_bind_group, 0, NULL);
+    wgpuRenderPassEncoderSetBindGroup(pass, 1,
+                                      pgraph_wgpu_get_texture_bind_group(
+                                          r, r->shader_binding->texture_layout),
+                                      0, NULL);
     if (vertex_size) {
         wgpuRenderPassEncoderSetVertexBuffer(
             pass, 0, r->stream_buffers[WGPU_STREAM_VERTEX].buffer,
@@ -821,6 +823,7 @@ void pgraph_wgpu_flush_draw(NV2AState *d)
     if (!b->valid) {
         return;
     }
+    pgraph_wgpu_bind_textures(d);
 
     int primitive_mode = b->state.geom.primitive_mode;
     bool expand;

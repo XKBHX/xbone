@@ -111,7 +111,7 @@ static WGPUDevice request_device(PGRAPHWgpuState *r, Error **errp)
     WGPURequestDeviceCallbackInfo callback =
         WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
     WGPUFutureWaitInfo wait_info = WGPU_FUTURE_WAIT_INFO_INIT;
-    WGPUFeatureName required_features[2] = {
+    WGPUFeatureName required_features[3] = {
         WGPUFeatureName_Depth32FloatStencil8,
     };
     size_t num_required_features = 1;
@@ -128,6 +128,12 @@ static WGPUDevice request_device(PGRAPHWgpuState *r, Error **errp)
     if (r->depth_clip_control) {
         required_features[num_required_features++] =
             WGPUFeatureName_DepthClipControl;
+    }
+    r->float32_filterable =
+        wgpuAdapterHasFeature(adapter, WGPUFeatureName_Float32Filterable);
+    if (r->float32_filterable) {
+        required_features[num_required_features++] =
+            WGPUFeatureName_Float32Filterable;
     }
     descriptor.requiredFeatureCount = num_required_features;
     descriptor.requiredFeatures = required_features;
