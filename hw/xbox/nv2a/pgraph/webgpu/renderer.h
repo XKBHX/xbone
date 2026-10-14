@@ -25,6 +25,7 @@
 #include <webgpu/webgpu.h>
 
 #include "constants.h"
+#include "prim.h"
 
 typedef struct WgpuUniformMember {
     int offset; // -1 if the member is not in the block
@@ -329,6 +330,7 @@ void pgraph_wgpu_clear_surface(NV2AState *d, uint32_t parameter);
 void pgraph_wgpu_draw_begin(NV2AState *d);
 void pgraph_wgpu_draw_end(NV2AState *d);
 void pgraph_wgpu_flush_draw(NV2AState *d);
+WgpuPrimState pgraph_wgpu_get_prim_state(const GeomState *geom);
 
 // blit.c
 void pgraph_wgpu_image_blit(NV2AState *d);

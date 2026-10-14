@@ -96,6 +96,13 @@ MString *pgraph_glsl_get_vtx_header(MString *out, PgraphGlslTarget target,
                            suffix_s);
     }
 
+    /* Point sprite texture coordinates, as WebGPU has no gl_PointCoord */
+    if (target == PGRAPH_GLSL_TARGET_WEBGPU) {
+        mstring_append_fmt(out,
+                           "layout(location = %zu) %s vec4 %svtxPtCoord;\n",
+                           ARRAY_SIZE(attr), in_out_s, prefix_s);
+    }
+
     return out;
 }
 

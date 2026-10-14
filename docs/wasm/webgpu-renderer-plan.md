@@ -37,7 +37,7 @@ Non-goals for this plan:
 | Native implementation | Dawn | Dawn ships the Emscripten port (`emdawnwebgpu`), the WGSL compiler (Tint), and native SPIR-V ingestion, which helps bring-up. |
 | Threading | The device is created and used **only on the PFIFO thread**, like the Vulkan backend | Matches the existing locking model. In the browser, WebGPU objects can't move between workers, so this is mandatory there. |
 | Shader language | **Bring-up only**: reuse the GLSL generator, compile to SPIR-V with the existing glslang code, and feed SPIR-V to Dawn natively. **Then a native WGSL generator** (phase 3), built before the performance work | Gets pixels quickly while keeping the long-term path free of translation layers. The browser only accepts WGSL, and no Tint has to ship inside the WASM binary. |
-| Primitives that need geometry shaders | CPU index rewriting, plus vertex pulling for point sprites | WebGPU has no geometry stage, no quads, no fans, and no polygon mode. |
+| Primitives that need geometry shaders | CPU index rewriting, plus instanced quads for point sprites | WebGPU has no geometry stage, no quads, no fans, and no polygon mode. |
 | Display (native) | Start with the existing "download to RAM, return `0`" fallback | This is exactly what Vulkan does without external memory (`vk/renderer.c`). The UI needs no changes. |
 | Display and UI (browser) | **The UI moves to WebGPU.** One device and one canvas (`OffscreenCanvas`), both owned by the PFIFO worker. ImGui draw data is built on the UI thread and handed to the PFIFO thread, which records the UI pass after the game frame | Avoids WebGPU↔WebGL interop, which browsers don't offer, and the game frame never leaves the GPU. WebGPU objects can't cross workers, so the UI pass has to be recorded on the device's thread. |
 | Native CI dependency | **Prebuilt Dawn**, pinned by version and checksum | Building Dawn from source makes CI much slower. A pinned prebuilt keeps builds reproducible. |
@@ -60,7 +60,7 @@ Each one needs a fallback.
 | Provoking vertex (flat shading) | WGSL `@interpolate(flat)` uses the **first** vertex | During list expansion, rotate each triangle's indices so the NV2A provoking vertex comes first. Strips with last-vertex provoking get converted to lists. |
 | Winding fix-ups (`tri_rot0/1`) | — | Apply them in the same index rewrite. |
 | Strip primitive restart | always on for indexed strips | Use `uint32` indices for strips, so `0xFFFF` is never treated as a restart. Or convert strips to lists. |
-| Point sprites / point size > 1 | 1-pixel points only | **Vertex pulling.** Draw 6 vertices per instance, one instance per point. The vertex shader reads attributes from a storage buffer, then expands the point in clip space. Particles are common in games, so this needs to land in phase 2. |
+| Point sprites / point size > 1 | 1-pixel points only | **Instanced quads** (phase 2 step 2). Draw a 4-vertex triangle strip per instance, one instance per point, with the packed vertex buffer stepped per instance. The vertex shader expands the point in clip space. This replaced the original vertex-pulling plan because it needs no storage buffers. |
 | Wide lines | 1-pixel lines only | Accept the difference (the Vulkan backend treats `wideLines` as optional in `vk/instance.c`). |
 
 Implement this as a standalone, unit-testable module
@@ -174,7 +174,7 @@ Each phase ends with a demonstrable exit criterion.
 | --- | --- |
 | 0. Groundwork | Done. Natively on macOS arm64 (Dawn Metal backend, Apple M1 Pro), `display.renderer = "WEBGPU"` creates a device and boots with a black screen and no asserts. Not yet run on Linux or Windows. |
 | 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 needs a Dawn built with the SPIR-V reader (see the step 4 notes). |
-| 2. Feature completeness | Step 1 (primitive assembly) is done, with host unit tests (`tests/xbox/prim`). Steps 2–7 have not started. |
+| 2. Feature completeness | Step 1 (primitive assembly, with host unit tests in `tests/xbox/prim`) and step 2 (point size and point sprites) are done. Steps 3–7 have not started. |
 | 3. WGSL generator | Not started. |
 | 4. Performance | Not started. |
 | 5. WebGPU UI and browser | Not started. |
@@ -315,7 +315,7 @@ Phase 1 notes (step 4, draw path):
   attachment (compare Always, no writes).
 - Known gaps: flat-shading provoking vertex and polygon modes (both handled
   since phase 2 step 1), point sprites
-  and point size, `x8y24` uint sampling, and culling of both faces (those
+  and point size (handled since phase 2 step 2), `x8y24` uint sampling, and culling of both faces (those
   draws are skipped). Constant-alpha blend factors use the blend constant
   with alpha in every channel. Emscripten can't use this path until the
   phase 3 WGSL generator exists.
@@ -406,6 +406,49 @@ Phase 2 notes (step 1, primitive assembly):
     shaders' TODO. When the front and back polygon modes differ, the front
     mode is used and `NV2A_UNIMPLEMENTED` is logged.
 
+Phase 2 notes (step 2, point size and point sprites):
+
+- WebGPU only rasterizes 1-pixel points, so every point, whether from
+  `PRIM_TYPE_POINTS` or polygon point mode, is an instance of a 4-vertex
+  triangle strip. The packed vertex buffer is stepped per instance, and
+  the vertex shader (`GenVshGlslOptions.point_quads`) moves each corner by
+  half of `oPts.x` (at least 1) pixels in clip space. The point size math
+  is the generator's existing code, the same that feeds `gl_PointSize` for
+  Vulkan. Point quads are never culled.
+- Instance data can't go through an index buffer, so indexed point draws
+  and polygon point mode pack their vertices on the CPU in draw order.
+  Non-indexed draws use `firstInstance` for each range.
+- WebGPU has no `gl_PointCoord`, so the WebGPU target adds a `vtxPtCoord`
+  varying, which the pixel shader uses for texture 3 when point sprites
+  are on. Point quads write their corner, `(0, 0)` at the top left. Other
+  primitives write their own texture 3 coordinates. On hardware, point
+  sprite mode leaves non-point primitives textured normally: the "Quad"
+  column of nxdk_pgraph_tests `Point sprite/AlphaMask_FF` in the hardware
+  golden results shows this. Vulkan reads `gl_PointCoord` there, which is
+  undefined for non-points, and draws a dark square.
+- The original plan used vertex pulling from a storage buffer. Instancing
+  gives the same result with fixed-function vertex fetch, and also works
+  where vertex-stage storage buffers are limited.
+- Checked with the nxdk_pgraph_tests release `v2026-10-10_21-27-19` on
+  macOS arm64:
+  - The `Point params` and `Point size` suites (including the 64-pixel
+    `LargestPointSize` cases) match Vulkan side by side.
+  - The `Point sprite` `AlphaMask_FF`, `AlphaMask_VS` and `AlphaTest` cases
+    match Vulkan, and on the Quad column they match the hardware golden
+    image rather than Vulkan.
+  - No WebGPU validation errors.
+- Known differences:
+  - Fractional sizes below about 2 pixels can cover slightly different
+    pixels than Vulkan's point rasterization, because quads follow
+    triangle coverage rules.
+  - Points whose centre is outside the viewport but whose quad overlaps it
+    are partly drawn; Vulkan discards them by the centre.
+  - `PolygonMode_Point` didn't run with the release ISO and config used
+    here, so polygon point mode hasn't been checked on screen.
+- Odd vertex formats and strides need nothing more for now. The CPU
+  packer from phase 1 already converts every format and stride. Reading
+  vertices straight from a guest RAM mirror is phase 4.
+
 ### Phase 0: groundwork and refactors (small, landable on its own)
 
 1. **Config and build plumbing.**
@@ -458,7 +501,7 @@ nxdk_pgraph_tests (clears, simple geometry, texture formats) match Vulkan.
 1. `prim.c`: quads, quad strips, polygons, fans, line loops, polygon modes,
    provoking-vertex rotation and winding. Write host-side unit tests first,
    with no GPU (see section 6).
-2. Vertex pulling for point sprites and point size, plus odd formats and
+2. Point sprites and point size (instanced quads), plus odd formats and
    strides.
 3. The full texture format table, including swizzle-in-shader, border and
    clamp emulation, LOD bias, `R16_UNORM` and `R8G8B8_SNORM` fallbacks, and

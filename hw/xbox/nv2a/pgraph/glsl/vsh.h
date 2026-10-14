@@ -101,6 +101,9 @@ typedef struct GenVshGlslOptions {
     bool prefix_outputs;
     bool use_push_constants_for_uniform_attrs;
     int ubo_binding;
+    /* WebGPU only: each point is an instance of a 4-vertex triangle strip,
+     * expanded here to the point size */
+    bool point_quads;
 } GenVshGlslOptions;
 
 MString *pgraph_glsl_gen_vsh(const VshState *state,

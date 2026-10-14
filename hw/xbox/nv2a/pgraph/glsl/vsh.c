@@ -414,6 +414,19 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
     /* Tint only accepts a constant point size of 1.0. */
     if (opts.target == PGRAPH_GLSL_TARGET_WEBGPU) {
         mstring_append(body, "  vtxPos1 = vec4(1.0 / vtxPos.w);\n");
+        if (opts.point_quads) {
+            /* oPos.xy is in clip space, where one pixel is 2 / surfaceSize */
+            mstring_append(
+                body,
+                "  int ptIndex = gl_VertexIndex;\n"
+                "  vec2 ptCorner = vec2(ptIndex & 1, ptIndex >> 1);\n"
+                "  vec2 ptOffset = (2.0 * ptCorner - 1.0) / surfaceSize;\n"
+                "  oPos.xy += ptOffset * max(oPts.x, 1.0) * oPos.w;\n"
+                "  vtxPtCoord = vec4(ptCorner, 1.0, 1.0);\n");
+        } else {
+            /* Point sprites only replace texture 3 coordinates on points */
+            mstring_append(body, "  vtxPtCoord = vtxT3;\n");
+        }
     } else {
         mstring_append(body,
                        "  vtxPos1 = vtxPos;\n"
