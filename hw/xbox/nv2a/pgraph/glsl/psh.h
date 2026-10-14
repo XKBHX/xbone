@@ -102,6 +102,19 @@ typedef struct GenPshGlslOptions {
 
 MString *pgraph_glsl_gen_psh(const PshState *state, GenPshGlslOptions opts);
 
+typedef enum PshTextureType {
+    PSH_TEXTURE_TYPE_NONE,
+    PSH_TEXTURE_TYPE_2D,
+    PSH_TEXTURE_TYPE_2D_UINT,
+    PSH_TEXTURE_TYPE_3D,
+    PSH_TEXTURE_TYPE_CUBE,
+} PshTextureType;
+
+/* Texture type declared for each stage by pgraph_glsl_gen_psh. */
+void pgraph_glsl_get_psh_texture_types(const PshState *state,
+                                       PgraphGlslTarget target,
+                                       PshTextureType types[4]);
+
 void pgraph_glsl_set_psh_uniform_values(PGRAPHState *pg,
                                         const PshUniformLocs locs,
                                         PshUniformValues *values);

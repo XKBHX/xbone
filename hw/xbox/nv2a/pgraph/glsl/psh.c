@@ -816,7 +816,7 @@ static void define_colorkey_comparator(MString *preflight)
 static MString* psh_convert(struct PixelShader *ps)
 {
     MString *preflight = mstring_new();
-    pgraph_glsl_get_vtx_header(preflight, psh_uses_spirv(ps),
+    pgraph_glsl_get_vtx_header(preflight, ps->opts.target,
                              ps->state->smooth_shading, true, false, false);
 
     if (psh_uses_spirv(ps)) {
@@ -984,6 +984,21 @@ static MString* psh_convert(struct PixelShader *ps)
         );
 
     MString *clip = mstring_new();
+    bool webgpu = ps->opts.target == PGRAPH_GLSL_TARGET_WEBGPU;
+    if (webgpu) {
+        /* No geometry stage, so the per-primitive depth plane is replaced by
+         * screen-space interpolation and derivatives. These must be computed
+         * before any discard. */
+        mstring_append_fmt(
+            clip,
+            "float zPlane = %s;\n"
+            "vec2 zGrad = vec2(dFdx(zPlane), dFdy(zPlane)) * vec2(surfaceScale);\n"
+            "float zSlope = max(abs(zGrad.x), abs(zGrad.y));\n"
+            "if (isnan(zSlope) || isinf(zSlope)) {\n"
+            "  zSlope = 0.0;\n"
+            "}\n",
+            ps->state->z_perspective ? "vtxPos1.x" : "vtxPos0.z");
+    }
     mstring_append_fmt(clip, "/*  Window-clip (%slusive) */\n",
                        ps->state->window_clip_exclusive ? "Exc" : "Inc");
     if (!ps->state->window_clip_exclusive) {
@@ -1009,7 +1024,25 @@ static MString* psh_convert(struct PixelShader *ps)
                              "}\n");
     }
 
-    if (ps->state->z_perspective) {
+    if (webgpu && ps->state->z_perspective) {
+        mstring_append(
+            clip,
+            "precise float zvalue = 1.0 / zPlane;\n"
+            "if (zvalue > 0.0) {\n"
+            "  float zslopeofs = depthFactor*zSlope*zvalue*zvalue;\n"
+            "  zvalue += depthOffset;\n"
+            "  zvalue += zslopeofs;\n"
+            "} else {\n"
+            "  zvalue = uintBitsToFloat(0x7F7FFFFFu);\n"
+            "}\n"
+            "if (isnan(zvalue)) {\n"
+            "  zvalue = uintBitsToFloat(0x7F7FFFFFu);\n"
+            "}\n");
+    } else if (webgpu) {
+        mstring_append(clip, "precise float zvalue = zPlane;\n"
+                             "zvalue += depthOffset;\n"
+                             "zvalue += depthFactor*zSlope;\n");
+    } else if (ps->state->z_perspective) {
         mstring_append(
             clip,
             "vec2 unscaled_xy = gl_FragCoord.xy / surfaceScale;\n"
@@ -1083,7 +1116,7 @@ static MString* psh_convert(struct PixelShader *ps)
     mstring_append(vars, "vec4 pT0 = vtxT0;\n");
     mstring_append(vars, "vec4 pT1 = vtxT1;\n");
     mstring_append(vars, "vec4 pT2 = vtxT2;\n");
-    if (ps->state->point_sprite) {
+    if (ps->state->point_sprite && !webgpu) {
         assert(!ps->state->rect_tex[3]);
         mstring_append(vars, "vec4 pT3 = vec4(gl_PointCoord, 1.0, 1.0);\n");
     } else {
@@ -1376,11 +1409,28 @@ static MString* psh_convert(struct PixelShader *ps)
             break;
         }
 
-        if (sampler_type != NULL) {
+        if (sampler_type != NULL && webgpu) {
+            /* WebGPU has no combined image samplers. "sampler2D" becomes
+             * "texture2D" etc. */
+            const char *sampler_s = strstr(sampler_type, "sampler");
+            assert(sampler_s);
+            int binding = ps->opts.tex_binding + 2 * i;
+            mstring_append_fmt(
+                preflight,
+                "layout(set = 1, binding = %d) uniform %.*stexture%s texSamp%d_tex;\n"
+                "layout(set = 1, binding = %d) uniform sampler texSamp%d_smp;\n"
+                "#define texSamp%d %s(texSamp%d_tex, texSamp%d_smp)\n",
+                binding, (int)(sampler_s - sampler_type), sampler_type,
+                sampler_s + strlen("sampler"), i, binding + 1, i, i,
+                sampler_type, i, i);
+        } else if (sampler_type != NULL) {
             if (psh_uses_spirv(ps)) {
                 mstring_append_fmt(preflight, "layout(binding = %d) ", ps->opts.tex_binding + i);
             }
             mstring_append_fmt(preflight, "uniform %s texSamp%d;\n", sampler_type, i);
+        }
+
+        if (sampler_type != NULL) {
 
             /* As this means a texture fetch does happen, do alphakill */
             if (ps->state->alphakill[i]) {
@@ -1528,6 +1578,7 @@ static MString* psh_convert(struct PixelShader *ps)
     MString *final = mstring_new();
     mstring_append_fmt(final, "#version %d\n\n",
                        psh_uses_spirv(ps) ? 450 : 400);
+    pgraph_glsl_append_target_header(final, ps->opts.target);
     mstring_append(final, mstring_get_str(preflight));
     mstring_append(final, "void main() {\n");
     mstring_append(final, mstring_get_str(clip));
@@ -1626,6 +1677,33 @@ MString *pgraph_glsl_gen_psh(const PshState *state, GenPshGlslOptions opts)
     }
 
     return psh_convert(&ps);
+}
+
+void pgraph_glsl_get_psh_texture_types(const PshState *state,
+                                       PgraphGlslTarget target,
+                                       PshTextureType types[4])
+{
+    struct PixelShader ps;
+    memset(&ps, 0, sizeof(ps));
+    ps.opts.target = target;
+    ps.state = state;
+
+    for (int i = 0; i < 4; i++) {
+        int mode = (state->shader_stage_program >> (i * 5)) & 0x1F;
+        const char *sampler_type = get_sampler_type(&ps, mode, i);
+        if (sampler_type == NULL) {
+            types[i] = PSH_TEXTURE_TYPE_NONE;
+        } else if (!strcmp(sampler_type, "usampler2D")) {
+            types[i] = PSH_TEXTURE_TYPE_2D_UINT;
+        } else if (!strcmp(sampler_type, "sampler3D")) {
+            types[i] = PSH_TEXTURE_TYPE_3D;
+        } else if (!strcmp(sampler_type, "samplerCube")) {
+            types[i] = PSH_TEXTURE_TYPE_CUBE;
+        } else {
+            assert(!strcmp(sampler_type, "sampler2D"));
+            types[i] = PSH_TEXTURE_TYPE_2D;
+        }
+    }
 }
 
 void pgraph_glsl_set_psh_uniform_values(PGRAPHState *pg,

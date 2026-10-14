@@ -307,9 +307,9 @@ MString *pgraph_glsl_gen_geom(const GeomState *state, GenGeomGlslOptions opts)
                          "#define v_vtxPos v_vtxPos0\n"
                          "\n",
                          spirv ? 450 : 400, layout_in, layout_out);
-    pgraph_glsl_get_vtx_header(output, spirv, state->smooth_shading, true,
-                               true, true);
-    pgraph_glsl_get_vtx_header(output, spirv, state->smooth_shading,
+    pgraph_glsl_get_vtx_header(output, opts.target, state->smooth_shading,
+                               true, true, true);
+    pgraph_glsl_get_vtx_header(output, opts.target, state->smooth_shading,
                                false, false, false);
 
     char vertex_order_buf[80];
