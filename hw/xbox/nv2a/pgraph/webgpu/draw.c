@@ -825,10 +825,18 @@ void pgraph_wgpu_flush_draw(NV2AState *d)
     }
     pgraph_wgpu_bind_textures(d);
 
-    int primitive_mode = b->state.geom.primitive_mode;
+    const GeomState *geom = &b->state.geom;
+    if (geom->polygon_front_mode != geom->polygon_back_mode) {
+        NV2A_UNIMPLEMENTED("Different front and back polygon modes");
+    }
+    WgpuPrimState prim = {
+        .primitive_mode = geom->primitive_mode,
+        .polygon_mode = geom->polygon_front_mode,
+        .flat = !geom->smooth_shading,
+        .first_vertex_is_provoking = geom->first_vertex_is_provoking,
+    };
     bool expand;
-    WGPUPrimitiveTopology topology =
-        pgraph_wgpu_prim_topology(primitive_mode, &expand);
+    WGPUPrimitiveTopology topology = pgraph_wgpu_prim_topology(&prim, &expand);
     if (culls_all_triangles(pg, topology)) {
         return;
     }
@@ -836,12 +844,12 @@ void pgraph_wgpu_flush_draw(NV2AState *d)
     size_t max_indices = 0;
     if (expand && pg->draw_arrays_length) {
         for (int i = 0; i < pg->draw_arrays_length; i++) {
-            max_indices += pgraph_wgpu_prim_max_indices(
-                primitive_mode, pg->draw_arrays_count[i]);
+            max_indices +=
+                pgraph_wgpu_prim_max_indices(&prim, pg->draw_arrays_count[i]);
         }
     } else if (expand) {
         max_indices = pgraph_wgpu_prim_max_indices(
-            primitive_mode, elements ? num_elements : num_vertices);
+            &prim, elements ? num_elements : num_vertices);
     } else if (elements) {
         max_indices = num_elements;
     }
@@ -879,13 +887,13 @@ void pgraph_wgpu_flush_draw(NV2AState *d)
         if (expand && pg->draw_arrays_length) {
             for (int i = 0; i < pg->draw_arrays_length; i++) {
                 num_indices += pgraph_wgpu_prim_expand(
-                    primitive_mode, NULL, pg->draw_arrays_start[i] - first,
+                    &prim, NULL, pg->draw_arrays_start[i] - first,
                     pg->draw_arrays_count[i], indices + num_indices);
             }
         } else if (expand) {
             num_indices = pgraph_wgpu_prim_expand(
-                primitive_mode, elements, 0,
-                elements ? num_elements : num_vertices, indices);
+                &prim, elements, 0, elements ? num_elements : num_vertices,
+                indices);
         } else {
             memcpy(indices, elements, num_elements * sizeof(uint32_t));
             num_indices = num_elements;

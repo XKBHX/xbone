@@ -174,7 +174,7 @@ Each phase ends with a demonstrable exit criterion.
 | --- | --- |
 | 0. Groundwork | Done. Natively on macOS arm64 (Dawn Metal backend, Apple M1 Pro), `display.renderer = "WEBGPU"` creates a device and boots with a black screen and no asserts. Not yet run on Linux or Windows. |
 | 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 needs a Dawn built with the SPIR-V reader (see the step 4 notes). |
-| 2. Feature completeness | Not started. |
+| 2. Feature completeness | Step 1 (primitive assembly) is done, with host unit tests (`tests/xbox/prim`). Steps 2–7 have not started. |
 | 3. WGSL generator | Not started. |
 | 4. Performance | Not started. |
 | 5. WebGPU UI and browser | Not started. |
@@ -313,7 +313,8 @@ Phase 1 notes (step 4, draw path):
   WebGPU requires a depth attachment whenever the fragment shader writes
   depth, so a draw with no zeta surface uses a scratch `depth24plus`
   attachment (compare Always, no writes).
-- Known gaps: flat-shading provoking vertex, polygon modes, point sprites
+- Known gaps: flat-shading provoking vertex and polygon modes (both handled
+  since phase 2 step 1), point sprites
   and point size, `x8y24` uint sampling, and culling of both faces (those
   draws are skipped). Constant-alpha blend factors use the blend constant
   with alpha in every channel. Emscripten can't use this path until the
@@ -367,6 +368,43 @@ Phase 1 notes (step 5, textures):
   phase 2 step 3. Only the dashboard's formats have been checked on screen.
   The depth, `Y16`, `R6G5B5`, cube and 3D paths compile, but nothing has
   exercised them yet.
+
+Phase 2 notes (step 1, primitive assembly):
+
+- `prim.c` takes a `WgpuPrimState` (primitive mode, polygon mode, flat
+  shading, provoking vertex) built from the shader binding's `GeomState`.
+  It returns the host topology and, when needed, rewrites the draw into an
+  index list. It follows the geometry shaders in `glsl/geom.c`:
+  - Fill mode splits quads along the 0-2 diagonal and quad strip quads into
+    `(0, 1, 2)` and `(2, 1, 3)`, as Vulkan does. Fans and polygons share
+    vertex 0.
+  - Line mode emits the three edges of every triangle (strips and fans
+    included), the four outer edges of every quad, and the closed outline
+    of a polygon. Point mode emits every triangle's or quad's vertices,
+    and every polygon vertex once.
+  - Line loops of two vertices draw one segment.
+- With flat shading, WebGPU takes the first vertex of each primitive. So
+  every triangle is rotated, keeping its winding, to put the NV2A
+  provoking vertex first. Strips and fans use the same provoking vertex as
+  the geometry shader. With last-vertex provoking, lines are reversed.
+  Flat-shaded triangle strips are always converted to lists, so the
+  host's rule for odd strip triangles never matters.
+- Quads and quad strips take flat attributes from their fourth vertex. The
+  first triangle of a 0-2 split doesn't contain that vertex, so flat quads
+  are split along the 1-3 diagonal instead, and flat quad strips along
+  0-3. Interpolated attributes such as texture coordinates can differ
+  from Vulkan for non-planar quads, or quads that aren't parallelograms.
+- Differences from Vulkan and the geometry shaders:
+  - Polygon line mode closes the outline. Vulkan draws an open line strip
+    and marks it `FIXME`.
+  - Polygon point mode works; the geometry shader generator asserts.
+  - In line and point modes, the geometry shaders give every edge and
+    point the flat attributes of its triangle's provoking vertex. Index
+    rewriting can't express this, so each edge or point uses its own
+    first vertex.
+  - Line and point modes do no face culling, which matches the geometry
+    shaders' TODO. When the front and back polygon modes differ, the front
+    mode is used and `NV2A_UNIMPLEMENTED` is logged.
 
 ### Phase 0: groundwork and refactors (small, landable on its own)
 
