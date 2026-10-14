@@ -18,19 +18,25 @@
 
 #include <webgpu/webgpu.h>
 
-/* Host topology for an NV2A primitive (enum ShaderPrimitiveMode). If
- * *expand is set, the primitive must be rewritten into a list with
- * pgraph_wgpu_prim_expand(). */
-WGPUPrimitiveTopology pgraph_wgpu_prim_topology(int primitive_mode,
+typedef struct WgpuPrimState {
+    int primitive_mode; /* enum ShaderPrimitiveMode */
+    int polygon_mode; /* enum ShaderPolygonMode */
+    bool flat;
+    bool first_vertex_is_provoking;
+} WgpuPrimState;
+
+/* Host topology for an NV2A primitive. If *expand is set, the primitive must
+ * be rewritten into a list with pgraph_wgpu_prim_expand(). */
+WGPUPrimitiveTopology pgraph_wgpu_prim_topology(const WgpuPrimState *s,
                                                 bool *expand);
 
 /* Upper bound on the indices pgraph_wgpu_prim_expand() emits for count
  * vertices. */
-size_t pgraph_wgpu_prim_max_indices(int primitive_mode, size_t count);
+size_t pgraph_wgpu_prim_max_indices(const WgpuPrimState *s, size_t count);
 
 /* Expands count vertices into list indices. Vertex i is in[i] if in is not
  * NULL, otherwise base + i. Returns the number of indices written. */
-size_t pgraph_wgpu_prim_expand(int primitive_mode, const uint32_t *in,
+size_t pgraph_wgpu_prim_expand(const WgpuPrimState *s, const uint32_t *in,
                                uint32_t base, size_t count, uint32_t *out);
 
 #endif

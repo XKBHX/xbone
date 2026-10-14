@@ -39,7 +39,8 @@ What exists:
 - `hw/xbox/nv2a/pgraph/webgpu` is an early WebGPU renderer
   (`-Dwebgpu=enabled`). On Emscripten it builds against the `emdawnwebgpu`
   port and is the only renderer offered. Natively it has the surface
-  cache, clears, image blits, the draw path, textures and the
+  cache, clears, image blits, the draw path, textures, primitive assembly
+  (polygon modes and the flat-shading provoking vertex) and the
   download-to-RAM display path, and it renders the dashboard. It still
   compiles shaders through SPIR-V, so it can't draw under Emscripten until
   the WGSL generator exists.
