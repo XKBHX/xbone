@@ -76,20 +76,22 @@ typedef struct PshState {
 
 void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state);
 
-#define PSH_UNIFORM_DECL_X(S, DECL) \
-    DECL(S, alphaRef, int, 1)       \
-    DECL(S, bumpMat, mat2, 4)       \
-    DECL(S, bumpOffset, float, 4)   \
-    DECL(S, bumpScale, float, 4)    \
-    DECL(S, clipRange, vec4, 1)     \
-    DECL(S, clipRegion, ivec4, 8)   \
-    DECL(S, colorKey, uint, 4)      \
-    DECL(S, colorKeyMask, uint, 4)  \
-    DECL(S, consts, vec4, 18)       \
-    DECL(S, depthFactor, float, 1)  \
-    DECL(S, depthOffset, float, 1)  \
-    DECL(S, fogColor, vec4, 1)      \
-    DECL(S, surfaceScale, ivec2, 1) \
+#define PSH_UNIFORM_DECL_X(S, DECL)  \
+    DECL(S, alphaRef, int, 1)        \
+    DECL(S, bumpMat, mat2, 4)        \
+    DECL(S, bumpOffset, float, 4)    \
+    DECL(S, bumpScale, float, 4)     \
+    DECL(S, clipRange, vec4, 1)      \
+    DECL(S, clipRegion, ivec4, 8)    \
+    DECL(S, colorKey, uint, 4)       \
+    DECL(S, colorKeyMask, uint, 4)   \
+    DECL(S, consts, vec4, 18)        \
+    DECL(S, depthFactor, float, 1)   \
+    DECL(S, depthOffset, float, 1)   \
+    DECL(S, fogColor, vec4, 1)       \
+    DECL(S, surfaceScale, ivec2, 1)  \
+    DECL(S, texBorderColor, vec4, 4) \
+    DECL(S, texBorderMode, uint, 4)  \
     DECL(S, texScale, float, 4)
 
 DECL_UNIFORM_TYPES(PshUniform, PSH_UNIFORM_DECL_X)

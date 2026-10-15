@@ -174,7 +174,7 @@ Each phase ends with a demonstrable exit criterion.
 | --- | --- |
 | 0. Groundwork | Done. Natively on macOS arm64 (Dawn Metal backend, Apple M1 Pro), `display.renderer = "WEBGPU"` creates a device and boots with a black screen and no asserts. Not yet run on Linux or Windows. |
 | 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 needs a Dawn built with the SPIR-V reader (see the step 4 notes). |
-| 2. Feature completeness | Step 1 (primitive assembly, with host unit tests in `tests/xbox/prim`) and step 2 (point size and point sprites) are done. Steps 3–7 have not started. |
+| 2. Feature completeness | Step 1 (primitive assembly, with host unit tests in `tests/xbox/prim`) and step 2 (point size and point sprites) are done. Step 3 is in progress: border colour is done; LOD bias and the remaining texture work are next. Steps 4–7 have not started. |
 | 3. WGSL generator | Not started. |
 | 4. Performance | Not started. |
 | 5. WebGPU UI and browser | Not started. |
@@ -363,9 +363,9 @@ Phase 1 notes (step 5, textures):
   surfaces. Sampling surfaces directly is phase 2 step 5.
 - Border textures are allocated at the doubled border size that the shader's
   border adjustment expects.
-- Not yet handled: border colour, LOD bias, the signed-channel filter bits
-  (also unimplemented in Vulkan) and convolution filters. They belong to
-  phase 2 step 3. Only the dashboard's formats have been checked on screen.
+- Not yet handled: border colour (handled since phase 2 step 3), LOD bias,
+  the signed-channel filter bits (also unimplemented in Vulkan) and
+  convolution filters. They belong to phase 2 step 3. Only the dashboard's formats have been checked on screen.
   The depth, `Y16`, `R6G5B5`, cube and 3D paths compile, but nothing has
   exercised them yet.
 
@@ -448,6 +448,38 @@ Phase 2 notes (step 2, point size and point sprites):
 - Odd vertex formats and strides need nothing more for now. The CPU
   packer from phase 1 already converts every format and stride. Reading
   vertices straight from a guest RAM mirror is phase 4.
+
+Phase 2 notes (step 3, textures):
+
+- WebGPU samplers have no border colour, so `BORDER` addressing still uses
+  a clamp-to-edge sampler, and the pixel shader mixes in the border colour.
+  The WebGPU target adds two pixel shader uniforms, `texBorderColor` (from
+  `NV_PGRAPH_BORDERCOLOR0`) and `texBorderMode`. The mode holds one bit for
+  each of U, V and P that uses `BORDER`, and one bit for a linear
+  magnification filter. The GL and Vulkan targets don't declare either
+  uniform.
+- After each 2D and 3D sample, `applyBorder()` computes how much of the
+  sample lies inside the texture on each border axis, and mixes the
+  clamp-to-edge texel with the border colour by that amount:
+  - With linear filtering the coverage on each axis is
+    `clamp(u * size + 0.5, 0, 1) * clamp((1 - u) * size + 0.5, 0, 1)`.
+    For bilinear filtering of the base level this gives exactly the weight
+    of the texels inside the texture.
+  - With nearest filtering the coverage is 1 inside `[0, 1)` and 0 outside.
+  - Minified samples use the same base-level coverage, so mipmapped
+    textures blend into the border slightly differently from hardware.
+- Textures whose border source is the texture itself already sample their
+  own border texels, so they skip the mix. So do cube maps and `x8y24`
+  depth textures.
+- `CLAMP_OGL` stays clamp-to-edge, as in Vulkan.
+- Checked with the nxdk_pgraph_tests release `v2026-10-10_21-27-19` on
+  macOS arm64, with no WebGPU validation errors:
+  - `Texture border/2D` matches the hardware golden image.
+  - `Texture border color/TextureBorderColor` matches the hardware golden
+    image, including the translucent border alpha. Vulkan draws the
+    border opaque for some formats.
+  - The rest of the `Texture border` suite (3D and cube textures with
+    texture borders) renders as before.
 
 ### Phase 0: groundwork and refactors (small, landable on its own)
 

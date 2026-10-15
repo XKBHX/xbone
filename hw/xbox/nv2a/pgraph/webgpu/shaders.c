@@ -274,6 +274,40 @@ void pgraph_wgpu_bind_shaders(PGRAPHState *pg)
     r->shader_binding = b;
 }
 
+/* Mode for the generator's applyBorder(): bits 0-2 are the axes that use
+ * BORDER addressing, bit 3 is set when the sampler filters linearly. */
+static uint32_t get_texture_border_mode(PGRAPHState *pg, int i)
+{
+    if (!(pgraph_reg_r(pg, NV_PGRAPH_TEXCTL0_0 + i * 4) &
+          NV_PGRAPH_TEXCTL0_0_ENABLE)) {
+        return 0;
+    }
+
+    uint32_t address = pgraph_reg_r(pg, NV_PGRAPH_TEXADDRESS0 + i * 4);
+    uint32_t mode = 0;
+    if (GET_MASK(address, NV_PGRAPH_TEXADDRESS0_ADDRU) ==
+        NV_PGRAPH_TEXADDRESS0_ADDRU_BORDER) {
+        mode |= 1;
+    }
+    if (GET_MASK(address, NV_PGRAPH_TEXADDRESS0_ADDRV) ==
+        NV_PGRAPH_TEXADDRESS0_ADDRU_BORDER) {
+        mode |= 2;
+    }
+    if (GET_MASK(address, NV_PGRAPH_TEXADDRESS0_ADDRP) ==
+        NV_PGRAPH_TEXADDRESS0_ADDRU_BORDER) {
+        mode |= 4;
+    }
+
+    uint32_t filter = pgraph_reg_r(pg, NV_PGRAPH_TEXFILTER0 + i * 4);
+    unsigned int mag_filter = GET_MASK(filter, NV_PGRAPH_TEXFILTER0_MAG);
+    if (mode && mag_filter < ARRAY_SIZE(pgraph_texture_mag_filter_wgpu_map) &&
+        pgraph_texture_mag_filter_wgpu_map[mag_filter] ==
+            WGPUFilterMode_Linear) {
+        mode |= 8;
+    }
+    return mode;
+}
+
 void pgraph_wgpu_update_uniforms(PGRAPHState *pg, bool *vsh_changed,
                                  bool *psh_changed)
 {
@@ -295,6 +329,10 @@ void pgraph_wgpu_update_uniforms(PGRAPHState *pg, bool *vsh_changed,
     pgraph_glsl_set_psh_uniform_values(pg, b->psh_locs, &psh_values);
     for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
         psh_values.texScale[i] = 1.0f;
+        pgraph_argb_pack32_to_rgba_float(
+            pgraph_reg_r(pg, NV_PGRAPH_BORDERCOLOR0 + i * 4),
+            psh_values.texBorderColor[i]);
+        psh_values.texBorderMode[i] = get_texture_border_mode(pg, i);
     }
     memset(r->psh_uniform_data, 0, b->psh_ubo_size);
     pack_uniforms(r->psh_uniform_data, PshUniformInfo, PshUniform__COUNT,
