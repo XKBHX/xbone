@@ -252,36 +252,12 @@ WGPUShaderModule pgraph_wgpu_create_wgsl_module(PGRAPHWgpuState *r,
         r, label, wgpuDeviceCreateShaderModule(r->device, &descriptor));
 }
 
-WGPUShaderModule pgraph_wgpu_create_spirv_module(PGRAPHWgpuState *r,
-                                                 const char *label,
-                                                 const uint32_t *code,
-                                                 size_t num_words)
-{
-    WGPUShaderSourceSPIRV source = WGPU_SHADER_SOURCE_SPIRV_INIT;
-    WGPUDawnShaderModuleSPIRVOptionsDescriptor options =
-        WGPU_DAWN_SHADER_MODULE_SPIRV_OPTIONS_DESCRIPTOR_INIT;
-    WGPUShaderModuleDescriptor descriptor = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
-
-    source.code = code;
-    source.codeSize = num_words;
-    /* GLSL allows implicit derivatives in non-uniform control flow */
-    options.allowNonUniformDerivatives = true;
-    source.chain.next = &options.chain;
-    descriptor.nextInChain = &source.chain;
-    descriptor.label = pgraph_wgpu_str(label);
-
-    wgpuDevicePushErrorScope(r->device, WGPUErrorFilter_Validation);
-    return finish_shader_module(
-        r, label, wgpuDeviceCreateShaderModule(r->device, &descriptor));
-}
-
 bool pgraph_wgpu_init_instance(PGRAPHState *pg, Error **errp)
 {
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
     WGPUInstanceDescriptor descriptor = WGPU_INSTANCE_DESCRIPTOR_INIT;
     WGPUInstanceFeatureName instance_features[] = {
         WGPUInstanceFeatureName_TimedWaitAny,
-        WGPUInstanceFeatureName_ShaderSourceSPIRV,
     };
 
     descriptor.requiredFeatureCount = ARRAY_SIZE(instance_features);

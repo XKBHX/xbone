@@ -45,8 +45,6 @@ typedef struct ShaderBinding {
     bool valid;
     WGPUShaderModule vsh;
     WGPUShaderModule psh;
-    bool vsh_wgsl;
-    bool psh_wgsl;
     VshUniformLocs vsh_locs;
     PshUniformLocs psh_locs;
     WgpuUniformMember vsh_members[VshUniform__COUNT];
@@ -332,10 +330,6 @@ bool pgraph_wgpu_wait(PGRAPHWgpuState *r, WGPUFuture future);
 WGPUShaderModule pgraph_wgpu_create_wgsl_module(PGRAPHWgpuState *r,
                                                 const char *label,
                                                 const char *code);
-WGPUShaderModule pgraph_wgpu_create_spirv_module(PGRAPHWgpuState *r,
-                                                 const char *label,
-                                                 const uint32_t *code,
-                                                 size_t num_words);
 
 // buffer.c
 void pgraph_wgpu_init_buffers(PGRAPHState *pg);

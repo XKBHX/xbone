@@ -173,9 +173,9 @@ Each phase ends with a demonstrable exit criterion.
 | Phase | Status |
 | --- | --- |
 | 0. Groundwork | Done. Natively on macOS arm64 (Dawn Metal backend, Apple M1 Pro), `display.renderer = "WEBGPU"` creates a device and boots with a black screen and no asserts. Not yet run on Linux or Windows. |
-| 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 needs a Dawn built with the SPIR-V reader (see the step 4 notes). |
+| 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 originally needed a Dawn built with the SPIR-V reader. Phase 3 step 3 removed that requirement. |
 | 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite, read back into a GL texture for the existing UI. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
-| 3. WGSL generator | Step 1 is done. Steps 2 and 3 are not. The pack and unpack kernels and the display composite were already WGSL in phase 2. Draw shaders are translated from the existing WebGPU GLSL into WGSL modules. SPIR-V remains a fallback where Dawn can read it, and is not removed. |
+| 3. WGSL generator | Steps 1–3 are done. Step 1 translates draw shaders from the WebGPU-targeted GLSL. Step 2 did not need new shaders: the pack and unpack kernels and the display composite were already WGSL in phase 2. Step 3 creates every shader module with `WGPUShaderSourceWGSL`. The WebGPU backend no longer links glslang and does not request `ShaderSourceSPIRV`. glslang remains for Vulkan. A translation or Tint failure skips that draw. |
 | 4. Performance | Not started. |
 | 5. WebGPU UI and browser | Not started. |
 
@@ -210,11 +210,11 @@ Phase 0 notes:
   `gl_ClipDistance`, so neither needs extra gating. Texture samplers still
   use `layout(binding = N)` with the implicit set 0; the phase 1 bind-group
   layout decides whether textures move to their own set.
-- glslang now lives in `glsl/spirv.c` (`pgraph_glsl_compile_to_spirv`),
-  shared by Vulkan and WebGPU. Meson looks for glslang when Vulkan is found
-  or when WebGPU is found outside Emscripten. The WebGPU target compiles for
-  the Vulkan 1.1 / SPIR-V 1.3 environment that Tint accepts; Vulkan keeps
-  Vulkan 1.3 / SPIR-V 1.6.
+- glslang lives in `glsl/spirv.c` (`pgraph_glsl_compile_to_spirv`) and is
+  linked for Vulkan. Meson looks for it when Vulkan is found. The WebGPU
+  backend no longer compiles SPIR-V (phase 3 step 3). The WebGPU target of
+  the GLSL generator still emits the Vulkan 1.1 style that the translator
+  accepts; Vulkan keeps Vulkan 1.3 / SPIR-V 1.6.
 - The Emscripten configure step still stops at
   `subprojects/dsp56300/meson.build` (`Unsupported host OS: emscripten`).
   This is outside the renderer and tracked with the phase 5 prerequisites.
@@ -272,13 +272,13 @@ Phase 1 notes (steps 1, 2, 3 and 6):
 
 Phase 1 notes (step 4, draw path):
 
-- Shaders need a Dawn with Tint's SPIR-V reader. `scripts/build-dawn.py`
-  builds one at the pinned revision. The prebuilt macOS archive still
-  advertises `ShaderSourceSPIRV`, so at init the renderer compiles a probe
-  module inside an error scope. If the probe fails, it logs a hint and draws
-  are skipped. Modules are created with Dawn's
-  `allowNonUniformDerivatives`, because GLSL allows implicit derivatives in
-  non-uniform control flow.
+- Step 4 compiled shaders through SPIR-V, so it needed a Dawn with Tint's
+  SPIR-V reader. `scripts/build-dawn.py` builds one at the pinned revision.
+  Modules were created with Dawn's `allowNonUniformDerivatives`, because
+  GLSL allows implicit derivatives in non-uniform control flow. Phase 3
+  step 3 removed that path: the renderer no longer probes SPIR-V at init
+  and does not request `ShaderSourceSPIRV`. Fragment WGSL turns the same
+  allowance into `diagnostic(off, derivative_uniformity)`.
 - Tint rejects some SPIR-V that Vulkan accepts, so the WebGPU target of the
   generator also:
   - replaces `isnan`/`isinf` with bit-pattern tests, because WGSL can't
@@ -773,11 +773,9 @@ Phase 3 notes (step 1, vertex and pixel shaders):
   `pgraph_glsl_gen_psh` for `PGRAPH_GLSL_TARGET_WEBGPU`. `pgraph_wgsl_gen_vsh`
   and `pgraph_wgsl_gen_psh` take the same `VshState` and `PshState` as the
   GLSL generators. The GLSL text stays the source of the shading rules.
-- A WGSL draw module uses entry points `vs` and `fs`. `XEMU_WGSL=0` skips
-  translation and compiles that GLSL to SPIR-V. `XEMU_WGSL_DUMP` prints the
-  WGSL. If translation or Tint rejects a shader, that stage logs the failure
-  and uses the SPIR-V module. The browser has no SPIR-V reader, so a rejected
-  shader does not draw there.
+- A WGSL draw module uses entry points `vs` and `fs`. `XEMU_WGSL_DUMP`
+  prints the translated source. Step 3 removed the SPIR-V fallback, so a
+  shader the translator or Tint rejects is not drawn.
 - WGSL has no overloads, so a later `xIsNan`, `_in`, or `normN` is renamed
   from its parameter types. Parameters are copied to locals, because a WGSL
   parameter cannot be assigned. `gl_VertexIndex` is a private variable set
@@ -786,14 +784,43 @@ Phase 3 notes (step 1, vertex and pixel shaders):
 - When the module is WGSL, the uniform block is packed in WGSL layout.
   Scalar and `vec2` arrays are not padded to 16 bytes, and a `mat2` column
   is 8 bytes. The binding slot is still sized for std140, which is the same
-  size or larger. A SPIR-V fallback keeps std140.
+  size or larger.
 - `tests/xbox/wgsl` translates a vertex shader and a pixel shader without a
   device. On macOS arm64, booting nxdk_pgraph_tests compiled every draw
-  shader as WGSL, with no Tint error and no SPIR-V fallback. The same boot
-  with `XEMU_WGSL=0` was compared on screen for `ZPassLineWidth-0x0001`,
-  `ZPassLineWidth-0x0008`, and `ZPassPointSize-0x0008`. The rectangle, the
-  line, and the point match. Both paths report the boolean occlusion count
-  `1`, which is the Dawn limit from phase 2 step 7, not a WGSL difference.
+  shader as WGSL, with no Tint error. The same boot with `XEMU_WGSL=0`,
+  before step 3 removed that switch, was compared on screen for
+  `ZPassLineWidth-0x0001`, `ZPassLineWidth-0x0008`, and
+  `ZPassPointSize-0x0008`. The rectangle, the line, and the point match.
+  Both paths report the boolean occlusion count `1`, which is the Dawn
+  limit from phase 2 step 7, not a WGSL difference.
+
+Phase 3 notes (step 2, pack, unpack, and display):
+
+- No new shaders. `surface-compute.c` and `display.c` were written as WGSL
+  in phase 2 steps 4 and 6, and the clear and depth-upload shaders in
+  `draw.c` and `surface.c` were already WGSL as well. They are created with
+  `pgraph_wgpu_create_wgsl_module`. The checks from those phase 2 notes
+  still apply.
+
+Phase 3 notes (step 3, WGSL only):
+
+- Draw shaders are still produced as GLSL by `pgraph_glsl_gen_vsh` and
+  `pgraph_glsl_gen_psh`, then translated. The module passed to Dawn is
+  WGSL, with entry points `vs` and `fs`. There is no SPIR-V fallback.
+  `XEMU_WGSL=0` is gone. `XEMU_WGSL_DUMP` still prints the WGSL.
+- If translation or Tint rejects a draw shader, that binding is invalid and
+  the draw is skipped. Pack, unpack, clear, depth upload, and the display
+  composite are fixed WGSL strings and are not on that path.
+- `pgraph_wgpu_create_spirv_module` is removed. The instance requests
+  `TimedWaitAny` only, not `ShaderSourceSPIRV`. Fragment shaders still emit
+  `diagnostic(off, derivative_uniformity)`, which is what the SPIR-V option
+  `allowNonUniformDerivatives` used to allow.
+- The WebGPU objects no longer link glslang. Meson looks up glslang only
+  when Vulkan is found. `glsl/spirv.c` stays for the Vulkan renderer.
+- A native Dawn build no longer needs `TINT_BUILD_SPV_READER` for this
+  backend. On macOS arm64 the instance comes up without that feature, and
+  a boot of nxdk_pgraph_tests compiled its draw shaders with no Tint error.
+  `tests/xbox/wgsl` still passes.
 
 **Exit**: the WebGPU backend runs natively with WGSL only and keeps phase 2
 parity.
@@ -884,8 +911,8 @@ WebGPU canvas. Performance is reported, not gated, until the CPU work in
   parity dashboard by test category: texture formats, combiners, fog, point
   sprites, and so on.
 - **Differential shader testing** in phase 3: `tests/xbox/wgsl` checks the
-  translator without a device. The same guest frame can be drawn with WGSL
-  and with `XEMU_WGSL=0` (GLSL through SPIR-V) and compared on screen.
+  translator without a device. Before the SPIR-V path was removed, the same
+  guest frame was drawn both ways and compared on screen.
 - **Validation.** Run Dawn with backend validation and the WebGPU error
   scopes (`wgpuDevicePushErrorScope`) enabled in debug builds. A
   `display.webgpu.validation` config flag would mirror

@@ -393,7 +393,7 @@ static WGPURenderPipeline create_draw_pipeline(PGRAPHState *pg,
     desc.label = pgraph_wgpu_str("PGRAPH draw");
     desc.layout = b->texture_layout->pipeline_layout;
     desc.vertex.module = b->vsh;
-    desc.vertex.entryPoint = pgraph_wgpu_str(b->vsh_wgsl ? "vs" : "main");
+    desc.vertex.entryPoint = pgraph_wgpu_str("vs");
     desc.vertex.bufferCount = vl->num_attributes ? 1 : 0;
     desc.vertex.buffers = &vertex_buffer;
 
@@ -524,7 +524,7 @@ static WGPURenderPipeline create_draw_pipeline(PGRAPHState *pg,
 
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = b->psh;
-    fragment.entryPoint = pgraph_wgpu_str(b->psh_wgsl ? "fs" : "main");
+    fragment.entryPoint = pgraph_wgpu_str("fs");
     if (key->color_format != WGPUTextureFormat_Undefined) {
         fragment.targetCount = 1;
         fragment.targets = &color_target;
