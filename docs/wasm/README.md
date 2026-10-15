@@ -44,8 +44,10 @@ What exists:
   point sprites, surface pack and unpack, copies of a render target into
   a texture, the PCRTC/PVIDEO display composite, ZPASS occlusion queries,
   and the surface scale factor. The composite is read back and uploaded to
-  a GL texture for the existing UI. It still compiles draw shaders through
-  SPIR-V, so it can't draw under Emscripten until the WGSL generator exists.
+  a GL texture for the existing UI. Draw shaders are translated to WGSL.
+  SPIR-V is still the fallback when translation or Tint rejects a shader, so
+  a browser build cannot draw that shader until the translator accepts it.
+  Pack, unpack, and the display composite were already WGSL.
 
 What blocks an xemu WASM build today:
 

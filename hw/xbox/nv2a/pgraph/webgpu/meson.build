@@ -1,5 +1,7 @@
 if webgpu.found()
   specific_ss.add([webgpu, libglslang, files(
+    '../wgsl/gen.c',
+    '../wgsl/translate.c',
     'blit.c',
     'buffer.c',
     'command.c',

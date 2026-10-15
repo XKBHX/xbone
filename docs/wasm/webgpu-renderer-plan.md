@@ -144,7 +144,7 @@ hw/xbox/nv2a/pgraph/webgpu/
   reports.c                 occlusion queries, report write-back
   display.c                 PCRTC/PVIDEO composite, presentation (readback or canvas)
   debug.c                   labels, debug groups, validation hooks
-hw/xbox/nv2a/pgraph/wgsl/   (phase B) WGSL emitter for vsh/psh, sharing state extraction with glsl/
+hw/xbox/nv2a/pgraph/wgsl/   WGSL translation of the WebGPU-targeted GLSL vertex and pixel shaders
 ```
 
 How the `PGRAPHRenderer` ops map to the Vulkan implementation they model:
@@ -175,7 +175,7 @@ Each phase ends with a demonstrable exit criterion.
 | 0. Groundwork | Done. Natively on macOS arm64 (Dawn Metal backend, Apple M1 Pro), `display.renderer = "WEBGPU"` creates a device and boots with a black screen and no asserts. Not yet run on Linux or Windows. |
 | 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 needs a Dawn built with the SPIR-V reader (see the step 4 notes). |
 | 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite, read back into a GL texture for the existing UI. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
-| 3. WGSL generator | Not started. |
+| 3. WGSL generator | Step 1 is done. Steps 2 and 3 are not. The pack and unpack kernels and the display composite were already WGSL in phase 2. Draw shaders are translated from the existing WebGPU GLSL into WGSL modules. SPIR-V remains a fallback where Dawn can read it, and is not removed. |
 | 4. Performance | Not started. |
 | 5. WebGPU UI and browser | Not started. |
 
@@ -767,6 +767,34 @@ round-trip.
 3. Use `WGPUShaderSourceWGSL` everywhere, and remove the SPIR-V and glslang
    dependency from the WebGPU backend.
 
+Phase 3 notes (step 1, vertex and pixel shaders):
+
+- `pgraph/wgsl/` translates the GLSL produced by `pgraph_glsl_gen_vsh` and
+  `pgraph_glsl_gen_psh` for `PGRAPH_GLSL_TARGET_WEBGPU`. `pgraph_wgsl_gen_vsh`
+  and `pgraph_wgsl_gen_psh` take the same `VshState` and `PshState` as the
+  GLSL generators. The GLSL text stays the source of the shading rules.
+- A WGSL draw module uses entry points `vs` and `fs`. `XEMU_WGSL=0` skips
+  translation and compiles that GLSL to SPIR-V. `XEMU_WGSL_DUMP` prints the
+  WGSL. If translation or Tint rejects a shader, that stage logs the failure
+  and uses the SPIR-V module. The browser has no SPIR-V reader, so a rejected
+  shader does not draw there.
+- WGSL has no overloads, so a later `xIsNan`, `_in`, or `normN` is renamed
+  from its parameter types. Parameters are copied to locals, because a WGSL
+  parameter cannot be assigned. `gl_VertexIndex` is a private variable set
+  from `@builtin(vertex_index)`, because a helper cannot see an entry-point
+  builtin. `if` and loop bodies are emitted with braces.
+- When the module is WGSL, the uniform block is packed in WGSL layout.
+  Scalar and `vec2` arrays are not padded to 16 bytes, and a `mat2` column
+  is 8 bytes. The binding slot is still sized for std140, which is the same
+  size or larger. A SPIR-V fallback keeps std140.
+- `tests/xbox/wgsl` translates a vertex shader and a pixel shader without a
+  device. On macOS arm64, booting nxdk_pgraph_tests compiled every draw
+  shader as WGSL, with no Tint error and no SPIR-V fallback. The same boot
+  with `XEMU_WGSL=0` was compared on screen for `ZPassLineWidth-0x0001`,
+  `ZPassLineWidth-0x0008`, and `ZPassPointSize-0x0008`. The rectangle, the
+  line, and the point match. Both paths report the boolean occlusion count
+  `1`, which is the Dawn limit from phase 2 step 7, not a WGSL difference.
+
 **Exit**: the WebGPU backend runs natively with WGSL only and keeps phase 2
 parity.
 
@@ -855,8 +883,9 @@ WebGPU canvas. Performance is reported, not gated, until the CPU work in
   WebGPU backends and diff the images with a per-test threshold. Track a
   parity dashboard by test category: texture formats, combiners, fog, point
   sprites, and so on.
-- **Differential shader testing** in phase 3: compare GLSL→SPIR-V output
-  with native WGSL output on the same `ShaderState`.
+- **Differential shader testing** in phase 3: `tests/xbox/wgsl` checks the
+  translator without a device. The same guest frame can be drawn with WGSL
+  and with `XEMU_WGSL=0` (GLSL through SPIR-V) and compared on screen.
 - **Validation.** Run Dawn with backend validation and the WebGPU error
   scopes (`wgpuDevicePushErrorScope`) enabled in debug builds. A
   `display.webgpu.validation` config flag would mirror

@@ -13,16 +13,19 @@
 #include "qemu/fast-hash.h"
 #include "qemu/mstring.h"
 #include "hw/xbox/nv2a/pgraph/glsl/spirv.h"
+#include "hw/xbox/nv2a/pgraph/wgsl/gen.h"
+#include "hw/xbox/nv2a/pgraph/wgsl/translate.h"
 #include "renderer.h"
 
 #define VSH_UBO_BINDING 0
 #define PSH_UBO_BINDING 1
 #define PSH_TEX_BINDING 0
 
-/* Matches the std140 layout glslang assigns to the generator's uniform blocks,
- * which declare every member of the X-macro tables in order. */
+/* std140 matches glslang. WGSL uniform layout does not pad array elements or
+ * mat2 columns out to 16 bytes, so a WGSL module is packed with wgsl=true. */
 static size_t layout_std140(const UniformInfo *info, int count,
-                            uint32_t skip_mask, WgpuUniformMember *members)
+                            uint32_t skip_mask, WgpuUniformMember *members,
+                            bool wgsl)
 {
     size_t offset = 0;
 
@@ -30,6 +33,55 @@ static size_t layout_std140(const UniformInfo *info, int count,
         WgpuUniformMember *m = &members[i];
         if (skip_mask & (1 << i)) {
             m->offset = -1;
+            continue;
+        }
+
+        if (wgsl) {
+            int components = 1;
+            int columns = 1;
+            switch (info[i].type) {
+            case UniformElementType_float:
+            case UniformElementType_int:
+            case UniformElementType_uint:
+                break;
+            case UniformElementType_ivec2:
+            case UniformElementType_vec2:
+                components = 2;
+                break;
+            case UniformElementType_vec3:
+                components = 3;
+                break;
+            case UniformElementType_ivec4:
+            case UniformElementType_vec4:
+                components = 4;
+                break;
+            case UniformElementType_mat2:
+                components = 2;
+                columns = 2;
+                break;
+            default:
+                g_assert_not_reached();
+            }
+            size_t el_align =
+                components == 3 || components == 4 ? 16 : components * 4;
+            size_t el_size = columns * components * 4;
+            if (info[i].type == UniformElementType_mat2) {
+                /* mat2x2f is two vec2 columns. An array strides by 16. */
+                el_align = 8;
+                el_size = 16;
+            }
+            size_t stride =
+                info[i].count > 1 ? ROUND_UP(el_size, el_align) : el_size;
+            offset = ROUND_UP(offset, el_align);
+            m->offset = offset;
+            m->column_bytes =
+                (info[i].type == UniformElementType_mat2) ? 8 : (int)el_size;
+            m->columns = (info[i].type == UniformElementType_mat2) ?
+                             2 * info[i].count :
+                             info[i].count;
+            m->stride =
+                (info[i].type == UniformElementType_mat2) ? 8 : (int)stride;
+            offset += stride * info[i].count;
             continue;
         }
 
@@ -91,8 +143,9 @@ static void pack_uniforms(uint8_t *out, const UniformInfo *info, int count,
     }
 }
 
-static WGPUShaderModule create_module(PGRAPHWgpuState *r, glslang_stage_t stage,
-                                      const char *label, MString *glsl)
+static WGPUShaderModule create_spirv_module(PGRAPHWgpuState *r,
+                                            glslang_stage_t stage,
+                                            const char *label, MString *glsl)
 {
     GByteArray *spirv = pgraph_glsl_compile_to_spirv(
         PGRAPH_GLSL_TARGET_WEBGPU, stage, mstring_get_str(glsl), false);
@@ -107,6 +160,37 @@ static WGPUShaderModule create_module(PGRAPHWgpuState *r, glslang_stage_t stage,
         fprintf(stderr, "[WebGPU] GLSL source:\n%s\n", mstring_get_str(glsl));
     }
     return module;
+}
+
+/* Prefer WGSL. The GLSL text is still produced first and remains the oracle;
+ * if translation or Tint rejects it, the SPIR-V module is the fallback. */
+static WGPUShaderModule create_draw_module(PGRAPHWgpuState *r,
+                                           glslang_stage_t stage,
+                                           const char *label, MString *glsl,
+                                           bool vertex, bool *used_wgsl)
+{
+    *used_wgsl = false;
+    if (getenv("XEMU_WGSL") && !strcmp(getenv("XEMU_WGSL"), "0")) {
+        return create_spirv_module(r, stage, label, glsl);
+    }
+    g_autoptr(MString) wgsl =
+        pgraph_wgsl_translate(mstring_get_str(glsl), vertex);
+    if (wgsl && getenv("XEMU_WGSL_DUMP")) {
+        fprintf(stderr, "[WebGPU] WGSL %s:\n%s\n", label,
+                mstring_get_str(wgsl));
+    }
+    if (wgsl) {
+        WGPUShaderModule module =
+            pgraph_wgpu_create_wgsl_module(r, label, mstring_get_str(wgsl));
+        if (module) {
+            *used_wgsl = true;
+            return module;
+        }
+        fprintf(stderr, "[WebGPU] WGSL source for %s:\n%s\n", label,
+                mstring_get_str(wgsl));
+    }
+    fprintf(stderr, "[WebGPU] %s is using the SPIR-V fallback\n", label);
+    return create_spirv_module(r, stage, label, glsl);
 }
 
 static WgpuTextureLayout *
@@ -196,7 +280,8 @@ static ShaderBinding *create_shader_binding(PGRAPHWgpuState *r,
                        WGPUPrimitiveTopology_PointList,
     };
     MString *vsh_code = pgraph_glsl_gen_vsh(&state->vsh, vsh_opts);
-    b->vsh = create_module(r, GLSLANG_STAGE_VERTEX, "PGRAPH vertex", vsh_code);
+    b->vsh = create_draw_module(r, GLSLANG_STAGE_VERTEX, "PGRAPH vertex",
+                                vsh_code, true, &b->vsh_wgsl);
     mstring_unref(vsh_code);
 
     GenPshGlslOptions psh_opts = {
@@ -205,8 +290,8 @@ static ShaderBinding *create_shader_binding(PGRAPHWgpuState *r,
         .tex_binding = PSH_TEX_BINDING,
     };
     MString *psh_code = pgraph_glsl_gen_psh(&state->psh, psh_opts);
-    b->psh =
-        create_module(r, GLSLANG_STAGE_FRAGMENT, "PGRAPH fragment", psh_code);
+    b->psh = create_draw_module(r, GLSLANG_STAGE_FRAGMENT, "PGRAPH fragment",
+                                psh_code, false, &b->psh_wgsl);
     mstring_unref(psh_code);
 
     b->valid = b->vsh && b->psh;
@@ -214,9 +299,9 @@ static ShaderBinding *create_shader_binding(PGRAPHWgpuState *r,
     uint32_t vsh_skip =
         state->vsh.uniform_attrs ? 0 : (1 << VshUniform_inlineValue);
     b->vsh_ubo_size = layout_std140(VshUniformInfo, VshUniform__COUNT, vsh_skip,
-                                    b->vsh_members);
-    b->psh_ubo_size =
-        layout_std140(PshUniformInfo, PshUniform__COUNT, 0, b->psh_members);
+                                    b->vsh_members, b->vsh_wgsl);
+    b->psh_ubo_size = layout_std140(PshUniformInfo, PshUniform__COUNT, 0,
+                                    b->psh_members, b->psh_wgsl);
     for (int i = 0; i < VshUniform__COUNT; i++) {
         b->vsh_locs[i] = b->vsh_members[i].offset < 0 ? -1 : i;
     }
@@ -360,7 +445,7 @@ static bool check_spirv_support(PGRAPHWgpuState *r)
                                      "  gl_Position = vec4(0.0);\n"
                                      "}\n");
     WGPUShaderModule module =
-        create_module(r, GLSLANG_STAGE_VERTEX, "SPIR-V probe", glsl);
+        create_spirv_module(r, GLSLANG_STAGE_VERTEX, "SPIR-V probe", glsl);
     mstring_unref(glsl);
     if (!module) {
         return false;
@@ -388,10 +473,11 @@ void pgraph_wgpu_init_shaders(PGRAPHState *pg)
     /* The largest blocks the generator can emit */
     WgpuUniformMember vsh_members[VshUniform__COUNT];
     WgpuUniformMember psh_members[PshUniform__COUNT];
+    /* Size the slot for std140. A WGSL block is the same size or smaller. */
     size_t vsh_size =
-        layout_std140(VshUniformInfo, VshUniform__COUNT, 0, vsh_members);
+        layout_std140(VshUniformInfo, VshUniform__COUNT, 0, vsh_members, false);
     size_t psh_size =
-        layout_std140(PshUniformInfo, PshUniform__COUNT, 0, psh_members);
+        layout_std140(PshUniformInfo, PshUniform__COUNT, 0, psh_members, false);
     r->uniform_binding_size = ROUND_UP(MAX(vsh_size, psh_size), 256);
     r->vsh_uniform_data = g_malloc0(r->uniform_binding_size);
     r->psh_uniform_data = g_malloc0(r->uniform_binding_size);
