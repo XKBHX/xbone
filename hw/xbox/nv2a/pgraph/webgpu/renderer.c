@@ -32,6 +32,7 @@ static void pgraph_wgpu_flush(NV2AState *d)
 
 static void pgraph_wgpu_sync(NV2AState *d)
 {
+    pgraph_wgpu_render_display(&d->pgraph);
     qatomic_set(&d->pgraph.sync_pending, false);
     qemu_event_set(&d->pgraph.sync_complete);
 }
@@ -82,6 +83,7 @@ static void pgraph_wgpu_init(NV2AState *d, Error **errp)
     pgraph_wgpu_init_shaders(pg);
     pgraph_wgpu_init_surfaces(pg);
     pgraph_wgpu_init_pipelines(pg);
+    pgraph_wgpu_init_display(pg);
 }
 
 static void pgraph_wgpu_finalize(NV2AState *d)
@@ -91,6 +93,7 @@ static void pgraph_wgpu_finalize(NV2AState *d)
     if (!pg->wgpu_renderer_state) {
         return;
     }
+    pgraph_wgpu_finalize_display(pg);
     pgraph_wgpu_finalize_pipelines(pg);
     pgraph_wgpu_finalize_shaders(pg);
     pgraph_wgpu_finalize_textures(pg);
@@ -154,14 +157,15 @@ static unsigned int pgraph_wgpu_get_surface_scale_factor(NV2AState *d)
 static int pgraph_wgpu_get_framebuffer_surface(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
+    PGRAPHWgpuState *r = pg->wgpu_renderer_state;
 
     qemu_mutex_lock(&d->pfifo.lock);
 
     VGADisplayParams vga_display_params;
     d->vga.get_params(&d->vga, &vga_display_params);
+    hwaddr addr = d->pcrtc.start + vga_display_params.line_offset;
 
-    SurfaceBinding *surface = pgraph_wgpu_surface_get_within(
-        d, d->pcrtc.start + vga_display_params.line_offset);
+    SurfaceBinding *surface = pgraph_wgpu_surface_get_within(d, addr);
     if (surface == NULL || !surface->color) {
         qemu_mutex_unlock(&d->pfifo.lock);
         return 0;
@@ -169,10 +173,31 @@ static int pgraph_wgpu_get_framebuffer_surface(NV2AState *d)
 
     surface->frame_time = pg->frame_time;
 
-    /* No GL interop yet; the display reads the surface back from VRAM. */
+#ifndef CONFIG_OPENGL
+    /* No UI GL context. The VGA path reads the surface back from VRAM. */
     qemu_mutex_unlock(&d->pfifo.lock);
     pgraph_wgpu_wait_for_surface_download(surface);
     return 0;
+#else
+    qemu_event_reset(&pg->sync_complete);
+    qatomic_set(&pg->sync_pending, true);
+    pfifo_kick(d);
+    qemu_mutex_unlock(&d->pfifo.lock);
+    qemu_event_wait(&pg->sync_complete);
+
+    GLuint tex = pgraph_wgpu_present_display(r);
+    if (tex) {
+        return tex;
+    }
+
+    qemu_mutex_lock(&d->pfifo.lock);
+    surface = pgraph_wgpu_surface_get_within(d, addr);
+    qemu_mutex_unlock(&d->pfifo.lock);
+    if (surface && surface->color) {
+        pgraph_wgpu_wait_for_surface_download(surface);
+    }
+    return 0;
+#endif
 }
 
 static GPUProperties *pgraph_wgpu_get_gpu_properties(void)

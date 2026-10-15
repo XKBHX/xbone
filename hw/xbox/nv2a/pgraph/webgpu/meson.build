@@ -3,6 +3,7 @@ if webgpu.found()
     'blit.c',
     'buffer.c',
     'command.c',
+    'display.c',
     'draw.c',
     'instance.c',
     'prim.c',
