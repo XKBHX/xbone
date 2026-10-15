@@ -169,6 +169,39 @@ typedef struct ClearPipeline {
     WGPURenderPipeline pipeline;
 } ClearPipeline;
 
+typedef struct WgpuDisplayState {
+    WGPUShaderModule module;
+    WGPUBindGroupLayout bind_group_layout;
+    WGPURenderPipeline pipeline;
+    WGPUSampler frame_sampler;
+    WGPUSampler pvideo_sampler;
+    WGPUBuffer uniform;
+
+    WGPUTexture image;
+    WGPUTextureView image_view;
+    unsigned int width;
+    unsigned int height;
+
+    WGPUTexture pvideo_image;
+    WGPUTextureView pvideo_view;
+    unsigned int pvideo_width;
+    unsigned int pvideo_height;
+
+    WGPUBindGroup bind_group;
+
+    WGPUBuffer readback;
+    uint64_t readback_size;
+    uint8_t *pixels;
+    size_t pixels_size;
+    bool pixels_valid;
+
+#ifdef CONFIG_OPENGL
+    GLuint gl_texture;
+    unsigned int gl_width;
+    unsigned int gl_height;
+#endif
+} WgpuDisplayState;
+
 typedef struct PGRAPHWgpuState {
     WGPUInstance instance;
     WGPUAdapter adapter;
@@ -245,6 +278,8 @@ typedef struct PGRAPHWgpuState {
 
     WgpuVertexLayout vertex_layout;
     WgpuVertexSource vertex_sources[NV2A_VERTEXSHADER_ATTRIBUTES];
+
+    WgpuDisplayState display;
 } PGRAPHWgpuState;
 
 typedef enum WgpuFinishReason {
@@ -367,5 +402,13 @@ WgpuPrimState pgraph_wgpu_get_prim_state(const GeomState *geom);
 
 // blit.c
 void pgraph_wgpu_image_blit(NV2AState *d);
+
+// display.c
+void pgraph_wgpu_init_display(PGRAPHState *pg);
+void pgraph_wgpu_finalize_display(PGRAPHState *pg);
+void pgraph_wgpu_render_display(PGRAPHState *pg);
+#ifdef CONFIG_OPENGL
+GLuint pgraph_wgpu_present_display(PGRAPHWgpuState *r);
+#endif
 
 #endif

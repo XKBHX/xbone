@@ -38,7 +38,7 @@ Non-goals for this plan:
 | Threading | The device is created and used **only on the PFIFO thread**, like the Vulkan backend | Matches the existing locking model. In the browser, WebGPU objects can't move between workers, so this is mandatory there. |
 | Shader language | **Bring-up only**: reuse the GLSL generator, compile to SPIR-V with the existing glslang code, and feed SPIR-V to Dawn natively. **Then a native WGSL generator** (phase 3), built before the performance work | Gets pixels quickly while keeping the long-term path free of translation layers. The browser only accepts WGSL, and no Tint has to ship inside the WASM binary. |
 | Primitives that need geometry shaders | CPU index rewriting, plus instanced quads for point sprites | WebGPU has no geometry stage, no quads, no fans, and no polygon mode. |
-| Display (native) | Start with the existing "download to RAM, return `0`" fallback | This is exactly what Vulkan does without external memory (`vk/renderer.c`). The UI needs no changes. |
+| Display (native) | Composite on the GPU, read the image back, and upload it to a GL texture on the UI thread | There is no shared-memory import yet (phase 4). The UI already displays a returned GL texture, so it needs no changes. Without OpenGL, fall back to the VGA read of guest RAM. |
 | Display and UI (browser) | **The UI moves to WebGPU.** One device and one canvas (`OffscreenCanvas`), both owned by the PFIFO worker. ImGui draw data is built on the UI thread and handed to the PFIFO thread, which records the UI pass after the game frame | Avoids WebGPU↔WebGL interop, which browsers don't offer, and the game frame never leaves the GPU. WebGPU objects can't cross workers, so the UI pass has to be recorded on the device's thread. |
 | Native CI dependency | **Prebuilt Dawn**, pinned by version and checksum | Building Dawn from source makes CI much slower. A pinned prebuilt keeps builds reproducible. |
 
@@ -160,7 +160,7 @@ How the `PGRAPHRenderer` ops map to the Vulkan implementation they model:
 | `flip_stall` | `command.c` finish + submit |
 | `process_pending` | deferred downloads, display sync and flush (`pgraph_vk_process_pending`) |
 | `pre_savevm_*` / `pre_shutdown_*` | download every dirty surface and signal the `QemuEvent` |
-| `get_framebuffer_surface` | native phase 1: download and return `0`. Browser: present, return `0` |
+| `get_framebuffer_surface` | native: composite, read back, return a GL texture. No color surface, or no OpenGL: download and return `0`. Browser canvas present is phase 5 |
 | `set/get_surface_scale_factor` | `surface.c` |
 | `get_gpu_properties` | `instance.c` (constant winding, since there is no geometry shader) |
 
@@ -174,7 +174,7 @@ Each phase ends with a demonstrable exit criterion.
 | --- | --- |
 | 0. Groundwork | Done. Natively on macOS arm64 (Dawn Metal backend, Apple M1 Pro), `display.renderer = "WEBGPU"` creates a device and boots with a black screen and no asserts. Not yet run on Linux or Windows. |
 | 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 needs a Dawn built with the SPIR-V reader (see the step 4 notes). |
-| 2. Feature completeness | Steps 1–5 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Steps 6–7 have not started. |
+| 2. Feature completeness | Steps 1–6 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite, read back into a GL texture for the existing UI. The NV09F image blit was already in phase 1. Step 7 has not started. |
 | 3. WGSL generator | Not started. |
 | 4. Performance | Not started. |
 | 5. WebGPU UI and browser | Not started. |
@@ -606,6 +606,36 @@ Phase 2 notes (step 5, surface as texture):
   test are identical, and there are no WebGPU validation errors. The copy
   runs for those render targets. `R5G6B5` and `X8R8G8B8` log a
   compatibility failure and stay on the RAM path.
+
+Phase 2 notes (step 6, display composite):
+
+- The NV09F image blit is the CPU path from phase 1. `display.c` is the
+  PCRTC composite from `vk/display.c`, written in WGSL. The scanout surface
+  is sampled into an `rgba8unorm` image at the VGA size. Interlace doubles
+  the height, then the surface scale is applied. The scale is still 1.
+  `line_offset` crops the source the same way Vulkan does.
+- The shader flips Y the same way `vk/display.c` does. WebGPU stores row 0
+  at the top, and `glTexImage2D` treats that row as the bottom. The UI
+  samples the returned texture with flip disabled, so the picture is upright.
+- PVIDEO buffer 0, colour format `LE_CR8YB8CB8YA8` only, is converted with
+  `convert_yuy2_to_rgb` and drawn over the framebuffer. The overlay rectangle,
+  colour key, and `DS_DX` / `DT_DY` scale match Vulkan, including treating
+  `SIZE_IN == 0xFFFFFFFF` as off. Other colour formats still assert, as in
+  the OpenGL and Vulkan renderers. Dirty surfaces that overlap the overlay
+  are downloaded before the upload, so a surface used as the video source is
+  not stale.
+- The overlay sample is taken in uniform control flow. WGSL rejects
+  `textureSample` under the per-pixel clip test.
+- There is no GL memory import yet. That is phase 4. `get_framebuffer_surface`
+  asks the PFIFO thread to render the composite and read it back, then
+  uploads the pixels with `glTexImage2D` on the UI thread, which already has
+  the GL context current. The UI is unchanged. If there is no colour surface,
+  the readback fails, or the build has no OpenGL, it still returns 0 and the
+  VGA path reads guest RAM.
+- The GL texture name belongs to the UI context. Shutdown retires it and the
+  next present on that context deletes it.
+- Checked by compiling the display shader with Tint and the renderer against
+  the SPIR-V Dawn SDK. Not yet compared on screen with Vulkan.
 
 ### Phase 0: groundwork and refactors (small, landable on its own)
 
