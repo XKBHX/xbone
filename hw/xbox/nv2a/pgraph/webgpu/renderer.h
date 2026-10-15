@@ -140,6 +140,8 @@ typedef struct TextureKey {
     uint32_t filter;
     uint32_t address;
     uint32_t max_anisotropy;
+    /* 1, or the surface scale when this texture is a scaled render target. */
+    uint32_t scale;
 } TextureKey;
 
 typedef struct TextureBinding {
@@ -150,6 +152,7 @@ typedef struct TextureBinding {
     WGPUTextureView view;
     WGPUSampler sampler;
     uint64_t hash;
+    int draw_time;
     bool possibly_dirty;
 } TextureBinding;
 
@@ -196,11 +199,11 @@ typedef struct PGRAPHWgpuState {
     WGPUBindGroupLayout depth_upload_bind_group_layout;
     WGPURenderPipeline depth_upload_pipeline;
 
-    /* Pack/unpack kernels for 16-bit colour and depth surfaces. */
-    WGPUShaderModule surface_compute_modules[8];
-    WGPUBindGroupLayout surface_compute_layouts[8];
-    WGPUPipelineLayout surface_compute_pipeline_layouts[8];
-    WGPUComputePipeline surface_compute_pipelines[8];
+    /* Pack/unpack kernels, plus the Z16 surface-to-texture kernel. */
+    WGPUShaderModule surface_compute_modules[9];
+    WGPUBindGroupLayout surface_compute_layouts[9];
+    WGPUPipelineLayout surface_compute_pipeline_layouts[9];
+    WGPUComputePipeline surface_compute_pipelines[9];
     WGPUBuffer surface_compute_uniform;
     WGPUBuffer surface_compute_storage[3];
     uint64_t surface_compute_storage_size[3];
@@ -345,6 +348,13 @@ void pgraph_wgpu_unpack_converted_surface(PGRAPHState *pg,
                                           SurfaceBinding *surface,
                                           const uint8_t *src,
                                           unsigned int pitch);
+/* Copy a zeta surface into a colour texture. Z24 becomes packed r32uint.
+ * Z16 becomes rgba32float with `channel_modes` (2 bits per channel).
+ */
+void pgraph_wgpu_copy_zeta_to_texture(PGRAPHState *pg, SurfaceBinding *surface,
+                                      WGPUTexture dst,
+                                      WGPUTextureFormat dst_format,
+                                      uint32_t channel_modes);
 
 // draw.c
 void pgraph_wgpu_init_pipelines(PGRAPHState *pg);
