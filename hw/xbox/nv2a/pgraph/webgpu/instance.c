@@ -193,19 +193,6 @@ bool pgraph_wgpu_wait(PGRAPHWgpuState *r, WGPUFuture future)
     return true;
 }
 
-WGPUShaderModule pgraph_wgpu_create_wgsl_module(PGRAPHWgpuState *r,
-                                                const char *label,
-                                                const char *code)
-{
-    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
-    WGPUShaderModuleDescriptor descriptor = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
-
-    source.code = pgraph_wgpu_str(code);
-    descriptor.nextInChain = &source.chain;
-    descriptor.label = pgraph_wgpu_str(label);
-    return wgpuDeviceCreateShaderModule(r->device, &descriptor);
-}
-
 typedef struct ErrorScopeState {
     WGPUErrorType type;
     char *message;
@@ -225,6 +212,46 @@ static void pop_error_scope_callback(WGPUPopErrorScopeStatus status,
     }
 }
 
+static WGPUShaderModule finish_shader_module(PGRAPHWgpuState *r,
+                                             const char *label,
+                                             WGPUShaderModule module)
+{
+    WGPUPopErrorScopeCallbackInfo callback =
+        WGPU_POP_ERROR_SCOPE_CALLBACK_INFO_INIT;
+    ErrorScopeState state = { 0 };
+
+    callback.mode = WGPUCallbackMode_WaitAnyOnly;
+    callback.callback = pop_error_scope_callback;
+    callback.userdata1 = &state;
+    pgraph_wgpu_wait(r, wgpuDevicePopErrorScope(r->device, callback));
+
+    if (state.type != WGPUErrorType_NoError) {
+        fprintf(stderr, "[WebGPU] Failed to create %s shader module: %s\n",
+                label, state.message ?: "unknown error");
+        g_free(state.message);
+        if (module) {
+            wgpuShaderModuleRelease(module);
+        }
+        return NULL;
+    }
+    return module;
+}
+
+WGPUShaderModule pgraph_wgpu_create_wgsl_module(PGRAPHWgpuState *r,
+                                                const char *label,
+                                                const char *code)
+{
+    WGPUShaderSourceWGSL source = WGPU_SHADER_SOURCE_WGSL_INIT;
+    WGPUShaderModuleDescriptor descriptor = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
+
+    source.code = pgraph_wgpu_str(code);
+    descriptor.nextInChain = &source.chain;
+    descriptor.label = pgraph_wgpu_str(label);
+    wgpuDevicePushErrorScope(r->device, WGPUErrorFilter_Validation);
+    return finish_shader_module(
+        r, label, wgpuDeviceCreateShaderModule(r->device, &descriptor));
+}
+
 WGPUShaderModule pgraph_wgpu_create_spirv_module(PGRAPHWgpuState *r,
                                                  const char *label,
                                                  const uint32_t *code,
@@ -234,9 +261,6 @@ WGPUShaderModule pgraph_wgpu_create_spirv_module(PGRAPHWgpuState *r,
     WGPUDawnShaderModuleSPIRVOptionsDescriptor options =
         WGPU_DAWN_SHADER_MODULE_SPIRV_OPTIONS_DESCRIPTOR_INIT;
     WGPUShaderModuleDescriptor descriptor = WGPU_SHADER_MODULE_DESCRIPTOR_INIT;
-    WGPUPopErrorScopeCallbackInfo callback =
-        WGPU_POP_ERROR_SCOPE_CALLBACK_INFO_INIT;
-    ErrorScopeState state = { 0 };
 
     source.code = code;
     source.codeSize = num_words;
@@ -247,21 +271,8 @@ WGPUShaderModule pgraph_wgpu_create_spirv_module(PGRAPHWgpuState *r,
     descriptor.label = pgraph_wgpu_str(label);
 
     wgpuDevicePushErrorScope(r->device, WGPUErrorFilter_Validation);
-    WGPUShaderModule module =
-        wgpuDeviceCreateShaderModule(r->device, &descriptor);
-    callback.mode = WGPUCallbackMode_WaitAnyOnly;
-    callback.callback = pop_error_scope_callback;
-    callback.userdata1 = &state;
-    pgraph_wgpu_wait(r, wgpuDevicePopErrorScope(r->device, callback));
-
-    if (state.type != WGPUErrorType_NoError) {
-        fprintf(stderr, "[WebGPU] Failed to create %s shader module: %s\n",
-                label, state.message ?: "unknown error");
-        g_free(state.message);
-        wgpuShaderModuleRelease(module);
-        return NULL;
-    }
-    return module;
+    return finish_shader_module(
+        r, label, wgpuDeviceCreateShaderModule(r->device, &descriptor));
 }
 
 bool pgraph_wgpu_init_instance(PGRAPHState *pg, Error **errp)

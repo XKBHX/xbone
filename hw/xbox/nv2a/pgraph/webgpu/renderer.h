@@ -45,6 +45,8 @@ typedef struct ShaderBinding {
     bool valid;
     WGPUShaderModule vsh;
     WGPUShaderModule psh;
+    bool vsh_wgsl;
+    bool psh_wgsl;
     VshUniformLocs vsh_locs;
     PshUniformLocs psh_locs;
     WgpuUniformMember vsh_members[VshUniform__COUNT];
