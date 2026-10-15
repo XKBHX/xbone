@@ -174,7 +174,7 @@ Each phase ends with a demonstrable exit criterion.
 | --- | --- |
 | 0. Groundwork | Done. Natively on macOS arm64 (Dawn Metal backend, Apple M1 Pro), `display.renderer = "WEBGPU"` creates a device and boots with a black screen and no asserts. Not yet run on Linux or Windows. |
 | 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 needs a Dawn built with the SPIR-V reader (see the step 4 notes). |
-| 2. Feature completeness | Steps 1–4 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Steps 5–7 have not started. |
+| 2. Feature completeness | Steps 1–5 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Steps 6–7 have not started. |
 | 3. WGSL generator | Not started. |
 | 4. Performance | Not started. |
 | 5. WebGPU UI and browser | Not started. |
@@ -360,9 +360,9 @@ Phase 1 notes (step 5, textures):
   or the shader's texture layout change. A stage is bound to the dummy of
   the declared type when its texture is disabled, or when its type
   (2D, 2D uint, 3D, cube) doesn't match what the shader declares.
-- Render targets reach textures through guest RAM: any dirty surface in
-  the texture's range is downloaded first, as Vulkan does for incompatible
-  surfaces. Sampling surfaces directly is phase 2 step 5.
+- A compatible render target is copied into the texture on the GPU (phase 2
+  step 5). Any other dirty surface in the texture's range is still downloaded
+  first, as Vulkan does for incompatible surfaces.
 - Border textures are allocated at the doubled border size that the shader's
   border adjustment expects.
 - Not yet handled: border colour and LOD bias (both handled since phase 2
@@ -574,6 +574,38 @@ Phase 2 notes (step 4, surface pack and unpack):
 - The surface tables still have no entry for `X1R5G5B5_O1R5G5B5` (`0x2`),
   `X8R8G8B8_O8R8G8B8` (`0x5`), or either `X1A7R8G8B8` format (`0x6`,
   `0x7`). Every renderer aborts on them.
+
+Phase 2 notes (step 5, surface as texture):
+
+- `bind_texture` looks up a surface at the texture's address. A
+  single-level 2D texture with the same width and height, and the same
+  pitch unless the surface is swizzled, can be filled from that surface
+  image. The texture object stays in the cache and is recopied when
+  `draw_time` changes, or after guest writes are uploaded.
+- The copy runs when the GPU texels are the surface image. `A8R8G8B8` and
+  `X8R8G8B8` surfaces copy into an `A8R8G8B8` texture with
+  `copyTextureToTexture` (`bgra8unorm` to `bgra8unorm`). `Z24S8` sampled as
+  `X8Y24` reuses the Z24 pack kernel and `copyBufferToTexture` into
+  `r32uint`, with no readback. The packed word is `(z24 << 8) | stencil`,
+  which the shader shifts by 8. `Z16` sampled as a Y16 texture quantizes
+  to a 16-bit unorm and writes `rgba32float` with the same channel swizzle
+  as the RAM decode (`R` is the depth, `G` is 0, `B` is 0 for fixed and 1
+  for float). That path needs `float32-filterable`. On a device without it
+  the Y16 texture is `rgba16float` and the bind stays on the RAM path.
+- 16-bit colour, `B8`, `G8B8`, and `X8R8G8B8` textures (alpha forced to 1)
+  stay on the RAM path. So do mipmaps, cubemaps, 3D textures, border
+  textures, indexed textures, and a linear pitch that does not match.
+  `Z24` sampled as Y16 stays on the RAM path as well: the texel sizes
+  differ.
+- When the surface scale factor is greater than 1 the texture is created
+  at the scaled size, matching Vulkan. The factor is still 1.
+- Checked with nxdk_pgraph_tests release `v2026-10-10_21-27-19` on macOS
+  arm64. `TexFmt_A8R8G8B8` (swizzled and linear), `RenderTextureLoop`,
+  `RenderTextureClearLoop`, and shadow comparator
+  `2P16_10.00-20.00_15.0000_LT` match Vulkan. Frames that show the same
+  test are identical, and there are no WebGPU validation errors. The copy
+  runs for those render targets. `R5G6B5` and `X8R8G8B8` log a
+  compatibility failure and stay on the RAM path.
 
 ### Phase 0: groundwork and refactors (small, landable on its own)
 

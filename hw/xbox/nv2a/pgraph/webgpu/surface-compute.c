@@ -82,6 +82,8 @@ enum {
     COMPUTE_UNPACK_R5G6B5,
     COMPUTE_PACK_X1R5G5B5,
     COMPUTE_UNPACK_X1R5G5B5,
+    /* Z16 depth sampled as a Y16 float texture. One thread per row. */
+    COMPUTE_Z16_TO_FLOAT,
     COMPUTE__COUNT,
 };
 
@@ -238,6 +240,31 @@ static const char unpack_x1r5g5b5_wgsl[] =
                  "(expand_bits(pix & 31u, 5u) << 16u) |"
                  "(select(0u, 255u, (pix & 0x8000u) != 0u) << 24u)");
 
+/* pad holds 2 bits per output channel: 0 is 0, 1 is 1, 2 is the depth. */
+static const char z16_to_float_wgsl[] =
+    PARAMS "@group(0) @binding(0) var depth_tex: texture_depth_2d;\n"
+           "@group(0) @binding(1) var<storage, read_write> dst: array<u32>;\n"
+           "@group(0) @binding(3) var<uniform> params: Params;\n"
+           "fn ch(mode: u32, r: f32) -> f32 {\n"
+           "    if (mode == 0u) { return 0.0; }\n"
+           "    if (mode == 1u) { return 1.0; }\n"
+           "    return r;\n"
+           "}\n" MAIN_ROW "    let stride = params.dst_stride / 4u;\n"
+           "    let modes = params.pad;\n"
+           "    for (var x = 0u; x < params.width_out; x++) {\n"
+           "        let d = clamp(textureLoad(depth_tex, vec2i(i32(x), "
+           "i32(y_out)), 0),\n"
+           "                      0.0, 1.0);\n"
+           "        let z16 = u32(d * 65535.0 + 0.5);\n"
+           "        let r = f32(z16) / 65535.0;\n"
+           "        let base = y_out * stride + x * 4u;\n"
+           "        dst[base] = bitcast<u32>(ch(modes & 3u, r));\n"
+           "        dst[base + 1u] = bitcast<u32>(ch((modes >> 2u) & 3u, r));\n"
+           "        dst[base + 2u] = bitcast<u32>(ch((modes >> 4u) & 3u, r));\n"
+           "        dst[base + 3u] = bitcast<u32>(ch((modes >> 6u) & 3u, r));\n"
+           "    }\n"
+           "}\n";
+
 static const char *const compute_shader_source[COMPUTE__COUNT] = {
     [COMPUTE_PACK_Z24] = pack_z24_wgsl,
     [COMPUTE_UNPACK_Z24] = unpack_z24_wgsl,
@@ -247,6 +274,7 @@ static const char *const compute_shader_source[COMPUTE__COUNT] = {
     [COMPUTE_UNPACK_R5G6B5] = unpack_r5g6b5_wgsl,
     [COMPUTE_PACK_X1R5G5B5] = pack_x1r5g5b5_wgsl,
     [COMPUTE_UNPACK_X1R5G5B5] = unpack_x1r5g5b5_wgsl,
+    [COMPUTE_Z16_TO_FLOAT] = z16_to_float_wgsl,
 };
 
 static int compute_op(const SurfaceBinding *surface, bool pack)
@@ -306,9 +334,11 @@ static void fill_layout_entries(int op, WGPUBindGroupLayoutEntry *entries,
         entries[n++] = buffer_entry(2, WGPUBufferBindingType_Storage);
         break;
     case COMPUTE_PACK_Z16:
+    case COMPUTE_Z16_TO_FLOAT:
     case COMPUTE_PACK_R5G6B5:
     case COMPUTE_PACK_X1R5G5B5:
-        entries[n++] = texture_entry(0, op == COMPUTE_PACK_Z16 ?
+        entries[n++] = texture_entry(0, op == COMPUTE_PACK_Z16 ||
+                                                op == COMPUTE_Z16_TO_FLOAT ?
                                             WGPUTextureSampleType_Depth :
                                             WGPUTextureSampleType_Float);
         entries[n++] = buffer_entry(1, WGPUBufferBindingType_Storage);
@@ -622,6 +652,76 @@ void pgraph_wgpu_pack_converted_surface(PGRAPHState *pg,
     }
     if (color_view) {
         wgpuTextureViewRelease(color_view);
+    }
+}
+
+void pgraph_wgpu_copy_zeta_to_texture(PGRAPHState *pg, SurfaceBinding *surface,
+                                      WGPUTexture dst,
+                                      WGPUTextureFormat dst_format,
+                                      uint32_t channel_modes)
+{
+    PGRAPHWgpuState *r = pg->wgpu_renderer_state;
+    unsigned int scaled_w, scaled_h;
+    scaled_size(pg, surface, &scaled_w, &scaled_h);
+
+    bool z24 = dst_format == WGPUTextureFormat_R32Uint;
+    int op = z24 ? COMPUTE_PACK_Z24 : COMPUTE_Z16_TO_FLOAT;
+    uint32_t texel_bytes = z24 ? 4 : 16;
+    uint32_t dst_stride = ROUND_UP(scaled_w * texel_bytes, 256);
+    uint64_t dst_bytes = (uint64_t)dst_stride * scaled_h;
+
+    assert(z24 == (surface->host_fmt.conversion == WGPU_SURFACE_CONV_Z24S8));
+    assert(z24 || dst_format == WGPUTextureFormat_RGBA32Float);
+
+    SurfaceComputeParams params = {
+        .width_in = scaled_w,
+        .height_in = scaled_h,
+        .width_out = scaled_w,
+        .height_out = scaled_h,
+        .dst_stride = dst_stride,
+        .pad = channel_modes,
+    };
+
+    WGPUBuffer out = ensure_buffer(
+        r, 1, dst_bytes, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc,
+        "Surface to texture");
+    WGPUBindGroupEntry entries[4];
+    uint32_t nentries = 0;
+    WGPUTextureView depth_view =
+        aspect_view(surface->texture, WGPUTextureFormat_Depth32Float,
+                    WGPUTextureAspect_DepthOnly);
+    WGPUTextureView stencil_view = NULL;
+
+    entries[nentries] = WGPU_BIND_GROUP_ENTRY_INIT;
+    entries[nentries].binding = 0;
+    entries[nentries].textureView = depth_view;
+    nentries++;
+
+    if (z24) {
+        stencil_view = aspect_view(surface->texture, WGPUTextureFormat_Stencil8,
+                                   WGPUTextureAspect_StencilOnly);
+        entries[nentries] = WGPU_BIND_GROUP_ENTRY_INIT;
+        entries[nentries].binding = 1;
+        entries[nentries].textureView = stencil_view;
+        nentries++;
+    }
+
+    entries[nentries] = WGPU_BIND_GROUP_ENTRY_INIT;
+    entries[nentries].binding = z24 ? 2 : 1;
+    entries[nentries].buffer = out;
+    entries[nentries].size = dst_bytes;
+    nentries++;
+
+    dispatch_compute(pg, op, &params, entries, nentries,
+                     WGPU_FINISH_REASON_SURFACE_DOWN);
+    copy_storage_to_texture(pgraph_wgpu_ensure_encoder(pg), out, dst_stride,
+                            dst, WGPUTextureAspect_All, scaled_w, scaled_h);
+    /* Submit before releasing the views the compute pass sampled. */
+    pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_SURFACE_DOWN, false);
+
+    wgpuTextureViewRelease(depth_view);
+    if (stencil_view) {
+        wgpuTextureViewRelease(stencil_view);
     }
 }
 

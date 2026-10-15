@@ -465,6 +465,11 @@ static void create_texture_object(PGRAPHWgpuState *r, TextureBinding *binding)
     unsigned int width, height, depth;
 
     get_texture_size(s, &width, &height, &depth);
+    /* A surface copy is stored at the scaled size. The factor is 1 for now. */
+    if (binding->key.scale > 1) {
+        width *= binding->key.scale;
+        height *= binding->key.scale;
+    }
 
     g_autofree gchar *label =
         g_strdup_printf("Texture %" HWADDR_PRIx "h fmt:%02xh %dx%dx%d lvls:%d",
@@ -664,6 +669,121 @@ static uint64_t hash_texture_data(NV2AState *d, const TextureKey *key)
     return hash;
 }
 
+/* 0 is 0, 1 is 1, 2 is the 16-bit depth value. Matches decode_texels for R16.
+ */
+static uint32_t r16_channel_mode(const WgpuColorFormatInfo *wf, int channel)
+{
+    switch (wf->swizzle[channel]) {
+    case WGPU_SWZ_ZERO:
+    case WGPU_SWZ_G:
+    case WGPU_SWZ_B:
+        return 0;
+    case WGPU_SWZ_ONE:
+    case WGPU_SWZ_A:
+        return 1;
+    case WGPU_SWZ_R:
+        return 2;
+    case WGPU_SWZ_ID:
+        if (channel == 0) {
+            return 2;
+        }
+        return channel == 3 ? 1 : 0;
+    default:
+        return 0;
+    }
+}
+
+static uint32_t z16_channel_modes(const WgpuColorFormatInfo *wf)
+{
+    uint32_t modes = 0;
+
+    for (int i = 0; i < 4; i++) {
+        modes |= r16_channel_mode(wf, i) << (i * 2);
+    }
+    return modes;
+}
+
+/*
+ * Copy on the GPU only when the texture texels are the surface image.
+ * Anything that still needs a decode (16-bit colour, X8 alpha, B8, G8B8,
+ * a mismatched depth format) keeps the RAM download.
+ */
+static bool surface_to_texture_compatible(PGRAPHWgpuState *r,
+                                          const SurfaceBinding *surface,
+                                          const TextureShape *shape)
+{
+    const WgpuColorFormatInfo *wf;
+
+    if (shape->dimensionality != 2 || shape->cubemap || shape->levels > 1 ||
+        shape->border || surface->width != shape->width ||
+        surface->height != shape->height ||
+        (!surface->swizzle && surface->pitch != shape->pitch) ||
+        shape->color_format == NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8) {
+        return false;
+    }
+
+    wf = &kelvin_color_format_wgpu_map[shape->color_format];
+    if (!surface->color) {
+        if (surface->host_fmt.conversion == WGPU_SURFACE_CONV_Z24S8 &&
+            wf->decode == WGPU_TEX_DECODE_COPY &&
+            wf->format == WGPUTextureFormat_R32Uint) {
+            return true;
+        }
+        return surface->host_fmt.conversion == WGPU_SURFACE_CONV_Z16 &&
+               wf->decode == WGPU_TEX_DECODE_R16 &&
+               get_host_format(r, wf) == WGPUTextureFormat_RGBA32Float;
+    }
+
+    return surface->host_fmt.conversion == WGPU_SURFACE_CONV_NONE &&
+           wf->decode == WGPU_TEX_DECODE_COPY &&
+           wf->format == surface->host_fmt.format;
+}
+
+static void copy_color_surface_to_texture(PGRAPHState *pg,
+                                          SurfaceBinding *surface,
+                                          TextureBinding *texture)
+{
+    PGRAPHWgpuState *r = pg->wgpu_renderer_state;
+    unsigned int width = surface->width;
+    unsigned int height = surface->height;
+
+    pgraph_apply_scaling_factor(pg, &width, &height);
+    pgraph_wgpu_end_render_pass(r);
+
+    WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+    WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+    WGPUExtent3D extent = { width, height, 1 };
+
+    src.texture = surface->texture;
+    dst.texture = texture->texture;
+    wgpuCommandEncoderCopyTextureToTexture(pgraph_wgpu_ensure_encoder(pg), &src,
+                                           &dst, &extent);
+}
+
+static void copy_surface_to_texture(PGRAPHState *pg, SurfaceBinding *surface,
+                                    TextureBinding *texture)
+{
+    nv2a_profile_inc_counter(NV2A_PROF_SURF_TO_TEX);
+    trace_nv2a_pgraph_surface_render_to_texture(
+        surface->vram_addr, surface->width, surface->height);
+
+    if (surface->color) {
+        copy_color_surface_to_texture(pg, surface, texture);
+    } else {
+        PGRAPHWgpuState *r = pg->wgpu_renderer_state;
+        const WgpuColorFormatInfo *wf =
+            &kelvin_color_format_wgpu_map[texture->key.state.color_format];
+        uint32_t modes = 0;
+
+        if (surface->host_fmt.conversion == WGPU_SURFACE_CONV_Z16) {
+            modes = z16_channel_modes(wf);
+        }
+        pgraph_wgpu_copy_zeta_to_texture(pg, surface, texture->texture,
+                                         get_host_format(r, wf), modes);
+    }
+    texture->draw_time = surface->draw_time;
+}
+
 static void bind_texture(PGRAPHState *pg, int texture_idx)
 {
     NV2AState *d = container_of(pg, NV2AState, pgraph);
@@ -686,11 +806,30 @@ static void bind_texture(PGRAPHState *pg, int texture_idx)
     key.max_anisotropy =
         1 << (GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_TEXCTL0_0 + texture_idx * 4),
                        NV_PGRAPH_TEXCTL0_0_MAX_ANISOTROPY));
+    key.scale = 1;
 
-    /* Render targets reach textures through guest RAM for now: write back any
-     * surface this texture may read. */
-    pgraph_wgpu_download_surfaces_in_range_if_dirty(pg, key.texture_vram_offset,
-                                                    key.texture_length);
+    SurfaceBinding *surface =
+        pgraph_wgpu_surface_get(d, key.texture_vram_offset);
+    bool surface_to_texture = false;
+    bool surface_uploaded = false;
+    if (surface && state.levels == 1) {
+        surface_to_texture = surface_to_texture_compatible(r, surface, &state);
+        if (!surface_to_texture && surface->color) {
+            trace_nv2a_pgraph_surface_texture_compat_failed(
+                surface->shape.color_format, state.color_format);
+        }
+        if (surface_to_texture && surface->upload_pending) {
+            pgraph_wgpu_upload_surface_data(d, surface, false);
+            surface_uploaded = true;
+        }
+    }
+    if (!surface_to_texture) {
+        pgraph_wgpu_download_surfaces_in_range_if_dirty(
+            pg, key.texture_vram_offset, key.texture_length);
+    }
+    if (surface_to_texture && pg->surface_scale_factor > 1) {
+        key.scale = pg->surface_scale_factor;
+    }
 
     uint64_t key_hash = fast_hash((const uint8_t *)&key, sizeof(key));
     LruNode *node = lru_lookup(&r->texture_cache, key_hash, &key);
@@ -698,11 +837,17 @@ static void bind_texture(PGRAPHState *pg, int texture_idx)
     bool found = binding->texture != NULL;
 
     bool possibly_dirty = !found || binding->possibly_dirty;
-    possibly_dirty |= check_texture_possibly_dirty(d, &key);
+    if (!surface_to_texture) {
+        possibly_dirty |= check_texture_possibly_dirty(d, &key);
+    }
     r->texture_bindings[texture_idx] = binding;
 
     if (found) {
-        if (possibly_dirty) {
+        if (surface_to_texture) {
+            if (surface_uploaded || surface->draw_time != binding->draw_time) {
+                copy_surface_to_texture(pg, surface, binding);
+            }
+        } else if (possibly_dirty) {
             uint64_t hash = hash_texture_data(d, &key);
             binding->possibly_dirty = false;
             if (hash != binding->hash) {
@@ -719,7 +864,6 @@ static void bind_texture(PGRAPHState *pg, int texture_idx)
 
     memcpy(&binding->key, &key, sizeof(key));
     binding->possibly_dirty = false;
-    binding->hash = hash_texture_data(d, &key);
     binding->type = get_texture_type(r, &state);
 
     assert(kelvin_color_format_info_map[state.color_format].bytes_per_pixel);
@@ -728,7 +872,14 @@ static void bind_texture(PGRAPHState *pg, int texture_idx)
     create_texture_object(r, binding);
     binding->sampler =
         create_sampler(r, &key, binding->type != PSH_TEXTURE_TYPE_2D_UINT);
-    upload_texture_data(pg, binding);
+    if (surface_to_texture) {
+        binding->hash = 0;
+        copy_surface_to_texture(pg, surface, binding);
+    } else {
+        binding->hash = hash_texture_data(d, &key);
+        binding->draw_time = 0;
+        upload_texture_data(pg, binding);
+    }
 }
 
 /* Guest CPU writes to texture memory don't set texture_dirty, so every enabled
