@@ -174,7 +174,7 @@ Each phase ends with a demonstrable exit criterion.
 | --- | --- |
 | 0. Groundwork | Done. Natively on macOS arm64 (Dawn Metal backend, Apple M1 Pro), `display.renderer = "WEBGPU"` creates a device and boots with a black screen and no asserts. Not yet run on Linux or Windows. |
 | 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 needs a Dawn built with the SPIR-V reader (see the step 4 notes). |
-| 2. Feature completeness | Step 1 (primitive assembly, with host unit tests in `tests/xbox/prim`) and step 2 (point size and point sprites) are done. Step 3 is in progress: border colour and LOD bias are done; the remaining texture work is next. Steps 4–7 have not started. |
+| 2. Feature completeness | Step 1 (primitive assembly, with host unit tests in `tests/xbox/prim`) and step 2 (point size and point sprites) are done. Step 3 (textures: border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware) is done. Steps 4–7 have not started. |
 | 3. WGSL generator | Not started. |
 | 4. Performance | Not started. |
 | 5. WebGPU UI and browser | Not started. |
@@ -315,8 +315,9 @@ Phase 1 notes (step 4, draw path):
   attachment (compare Always, no writes).
 - Known gaps: flat-shading provoking vertex and polygon modes (both handled
   since phase 2 step 1), point sprites
-  and point size (handled since phase 2 step 2), `x8y24` uint sampling, and culling of both faces (those
-  draws are skipped). Constant-alpha blend factors use the blend constant
+  and point size (handled since phase 2 step 2), `x8y24` uint sampling
+  (handled since phase 2 step 3), and culling of both faces (those draws
+  are skipped). Constant-alpha blend factors use the blend constant
   with alpha in every channel. Emscripten can't use this path until the
   phase 3 WGSL generator exists.
 
@@ -365,9 +366,8 @@ Phase 1 notes (step 5, textures):
   border adjustment expects.
 - Not yet handled: border colour and LOD bias (both handled since phase 2
   step 3), the signed-channel filter bits (also unimplemented in Vulkan)
-  and convolution filters. They belong to phase 2 step 3. Only the dashboard's formats have been checked on screen.
-  The depth, `Y16`, `R6G5B5`, cube and 3D paths compile, but nothing has
-  exercised them yet.
+  and convolution filters. They belong to phase 2 step 3. Phase 2 step 3
+  checked the formats, depth, cube and 3D paths on screen.
 
 Phase 2 notes (step 1, primitive assembly):
 
@@ -506,6 +506,34 @@ Phase 2 notes (step 3, textures):
   fires for disabled stages. A lookup whose binding and texture object are
   unchanged doesn't rebuild the bind group. With this, the `Texture CPU
   Update` suite and `Volumetric_as_2D` match the hardware golden images.
+- WGSL has no `textureSample` for integer textures, so Tint rejected every
+  shader that sampled an `x8y24` depth texture through `textureProj` on a
+  `usampler2D`, and those draws were skipped. The WebGPU target now uses
+  `texelFetch` on the texel that a nearest-filtered sample would return,
+  clamped to the edge. Integer textures can't be filtered, so a nearest
+  texel is the only result a sample can give. Vulkan keeps the guest's
+  address modes, so `BORDER`, wrap and mirror addressing can differ from
+  Vulkan.
+- Format table check. These suites were captured on both renderers and
+  scored against the hardware golden images: `Texture format`,
+  `Texture DXT`, `Texture palette`, `Texture 2D as cubemap`,
+  `Volume texture`, `Texture signed component tests`,
+  `Texture projective 2D`, `Texture 3D as 2D`, `TextureWrapMode`,
+  `Texture anisotropy`, `Texture CPU Update`, and the 24-bit and some 16-bit
+  `Texture shadow comparator` cases. That is about 180 tests. After the two
+  fixes above, WebGPU is as close to hardware as Vulkan in every one of them.
+  Problems shared by every renderer:
+  - The shared texture code doesn't define nxdk's `LU_IMAGE_R8B8` (`0x16`),
+    swizzled `X8_Y24` and `Y16_FLOAT` depth (`0x2A`, `0x2B`, `0x2D`),
+    `SZ_Y16` (`0x32`), the `YB16YA16` formats (`0x33`, `0x36`) and
+    `A4V6YB6A4U6YA6` (`0x34`), and aborts on them. Swizzled 3D `R6G5B5`
+    hits an assertion in `pgraph_convert_texture_data`. Those test cases
+    were skipped.
+  - The signed-channel bits are unimplemented, so `Texture signed component
+    tests` differ from hardware on both renderers.
+  - In `Texture projective 2D/ExplicitQ_ZeroCorner_*`, where q is zero at
+    one corner, the `BORDER` row differs from hardware on both renderers,
+    in different ways.
 
 ### Phase 0: groundwork and refactors (small, landable on its own)
 
