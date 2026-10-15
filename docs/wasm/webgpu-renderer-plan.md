@@ -174,7 +174,7 @@ Each phase ends with a demonstrable exit criterion.
 | --- | --- |
 | 0. Groundwork | Done. Natively on macOS arm64 (Dawn Metal backend, Apple M1 Pro), `display.renderer = "WEBGPU"` creates a device and boots with a black screen and no asserts. Not yet run on Linux or Windows. |
 | 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 needs a Dawn built with the SPIR-V reader (see the step 4 notes). |
-| 2. Feature completeness | Step 1 (primitive assembly, with host unit tests in `tests/xbox/prim`) and step 2 (point size and point sprites) are done. Step 3 (textures: border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware) is done. Steps 4–7 have not started. |
+| 2. Feature completeness | Steps 1–4 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Steps 5–7 have not started. |
 | 3. WGSL generator | Not started. |
 | 4. Performance | Not started. |
 | 5. WebGPU UI and browser | Not started. |
@@ -249,7 +249,8 @@ Phase 1 notes (steps 1, 2, 3 and 6):
     `r32float` staging texture and draws a fullscreen triangle that outputs
     `@builtin(frag_depth)`. Stencil is written directly through a
     stencil-aspect `wgpuQueueWriteTexture`.
-  - The compute pack/unpack pass described in section 3.4 moves to phase 4.
+  - Phase 2 step 4 moves this conversion into the compute pack/unpack
+    pass. Phase 4 item 4 is separate: it is the texture upload conversion.
 - Clears always use a fullscreen-triangle draw: blend constant colour, the
   channel write mask, the viewport depth range set to the clear depth, and
   stencil `Replace` with the reference value. The scissor is the clear
@@ -534,6 +535,45 @@ Phase 2 notes (step 3, textures):
   - In `Texture projective 2D/ExplicitQ_ZeroCorner_*`, where q is zero at
     one corner, the `BORDER` row differs from hardware on both renderers,
     in different ways.
+
+Phase 2 notes (step 4, surface pack and unpack):
+
+- `R5G6B5`, `X1R5G5B5`, `Z16` and `Z24S8` still render through `rgba8unorm`
+  and `depth32float-stencil8`. Upload and download used to convert on the
+  CPU. `surface-compute.c` does that conversion in WGSL.
+- Each kernel runs one thread per output row, so packed 16-bit pairs and
+  stencil bytes are written by a single thread. Pack samples the colour
+  texture, or the depth texture plus a stencil-aspect `texture_2d<u32>`,
+  and writes guest pixels into a storage buffer. That buffer is copied to
+  a map-readable buffer. Unpack writes `r32float` depth, then the existing
+  fullscreen triangle stores it with `@builtin(frag_depth)`. Stencil is
+  copied in as bytes. Colour is copied in as `rgba8unorm`. Copy rows are
+  aligned to 256 bytes. `A8R8G8B8`, `X8R8G8B8`, `B8` and `G8B8` stay on the
+  direct copy path.
+- Z24 matches `vk/surface-compute.c` for `D32_SFLOAT_S8`: pack is
+  `int(d * 0xffffff)`, unpack is `z / 2^24` plus one ULP. Z16 is
+  `z / 65535`, rounded to nearest on the way back. 16-bit colour uses the
+  same expand and reduce as the old CPU path. The X1 bit is alpha ≥ 128,
+  which is what Vulkan's `A1R5G5B5` stores. Vulkan's format comment still
+  says that bit should be forced to zero. Hardware clears leave it clear,
+  so both renderers differ from hardware in the same way.
+- The kernels take `width_in` and `width_out` and scale the same way as
+  Vulkan. The scale factor is still 1 until step 7.
+- Swizzle stays on the CPU (`swizzle_rect` / `unswizzle_rect`), as in
+  Vulkan.
+- Checked with nxdk_pgraph_tests release `v2026-10-10_21-27-19` on macOS
+  arm64. Frames that show the same test match Vulkan, with no validation
+  errors on these paths. `Surface format` `R5G6B5` matches the hardware
+  golden. `X1R5G5B5` matches Vulkan. Fixed-point `Z16` and `Z24` depth
+  tests match Vulkan and sit close to the hardware goldens.
+- `Color zeta overlap` hits the `buffer_dirty` assert while evicting the
+  bound colour surface. The OpenGL backend asserts in the same place.
+- Float-Z depth tests submit a viewport depth outside `[0, 1]`. Dawn
+  rejects the command buffer, so those draws do not appear. That check is
+  outside the pack and unpack path.
+- The surface tables still have no entry for `X1R5G5B5_O1R5G5B5` (`0x2`),
+  `X8R8G8B8_O8R8G8B8` (`0x5`), or either `X1A7R8G8B8` format (`0x6`,
+  `0x7`). Every renderer aborts on them.
 
 ### Phase 0: groundwork and refactors (small, landable on its own)
 

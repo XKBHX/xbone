@@ -79,100 +79,6 @@ void pgraph_wgpu_download_surfaces_in_range_if_dirty(PGRAPHState *pg,
     }
 }
 
-static uint8_t expand_bits(unsigned int v, unsigned int bits)
-{
-    unsigned int max = (1 << bits) - 1;
-    return (v * 255 + max / 2) / max;
-}
-
-static unsigned int reduce_bits(uint8_t v, unsigned int bits)
-{
-    unsigned int max = (1 << bits) - 1;
-    return (v * max + 127) / 255;
-}
-
-/* Convert one row of guest pixels to the host texture layout. */
-static void convert_row_to_host(const SurfaceBinding *surface, uint8_t *dst,
-                                const uint8_t *src)
-{
-    unsigned int width = surface->width;
-
-    switch (surface->host_fmt.conversion) {
-    case WGPU_SURFACE_CONV_R5G6B5:
-        for (unsigned int x = 0; x < width; x++) {
-            uint16_t v = lduw_le_p(src + x * 2);
-            dst[x * 4 + 0] = expand_bits((v >> 11) & 0x1f, 5);
-            dst[x * 4 + 1] = expand_bits((v >> 5) & 0x3f, 6);
-            dst[x * 4 + 2] = expand_bits(v & 0x1f, 5);
-            dst[x * 4 + 3] = 0xff;
-        }
-        break;
-    case WGPU_SURFACE_CONV_X1R5G5B5:
-        for (unsigned int x = 0; x < width; x++) {
-            uint16_t v = lduw_le_p(src + x * 2);
-            dst[x * 4 + 0] = expand_bits((v >> 10) & 0x1f, 5);
-            dst[x * 4 + 1] = expand_bits((v >> 5) & 0x1f, 5);
-            dst[x * 4 + 2] = expand_bits(v & 0x1f, 5);
-            dst[x * 4 + 3] = (v & 0x8000) ? 0xff : 0;
-        }
-        break;
-    default:
-        memcpy(dst, src, width * surface->fmt.bytes_per_pixel);
-        break;
-    }
-}
-
-static void convert_row_to_guest(const SurfaceBinding *surface, uint8_t *dst,
-                                 const uint8_t *src)
-{
-    unsigned int width = surface->width;
-
-    switch (surface->host_fmt.conversion) {
-    case WGPU_SURFACE_CONV_R5G6B5:
-        for (unsigned int x = 0; x < width; x++) {
-            const uint8_t *p = src + x * 4;
-            stw_le_p(dst + x * 2, reduce_bits(p[0], 5) << 11 |
-                                      reduce_bits(p[1], 6) << 5 |
-                                      reduce_bits(p[2], 5));
-        }
-        break;
-    case WGPU_SURFACE_CONV_X1R5G5B5:
-        for (unsigned int x = 0; x < width; x++) {
-            const uint8_t *p = src + x * 4;
-            stw_le_p(dst + x * 2,
-                     (p[3] >= 0x80 ? 0x8000 : 0) | reduce_bits(p[0], 5) << 10 |
-                         reduce_bits(p[1], 5) << 5 | reduce_bits(p[2], 5));
-        }
-        break;
-    default:
-        memcpy(dst, src, width * surface->fmt.bytes_per_pixel);
-        break;
-    }
-}
-
-/* Must match the depth conversion used by the generated fragment shaders. */
-static float unpack_z24(uint32_t z24)
-{
-    float d = (float)z24 / 16777216.0f;
-    uint32_t bits;
-    memcpy(&bits, &d, sizeof(bits));
-    bits += 1;
-    memcpy(&d, &bits, sizeof(d));
-    return d;
-}
-
-static float load_float(const uint8_t *p)
-{
-    float f;
-    memcpy(&f, p, sizeof(f));
-    return f;
-}
-
-static uint32_t pack_z24(float d)
-{
-    return (uint32_t)(int32_t)(d * (float)0xffffff);
-}
-
 static void ensure_readback_buffer(PGRAPHWgpuState *r, uint64_t size)
 {
     if (r->readback_buffer && r->readback_buffer_size >= size) {
@@ -227,27 +133,32 @@ static void download_surface_to_buffer(NV2AState *d, SurfaceBinding *surface,
         surface->vram_addr, surface->width, surface->height, surface->pitch,
         surface->fmt.bytes_per_pixel);
 
-    uint32_t main_bpp =
-        surface->host_fmt.depth ? 4 : surface->host_fmt.host_bytes_per_pixel;
-    uint32_t main_row = ROUND_UP(surface->width * main_bpp, 256);
-    uint64_t main_size = (uint64_t)main_row * surface->height;
-    uint32_t stencil_row = ROUND_UP(surface->width, 256);
-    uint64_t total_size = main_size;
-    if (surface->host_fmt.depth) {
-        total_size += (uint64_t)stencil_row * surface->height;
+    /* 16-bit colour and depth are packed on the GPU. Swizzle stays here,
+     * matching Vulkan. */
+    if (surface->host_fmt.conversion != WGPU_SURFACE_CONV_NONE) {
+        uint8_t *out = pixels;
+        g_autofree uint8_t *swizzle_buf = NULL;
+        if (surface->swizzle) {
+            swizzle_buf = g_malloc(surface->size);
+            out = swizzle_buf;
+        }
+        pgraph_wgpu_pack_converted_surface(pg, surface, out, surface->pitch);
+        if (surface->swizzle) {
+            swizzle_rect(swizzle_buf, surface->width, surface->height, pixels,
+                         surface->pitch, surface->fmt.bytes_per_pixel);
+            nv2a_profile_inc_counter(NV2A_PROF_SURF_SWIZZLE);
+        }
+        return;
     }
+
+    uint32_t main_bpp = surface->host_fmt.host_bytes_per_pixel;
+    uint32_t main_row = ROUND_UP(surface->width * main_bpp, 256);
+    uint64_t total_size = (uint64_t)main_row * surface->height;
     ensure_readback_buffer(r, total_size);
 
     WGPUCommandEncoder encoder = pgraph_wgpu_ensure_encoder(pg);
-    if (surface->host_fmt.depth) {
-        copy_aspect_to_buffer(encoder, surface, WGPUTextureAspect_DepthOnly,
-                              r->readback_buffer, 0, main_row);
-        copy_aspect_to_buffer(encoder, surface, WGPUTextureAspect_StencilOnly,
-                              r->readback_buffer, main_size, stencil_row);
-    } else {
-        copy_aspect_to_buffer(encoder, surface, WGPUTextureAspect_All,
-                              r->readback_buffer, 0, main_row);
-    }
+    copy_aspect_to_buffer(encoder, surface, WGPUTextureAspect_All,
+                          r->readback_buffer, 0, main_row);
     nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_1);
     pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_SURFACE_DOWN, false);
 
@@ -266,29 +177,8 @@ static void download_surface_to_buffer(NV2AState *d, SurfaceBinding *surface,
     }
 
     for (unsigned int y = 0; y < surface->height; y++) {
-        const uint8_t *row = mapped + (uint64_t)y * main_row;
-        uint8_t *dst = out + (size_t)y * out_pitch;
-
-        switch (surface->host_fmt.conversion) {
-        case WGPU_SURFACE_CONV_Z16:
-            for (unsigned int x = 0; x < surface->width; x++) {
-                float depth = MIN(MAX(load_float(row + x * 4), 0.0f), 1.0f);
-                stw_le_p(dst + x * 2, (uint16_t)(depth * 65535.0f + 0.5f));
-            }
-            break;
-        case WGPU_SURFACE_CONV_Z24S8: {
-            const uint8_t *stencil =
-                mapped + main_size + (uint64_t)y * stencil_row;
-            for (unsigned int x = 0; x < surface->width; x++) {
-                stl_le_p(dst + x * 4,
-                         pack_z24(load_float(row + x * 4)) << 8 | stencil[x]);
-            }
-            break;
-        }
-        default:
-            convert_row_to_guest(surface, dst, row);
-            break;
-        }
+        memcpy(out + (size_t)y * out_pitch, mapped + (uint64_t)y * main_row,
+               (size_t)surface->width * main_bpp);
     }
 
     wgpuBufferUnmap(r->readback_buffer);
@@ -687,86 +577,6 @@ static void write_texture(PGRAPHWgpuState *r, WGPUTexture texture,
     wgpuQueueWriteTexture(r->queue, &dst, data, size, &layout, &extent);
 }
 
-/* Depth aspects can't be copy destinations, so depth is written by drawing a
- * fullscreen triangle that samples an r32float staging texture.
- */
-static void upload_depth_stencil(PGRAPHState *pg, SurfaceBinding *surface,
-                                 const uint8_t *pixels)
-{
-    PGRAPHWgpuState *r = pg->wgpu_renderer_state;
-    unsigned int width = surface->width, height = surface->height;
-    size_t num_pixels = (size_t)width * height;
-
-    g_autofree float *depth = g_malloc(num_pixels * sizeof(float));
-    g_autofree uint8_t *stencil = g_malloc0(num_pixels);
-
-    for (unsigned int y = 0; y < height; y++) {
-        const uint8_t *row = pixels + (size_t)y * surface->pitch;
-        for (unsigned int x = 0; x < width; x++) {
-            size_t i = (size_t)y * width + x;
-            if (surface->host_fmt.conversion == WGPU_SURFACE_CONV_Z16) {
-                depth[i] = lduw_le_p(row + x * 2) / 65535.0f;
-            } else {
-                uint32_t v = ldl_le_p(row + x * 4);
-                depth[i] = unpack_z24(v >> 8);
-                stencil[i] = v & 0xff;
-            }
-        }
-    }
-
-    WGPUTextureDescriptor staging_desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
-    staging_desc.label = pgraph_wgpu_str("Depth upload staging");
-    staging_desc.usage =
-        WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
-    staging_desc.dimension = WGPUTextureDimension_2D;
-    staging_desc.size = (WGPUExtent3D){ width, height, 1 };
-    staging_desc.format = WGPUTextureFormat_R32Float;
-    WGPUTexture staging = wgpuDeviceCreateTexture(r->device, &staging_desc);
-    WGPUTextureView staging_view = wgpuTextureCreateView(staging, NULL);
-
-    write_texture(r, staging, WGPUTextureAspect_All, depth,
-                  num_pixels * sizeof(float), width * sizeof(float), width,
-                  height);
-    write_texture(r, surface->texture, WGPUTextureAspect_StencilOnly, stencil,
-                  num_pixels, width, width, height);
-
-    WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
-    entry.binding = 0;
-    entry.textureView = staging_view;
-    WGPUBindGroupDescriptor bg_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
-    bg_desc.layout = r->depth_upload_bind_group_layout;
-    bg_desc.entryCount = 1;
-    bg_desc.entries = &entry;
-    WGPUBindGroup bind_group = wgpuDeviceCreateBindGroup(r->device, &bg_desc);
-
-    WGPURenderPassDepthStencilAttachment ds_attachment =
-        WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
-    ds_attachment.view = surface->view;
-    ds_attachment.depthLoadOp = WGPULoadOp_Load;
-    ds_attachment.depthStoreOp = WGPUStoreOp_Store;
-    ds_attachment.stencilLoadOp = WGPULoadOp_Load;
-    ds_attachment.stencilStoreOp = WGPUStoreOp_Store;
-    WGPURenderPassDescriptor pass_desc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
-    pass_desc.label = pgraph_wgpu_str("Depth upload");
-    pass_desc.depthStencilAttachment = &ds_attachment;
-
-    WGPUCommandEncoder encoder = pgraph_wgpu_ensure_encoder(pg);
-    WGPURenderPassEncoder pass =
-        wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
-    wgpuRenderPassEncoderSetPipeline(pass, r->depth_upload_pipeline);
-    wgpuRenderPassEncoderSetBindGroup(pass, 0, bind_group, 0, NULL);
-    wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
-    wgpuRenderPassEncoderEnd(pass);
-    wgpuRenderPassEncoderRelease(pass);
-
-    nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_2);
-    pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_SURFACE_CREATE, false);
-
-    wgpuBindGroupRelease(bind_group);
-    wgpuTextureViewRelease(staging_view);
-    wgpuTextureRelease(staging);
-}
-
 void pgraph_wgpu_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
                                      bool force)
 {
@@ -807,16 +617,16 @@ void pgraph_wgpu_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
         buf = swizzle_buf;
     }
 
-    if (surface->host_fmt.depth) {
-        upload_depth_stencil(pg, surface, buf);
+    if (surface->host_fmt.depth ||
+        surface->host_fmt.conversion != WGPU_SURFACE_CONV_NONE) {
+        pgraph_wgpu_unpack_converted_surface(pg, surface, buf, pitch);
     } else {
-        uint32_t row_size =
-            surface->width * surface->host_fmt.host_bytes_per_pixel;
+        uint32_t row_size = surface->width * surface->fmt.bytes_per_pixel;
         size_t size = (size_t)row_size * surface->height;
         g_autofree uint8_t *host_buf = g_malloc(size);
         for (unsigned int y = 0; y < surface->height; y++) {
-            convert_row_to_host(surface, host_buf + (size_t)y * row_size,
-                                buf + (size_t)y * pitch);
+            memcpy(host_buf + (size_t)y * row_size, buf + (size_t)y * pitch,
+                   row_size);
         }
         write_texture(r, surface->texture, WGPUTextureAspect_All, host_buf,
                       size, row_size, surface->width, surface->height);
@@ -1268,6 +1078,7 @@ void pgraph_wgpu_init_surfaces(PGRAPHState *pg)
     r->framebuffer_dirty = true;
 
     create_depth_upload_pipeline(r);
+    pgraph_wgpu_init_surface_compute(r);
 }
 
 void pgraph_wgpu_finalize_surfaces(PGRAPHState *pg)
@@ -1288,6 +1099,7 @@ void pgraph_wgpu_finalize_surfaces(PGRAPHState *pg)
         wgpuShaderModuleRelease(r->depth_upload_module);
         r->depth_upload_module = NULL;
     }
+    pgraph_wgpu_finalize_surface_compute(r);
     if (r->readback_buffer) {
         wgpuBufferRelease(r->readback_buffer);
         r->readback_buffer = NULL;
