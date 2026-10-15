@@ -12,7 +12,6 @@
 #include "qemu/osdep.h"
 #include "qemu/fast-hash.h"
 #include "qemu/mstring.h"
-#include "hw/xbox/nv2a/pgraph/glsl/spirv.h"
 #include "hw/xbox/nv2a/pgraph/wgsl/gen.h"
 #include "hw/xbox/nv2a/pgraph/wgsl/translate.h"
 #include "renderer.h"
@@ -143,54 +142,29 @@ static void pack_uniforms(uint8_t *out, const UniformInfo *info, int count,
     }
 }
 
-static WGPUShaderModule create_spirv_module(PGRAPHWgpuState *r,
-                                            glslang_stage_t stage,
-                                            const char *label, MString *glsl)
-{
-    GByteArray *spirv = pgraph_glsl_compile_to_spirv(
-        PGRAPH_GLSL_TARGET_WEBGPU, stage, mstring_get_str(glsl), false);
-    WGPUShaderModule module = NULL;
-
-    if (spirv) {
-        module = pgraph_wgpu_create_spirv_module(
-            r, label, (const uint32_t *)spirv->data, spirv->len / 4);
-        g_byte_array_unref(spirv);
-    }
-    if (!module) {
-        fprintf(stderr, "[WebGPU] GLSL source:\n%s\n", mstring_get_str(glsl));
-    }
-    return module;
-}
-
-/* Prefer WGSL. The GLSL text is still produced first and remains the oracle;
- * if translation or Tint rejects it, the SPIR-V module is the fallback. */
+/* GLSL is still generated first and is the source of the shading rules.
+ * The module Dawn receives is WGSL. */
 static WGPUShaderModule create_draw_module(PGRAPHWgpuState *r,
-                                           glslang_stage_t stage,
                                            const char *label, MString *glsl,
-                                           bool vertex, bool *used_wgsl)
+                                           bool vertex)
 {
-    *used_wgsl = false;
-    if (getenv("XEMU_WGSL") && !strcmp(getenv("XEMU_WGSL"), "0")) {
-        return create_spirv_module(r, stage, label, glsl);
-    }
     g_autoptr(MString) wgsl =
         pgraph_wgsl_translate(mstring_get_str(glsl), vertex);
-    if (wgsl && getenv("XEMU_WGSL_DUMP")) {
+    if (!wgsl) {
+        fprintf(stderr, "[WebGPU] %s has no WGSL module\n", label);
+        return NULL;
+    }
+    if (getenv("XEMU_WGSL_DUMP")) {
         fprintf(stderr, "[WebGPU] WGSL %s:\n%s\n", label,
                 mstring_get_str(wgsl));
     }
-    if (wgsl) {
-        WGPUShaderModule module =
-            pgraph_wgpu_create_wgsl_module(r, label, mstring_get_str(wgsl));
-        if (module) {
-            *used_wgsl = true;
-            return module;
-        }
+    WGPUShaderModule module =
+        pgraph_wgpu_create_wgsl_module(r, label, mstring_get_str(wgsl));
+    if (!module) {
         fprintf(stderr, "[WebGPU] WGSL source for %s:\n%s\n", label,
                 mstring_get_str(wgsl));
     }
-    fprintf(stderr, "[WebGPU] %s is using the SPIR-V fallback\n", label);
-    return create_spirv_module(r, stage, label, glsl);
+    return module;
 }
 
 static WgpuTextureLayout *
@@ -280,8 +254,7 @@ static ShaderBinding *create_shader_binding(PGRAPHWgpuState *r,
                        WGPUPrimitiveTopology_PointList,
     };
     MString *vsh_code = pgraph_glsl_gen_vsh(&state->vsh, vsh_opts);
-    b->vsh = create_draw_module(r, GLSLANG_STAGE_VERTEX, "PGRAPH vertex",
-                                vsh_code, true, &b->vsh_wgsl);
+    b->vsh = create_draw_module(r, "PGRAPH vertex", vsh_code, true);
     mstring_unref(vsh_code);
 
     GenPshGlslOptions psh_opts = {
@@ -290,8 +263,7 @@ static ShaderBinding *create_shader_binding(PGRAPHWgpuState *r,
         .tex_binding = PSH_TEX_BINDING,
     };
     MString *psh_code = pgraph_glsl_gen_psh(&state->psh, psh_opts);
-    b->psh = create_draw_module(r, GLSLANG_STAGE_FRAGMENT, "PGRAPH fragment",
-                                psh_code, false, &b->psh_wgsl);
+    b->psh = create_draw_module(r, "PGRAPH fragment", psh_code, false);
     mstring_unref(psh_code);
 
     b->valid = b->vsh && b->psh;
@@ -299,9 +271,9 @@ static ShaderBinding *create_shader_binding(PGRAPHWgpuState *r,
     uint32_t vsh_skip =
         state->vsh.uniform_attrs ? 0 : (1 << VshUniform_inlineValue);
     b->vsh_ubo_size = layout_std140(VshUniformInfo, VshUniform__COUNT, vsh_skip,
-                                    b->vsh_members, b->vsh_wgsl);
+                                    b->vsh_members, true);
     b->psh_ubo_size = layout_std140(PshUniformInfo, PshUniform__COUNT, 0,
-                                    b->psh_members, b->psh_wgsl);
+                                    b->psh_members, true);
     for (int i = 0; i < VshUniform__COUNT; i++) {
         b->vsh_locs[i] = b->vsh_members[i].offset < 0 ? -1 : i;
     }
@@ -438,33 +410,9 @@ void pgraph_wgpu_update_uniforms(PGRAPHState *pg, bool *vsh_changed,
                                  NV2A_PROF_SHADER_UBO_NOTDIRTY);
 }
 
-static bool check_spirv_support(PGRAPHWgpuState *r)
-{
-    MString *glsl = mstring_from_str("#version 450\n"
-                                     "void main() {\n"
-                                     "  gl_Position = vec4(0.0);\n"
-                                     "}\n");
-    WGPUShaderModule module =
-        create_spirv_module(r, GLSLANG_STAGE_VERTEX, "SPIR-V probe", glsl);
-    mstring_unref(glsl);
-    if (!module) {
-        return false;
-    }
-    wgpuShaderModuleRelease(module);
-    return true;
-}
-
 void pgraph_wgpu_init_shaders(PGRAPHState *pg)
 {
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
-
-    pgraph_glsl_init_spirv_compiler();
-
-    if (!check_spirv_support(r)) {
-        fprintf(stderr,
-                "[WebGPU] Dawn cannot ingest SPIR-V. Build Dawn with "
-                "TINT_BUILD_SPV_READER=ON (see scripts/build-dawn.py).\n");
-    }
 
     r->shader_cache = g_hash_table_new_full(
         shader_state_hash, shader_state_equal, NULL, free_shader_binding);
@@ -535,6 +483,4 @@ void pgraph_wgpu_finalize_shaders(PGRAPHState *pg)
     r->vsh_uniform_data = NULL;
     g_free(r->psh_uniform_data);
     r->psh_uniform_data = NULL;
-
-    pgraph_glsl_finalize_spirv_compiler();
 }

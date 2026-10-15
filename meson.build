@@ -2425,7 +2425,7 @@ elif not get_option('webgpu').disabled()
   endif
 endif
 
-if vulkan.found() or (webgpu.found() and host_os != 'emscripten')
+if vulkan.found()
   libglslang = dependency('glslang', version: '>=15.0.0', required: false)
   if not libglslang.found()
     # FIXME: Get spirv-tools to enable opt.
