@@ -202,6 +202,13 @@ typedef struct WgpuDisplayState {
 #endif
 } WgpuDisplayState;
 
+typedef struct QueryReport {
+    QSIMPLEQ_ENTRY(QueryReport) entry;
+    bool clear;
+    uint32_t parameter;
+    unsigned int query_count;
+} QueryReport;
+
 typedef struct PGRAPHWgpuState {
     WGPUInstance instance;
     WGPUAdapter adapter;
@@ -221,6 +228,23 @@ typedef struct PGRAPHWgpuState {
     QemuEvent downloads_complete;
     bool download_dirty_surfaces_pending;
     QemuEvent dirty_surfaces_download_complete;
+
+    /* Occlusion queries. WebGPU begins and ends a query inside one render
+     * pass, so a Vulkan query that spans several passes becomes several
+     * queries here. Their sample counts are summed. */
+    WGPUQuerySet query_set;
+    WGPUBuffer query_resolve;
+    WGPUBuffer query_readback;
+    QSIMPLEQ_HEAD(, QueryReport) report_queue;
+    unsigned int num_queries_in_flight;
+    unsigned int max_queries_in_flight;
+    bool new_query_needed;
+    bool query_in_flight;
+    bool resolve_queries;
+    bool occlusion_collect_pending;
+    bool occlusion_readback_pending;
+    uint64_t occlusion_readback_bytes;
+    uint32_t zpass_pixel_count_result;
 
     WGPUBuffer readback_buffer;
     uint64_t readback_buffer_size;
@@ -371,6 +395,25 @@ void pgraph_wgpu_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
 void pgraph_wgpu_surface_update(NV2AState *d, bool upload, bool color_write,
                                 bool zeta_write);
 void pgraph_wgpu_set_surface_dirty(PGRAPHState *pg, bool color, bool zeta);
+void pgraph_wgpu_set_surface_scale_factor(NV2AState *d, unsigned int scale);
+unsigned int pgraph_wgpu_get_surface_scale_factor(NV2AState *d);
+void pgraph_wgpu_reload_surface_scale_factor(PGRAPHState *pg);
+
+// reports.c
+void pgraph_wgpu_init_reports(PGRAPHState *pg);
+void pgraph_wgpu_finalize_reports(PGRAPHState *pg);
+void pgraph_wgpu_clear_report_value(NV2AState *d);
+void pgraph_wgpu_get_report(NV2AState *d, uint32_t parameter);
+void pgraph_wgpu_process_pending_reports(NV2AState *d);
+/* Finish an open query before ending the pass that owns it. */
+void pgraph_wgpu_end_occlusion_query(PGRAPHWgpuState *r);
+/* Make room for another query before this draw allocates vertex data. */
+void pgraph_wgpu_reserve_occlusion_query(PGRAPHState *pg);
+/* Begin the query for draws about to be recorded in the open pass. */
+void pgraph_wgpu_prepare_occlusion_query(PGRAPHState *pg);
+/* Record resolve + copy when reports or a full query set must be read. */
+void pgraph_wgpu_occlusion_before_submit(PGRAPHState *pg);
+void pgraph_wgpu_occlusion_after_submit(PGRAPHState *pg);
 
 // surface-compute.c
 void pgraph_wgpu_init_surface_compute(PGRAPHWgpuState *r);

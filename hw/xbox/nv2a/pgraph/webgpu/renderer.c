@@ -75,9 +75,7 @@ static void pgraph_wgpu_init(NV2AState *d, Error **errp)
         return;
     }
 
-    /* Resolution scaling is not supported yet. */
-    pg->surface_scale_factor = 1;
-
+    pgraph_wgpu_init_reports(pg);
     pgraph_wgpu_init_buffers(pg);
     pgraph_wgpu_init_textures(pg);
     pgraph_wgpu_init_shaders(pg);
@@ -99,23 +97,15 @@ static void pgraph_wgpu_finalize(NV2AState *d)
     pgraph_wgpu_finalize_textures(pg);
     pgraph_wgpu_finalize_surfaces(pg);
     pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_FLUSH, true);
+    pgraph_wgpu_finalize_reports(pg);
     pgraph_wgpu_finalize_buffers(pg);
     pgraph_wgpu_finalize_instance(pg);
     g_clear_pointer(&pg->wgpu_renderer_state, g_free);
 }
 
-static void pgraph_wgpu_clear_report_value(NV2AState *d)
-{
-}
-
 static void pgraph_wgpu_flip_stall(NV2AState *d)
 {
     pgraph_wgpu_finish(&d->pgraph, WGPU_FINISH_REASON_FLIP_STALL, true);
-}
-
-static void pgraph_wgpu_get_report(NV2AState *d, uint32_t parameter)
-{
-    pgraph_write_zpass_pixel_cnt_report(d, parameter, 0);
 }
 
 static void pgraph_wgpu_pre_savevm_trigger(NV2AState *d)
@@ -138,20 +128,6 @@ static void pgraph_wgpu_pre_shutdown_trigger(NV2AState *d)
 
 static void pgraph_wgpu_pre_shutdown_wait(NV2AState *d)
 {
-}
-
-static void pgraph_wgpu_process_pending_reports(NV2AState *d)
-{
-}
-
-static void pgraph_wgpu_set_surface_scale_factor(NV2AState *d,
-                                                 unsigned int scale)
-{
-}
-
-static unsigned int pgraph_wgpu_get_surface_scale_factor(NV2AState *d)
-{
-    return 1;
 }
 
 static int pgraph_wgpu_get_framebuffer_surface(NV2AState *d)

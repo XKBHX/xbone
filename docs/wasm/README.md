@@ -42,10 +42,10 @@ What exists:
   cache, clears, image blits, the draw path, textures, primitive assembly
   (polygon modes and the flat-shading provoking vertex), point size and
   point sprites, surface pack and unpack, copies of a render target into
-  a texture, and the PCRTC/PVIDEO display composite. The composite is read
-  back and uploaded to a GL texture for the existing UI. It still compiles
-  draw shaders through SPIR-V, so it can't draw under Emscripten until the
-  WGSL generator exists.
+  a texture, the PCRTC/PVIDEO display composite, ZPASS occlusion queries,
+  and the surface scale factor. The composite is read back and uploaded to
+  a GL texture for the existing UI. It still compiles draw shaders through
+  SPIR-V, so it can't draw under Emscripten until the WGSL generator exists.
 
 What blocks an xemu WASM build today:
 

@@ -42,6 +42,9 @@ WGPUCommandEncoder pgraph_wgpu_ensure_encoder(PGRAPHState *pg)
 void pgraph_wgpu_end_render_pass(PGRAPHWgpuState *r)
 {
     if (r->render_pass) {
+        /* The draw pass owns the occlusion query. Ending the pass with a
+         * query still open is a validation error. */
+        pgraph_wgpu_end_occlusion_query(r);
         wgpuRenderPassEncoderEnd(r->render_pass);
         wgpuRenderPassEncoderRelease(r->render_pass);
         r->render_pass = NULL;
@@ -73,11 +76,13 @@ void pgraph_wgpu_finish(PGRAPHState *pg, WgpuFinishReason why, bool wait)
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
 
     pgraph_wgpu_flush_streams(r);
+    pgraph_wgpu_end_render_pass(r);
+    /* Resolve while the ended queries are still in this encoder, or open a
+     * new one for queries submitted earlier. */
+    pgraph_wgpu_occlusion_before_submit(pg);
 
     if (r->encoder) {
         nv2a_profile_inc_counter(finish_reason_to_counter_enum[why]);
-
-        pgraph_wgpu_end_render_pass(r);
 
         WGPUCommandBuffer commands = wgpuCommandEncoderFinish(r->encoder, NULL);
         wgpuCommandEncoderRelease(r->encoder);
@@ -92,6 +97,8 @@ void pgraph_wgpu_finish(PGRAPHState *pg, WgpuFinishReason why, bool wait)
     if (wait) {
         pgraph_wgpu_wait_idle(r);
     }
+
+    pgraph_wgpu_occlusion_after_submit(pg);
 }
 
 typedef struct MapState {
