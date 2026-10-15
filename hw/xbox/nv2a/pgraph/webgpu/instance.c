@@ -12,6 +12,104 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "renderer.h"
+#include "ui/xemu-settings.h"
+
+#ifndef __EMSCRIPTEN__
+struct WgpuBlobCache {
+    char *dir;
+    GMutex mutex;
+};
+
+static char *blob_cache_path(WgpuBlobCache *cache, const uint8_t *key,
+                             size_t key_size)
+{
+    gchar *sum = g_compute_checksum_for_data(G_CHECKSUM_SHA256, key, key_size);
+    char *path = g_build_filename(cache->dir, sum, NULL);
+
+    g_free(sum);
+    return path;
+}
+
+/* Dawn calls these from the pipeline compiler thread. A zero valueSize asks
+ * for the stored size; a later call copies that many bytes. */
+static size_t blob_cache_load(size_t key_size, const uint8_t *key,
+                              size_t value_size, uint8_t *value,
+                              void *userdata1, void *userdata2)
+{
+    WgpuBlobCache *cache = userdata1;
+    size_t stored = 0;
+
+    if (!cache->dir || !key_size) {
+        return 0;
+    }
+
+    g_mutex_lock(&cache->mutex);
+    g_autofree char *path = blob_cache_path(cache, key, key_size);
+    if (!value_size) {
+        GStatBuf st;
+
+        if (g_stat(path, &st) == 0 && st.st_size > 0) {
+            stored = st.st_size;
+        }
+    } else {
+        g_autofree char *data = NULL;
+        gsize len = 0;
+
+        if (g_file_get_contents(path, &data, &len, NULL) && len == value_size &&
+            value) {
+            memcpy(value, data, value_size);
+            stored = value_size;
+        }
+    }
+    g_mutex_unlock(&cache->mutex);
+    return stored;
+}
+
+static void blob_cache_store(size_t key_size, const uint8_t *key,
+                             size_t value_size, const uint8_t *value,
+                             void *userdata1, void *userdata2)
+{
+    WgpuBlobCache *cache = userdata1;
+
+    if (!cache->dir || !key_size || !value_size || !value) {
+        return;
+    }
+
+    g_mutex_lock(&cache->mutex);
+    g_autofree char *path = blob_cache_path(cache, key, key_size);
+    if (!g_file_set_contents(path, (const char *)value, value_size, NULL)) {
+        fprintf(stderr, "[WebGPU] Failed to store pipeline cache entry\n");
+    }
+    g_mutex_unlock(&cache->mutex);
+}
+
+static WgpuBlobCache *blob_cache_new(void)
+{
+    const char *base = xemu_settings_get_base_path();
+    WgpuBlobCache *cache = g_new0(WgpuBlobCache, 1);
+
+    cache->dir = g_build_filename(base, "webgpu-pipeline-cache", NULL);
+    g_mutex_init(&cache->mutex);
+    if (g_mkdir_with_parents(cache->dir, 0700) != 0) {
+        fprintf(stderr, "[WebGPU] Pipeline cache disabled (%s)\n", cache->dir);
+        g_free(cache->dir);
+        cache->dir = NULL;
+    } else {
+        fprintf(stderr, "[WebGPU] Pipeline cache: %s\n", cache->dir);
+    }
+    return cache;
+}
+
+static void blob_cache_free(WgpuBlobCache *cache)
+{
+    if (!cache) {
+        return;
+    }
+    g_mutex_clear(&cache->mutex);
+    g_free(cache->dir);
+    g_free(cache);
+}
+#endif
 
 typedef struct RequestAdapterState {
     WGPURequestAdapterStatus status;
@@ -140,6 +238,19 @@ static WGPUDevice request_device(PGRAPHWgpuState *r, Error **errp)
     descriptor.uncapturedErrorCallbackInfo.callback = uncaptured_error_callback;
     descriptor.deviceLostCallbackInfo.mode = WGPUCallbackMode_AllowSpontaneous;
     descriptor.deviceLostCallbackInfo.callback = device_lost_callback;
+
+#ifndef __EMSCRIPTEN__
+    WGPUDawnCacheDeviceDescriptor cache =
+        WGPU_DAWN_CACHE_DEVICE_DESCRIPTOR_INIT;
+    if (r->blob_cache && r->blob_cache->dir) {
+        cache.isolationKey = pgraph_wgpu_str("xemu-nv2a");
+        cache.dawnLoadCacheDataCallbackInfo.callback = blob_cache_load;
+        cache.dawnLoadCacheDataCallbackInfo.userdata1 = r->blob_cache;
+        cache.dawnStoreCacheDataCallbackInfo.callback = blob_cache_store;
+        cache.dawnStoreCacheDataCallbackInfo.userdata1 = r->blob_cache;
+        descriptor.nextInChain = &cache.chain;
+    }
+#endif
 
     callback.mode = WGPUCallbackMode_WaitAnyOnly;
     callback.callback = request_device_callback;
@@ -274,6 +385,9 @@ bool pgraph_wgpu_init_instance(PGRAPHState *pg, Error **errp)
     }
     log_adapter(r->adapter);
 
+#ifndef __EMSCRIPTEN__
+    r->blob_cache = blob_cache_new();
+#endif
     r->device = request_device(r, errp);
     if (*errp) {
         return false;
@@ -303,4 +417,8 @@ void pgraph_wgpu_finalize_instance(PGRAPHState *pg)
     if (r->instance) {
         wgpuInstanceRelease(r->instance);
     }
+#ifndef __EMSCRIPTEN__
+    blob_cache_free(r->blob_cache);
+    r->blob_cache = NULL;
+#endif
 }

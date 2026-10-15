@@ -358,7 +358,15 @@ static void init_pipeline_key(PGRAPHState *pg, WGPUPrimitiveTopology topology,
     key->topology = topology;
     memcpy(&key->vertex_layout, &r->vertex_layout, sizeof(r->vertex_layout));
     for (int i = 0; i < ARRAY_SIZE(pipeline_regs); i++) {
-        key->regs[i] = pgraph_reg_r(pg, pipeline_regs[i]);
+        uint32_t value = pgraph_reg_r(pg, pipeline_regs[i]);
+
+        /* Blend color and the stencil reference are dynamic state. */
+        if (pipeline_regs[i] == NV_PGRAPH_BLENDCOLOR) {
+            value = 0;
+        } else if (pipeline_regs[i] == NV_PGRAPH_CONTROL_1) {
+            value &= ~NV_PGRAPH_CONTROL_1_STENCIL_REF;
+        }
+        key->regs[i] = value;
     }
 }
 
@@ -548,8 +556,10 @@ static WGPURenderPipeline get_draw_pipeline(PGRAPHState *pg,
     }
 
     pipeline = create_draw_pipeline(pg, &key);
-    g_hash_table_insert(r->pipeline_cache, g_memdup2(&key, sizeof(key)),
-                        pipeline);
+    if (pipeline) {
+        g_hash_table_insert(r->pipeline_cache, g_memdup2(&key, sizeof(key)),
+                            pipeline);
+    }
     return pipeline;
 }
 
@@ -850,6 +860,12 @@ void pgraph_wgpu_flush_draw(NV2AState *d)
         return;
     }
 
+    WGPURenderPipeline pipeline = get_draw_pipeline(pg, topology);
+    if (!pipeline) {
+        fprintf(stderr, "[WebGPU] Draw pipeline was not created\n");
+        return;
+    }
+
     size_t max_indices = 0;
     if (expand && pg->draw_arrays_length) {
         for (int i = 0; i < pg->draw_arrays_length; i++) {
@@ -897,8 +913,6 @@ void pgraph_wgpu_flush_draw(NV2AState *d)
                                max_indices * sizeof(uint32_t));
     pgraph_wgpu_stream_reserve(pg, WGPU_STREAM_UNIFORM,
                                2 * (r->uniform_binding_size + 256));
-
-    WGPURenderPipeline pipeline = get_draw_pipeline(pg, topology);
 
     upload_uniforms(pg);
 

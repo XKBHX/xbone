@@ -176,7 +176,7 @@ Each phase ends with a demonstrable exit criterion.
 | 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 originally needed a Dawn built with the SPIR-V reader. Phase 3 step 3 removed that requirement. |
 | 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite, read back into a GL texture for the existing UI. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
 | 3. WGSL generator | Steps 1–3 are done. Step 1 translates draw shaders from the WebGPU-targeted GLSL. Step 2 did not need new shaders: the pack and unpack kernels and the display composite were already WGSL in phase 2. Step 3 creates every shader module with `WGPUShaderSourceWGSL`. The WebGPU backend no longer links glslang and does not request `ShaderSourceSPIRV`. glslang remains for Vulkan. A translation or Tint failure skips that draw. |
-| 4. Performance | Not started. |
+| 4. Performance | Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline, so compilation does not drop geometry. Blend color and the stencil reference stay dynamic and are not part of the pipeline key. Steps 2–5 are not started. Frame times have not been compared with Vulkan. |
 | 5. WebGPU UI and browser | Not started. |
 
 Phase 0 notes:
@@ -827,8 +827,9 @@ parity.
 
 ### Phase 4: performance and native display fast path (medium)
 
-1. Asynchronous pipeline creation, with a placeholder or skipped draw while a
-   pipeline compiles. Dawn's blob cache gives a persistent pipeline cache.
+1. Persistent pipeline cache through Dawn's blob cache. The draw waits for
+   that pipeline. Blend color and the stencil reference stay dynamic, so a
+   change there does not compile another pipeline.
 2. Fewer stalls: deferred and coalesced downloads, and readbacks only when
    `DIRTY_MEMORY_NV2A` or a semaphore actually requires them.
 3. Bind group caching keyed by texture and sampler set. Coarser
@@ -840,6 +841,26 @@ parity.
    display texture with Dawn `SharedTextureMemory` (dmabuf / opaque FD, D3D
    shared handle, IOSurface) and import it into GL with the same
    `glImportMemory*EXT` calls `vk/display.c` uses.
+
+Phase 4 notes (step 1, pipeline cache):
+
+- Draw pipelines are created with `wgpuDeviceCreateRenderPipeline` before
+  the draw is recorded. Skipping a draw while a pipeline compiled dropped
+  boot-animation geometry, because a fade changes `NV_PGRAPH_BLENDCOLOR`
+  on draws that are not repeated. That path was removed.
+- `NV_PGRAPH_BLENDCOLOR` and `NV_PGRAPH_CONTROL_1_STENCIL_REF` are applied
+  with `wgpuRenderPassEncoderSetBlendConstant` and
+  `wgpuRenderPassEncoderSetStencilReference`. They are cleared in the
+  pipeline key so a fade or a new stencil reference reuses the pipeline.
+- The device descriptor chains `WGPUDawnCacheDeviceDescriptor`. Load and
+  store callbacks keep one file per key under
+  `<xemu base path>/webgpu-pipeline-cache`, named by the SHA-256 of Dawn's
+  key. Dawn may call them from a compiler thread, so the file access is
+  locked, and a store uses `g_file_set_contents` so a partial file cannot
+  fail Dawn's blob hash check. The browser build has no Dawn blob cache.
+  The in-memory map remains the `PipelineKey` hash table.
+- On macOS arm64, a boot of nxdk_pgraph_tests wrote the cache (102 files
+  on that run) and a second boot loaded it with no Dawn hash failure.
 
 **Exit**: frame times within about 20% of Vulkan on the same machine for the
 curated titles.
