@@ -783,6 +783,27 @@ static void apply_border_adjustment(const struct PixelShader *ps, MString *vars,
         var_name, var_name, i, ps->state->border_inv_real_size[i][0], ps->state->border_inv_real_size[i][1], ps->state->border_inv_real_size[i][2]);
 }
 
+/* WebGPU only: mixes the border color into t<tex_index> for BORDER
+ * addressing. uvw is the normalized texture coordinate. Textures with a
+ * border source of TEXTURE sample their own border texels instead. */
+static void apply_border_color(const struct PixelShader *ps, MString *vars,
+                               int tex_index, const char *uvw)
+{
+    int i = tex_index;
+    if (ps->opts.target != PGRAPH_GLSL_TARGET_WEBGPU ||
+        ps->state->border_logical_size[i][0] != 0.0f ||
+        ps->state->tex_x8y24[i]) {
+        return;
+    }
+
+    bool is_3d = ps->state->dim_tex[i] == 3;
+    mstring_append_fmt(
+        vars,
+        "t%d = applyBorder(t%d, %s, vec3(textureSize(texSamp%d, 0)%s),\n"
+        "                  texBorderMode[%d]%s, texBorderColor[%d]);\n",
+        i, i, uvw, i, is_3d ? "" : ", 1.0", i, is_3d ? "" : " & 3u", i);
+}
+
 static void apply_convolution_filter(const struct PixelShader *ps, MString *vars, int tex)
 {
     assert(ps->state->dim_tex[tex] == 2);
@@ -837,6 +858,10 @@ static MString* psh_convert(struct PixelShader *ps)
     for (int i = 0; i < ARRAY_SIZE(PshUniformInfo); i++) {
         const UniformInfo *info = &PshUniformInfo[i];
         const char *type_str = uniform_element_type_to_str[info->type];
+        if ((i == PshUniform_texBorderColor || i == PshUniform_texBorderMode) &&
+            ps->opts.target != PGRAPH_GLSL_TARGET_WEBGPU) {
+            continue;
+        }
         if (info->count == 1) {
             mstring_append_fmt(preflight, "%s%s %s;\n", u, type_str,
                                info->name);
@@ -982,6 +1007,32 @@ static MString* psh_convert(struct PixelShader *ps)
         "    return normalize(vec3(1.0, st.y, -st.x));"
         "}\n"
         );
+
+    if (ps->opts.target == PGRAPH_GLSL_TARGET_WEBGPU) {
+        /* WebGPU has no clamp-to-border, so the texture is sampled clamped
+         * to edge and mixed with the border color by the part of the filter
+         * footprint that falls outside. Mode bits 0-2 select the axes, bit 3
+         * means a linear filter. */
+        // clang-format off
+        mstring_append(preflight,
+            "vec4 applyBorder(vec4 texel, vec3 uvw, vec3 size, uint mode,\n"
+            "                 vec4 color) {\n"
+            "    if ((mode & 7u) == 0u) {\n"
+            "        return texel;\n"
+            "    }\n"
+            "    vec3 inside;\n"
+            "    if ((mode & 8u) != 0u) {\n"
+            "        inside = clamp(uvw * size + 0.5, 0.0, 1.0) *\n"
+            "                 clamp((1.0 - uvw) * size + 0.5, 0.0, 1.0);\n"
+            "    } else {\n"
+            "        inside = step(0.0, uvw) * (1.0 - step(1.0, uvw));\n"
+            "    }\n"
+            "    vec3 axes = vec3(uvec3(mode, mode >> 1, mode >> 2) & 1u);\n"
+            "    vec3 c = mix(vec3(1.0), inside, axes);\n"
+            "    return mix(color, texel, c.x * c.y * c.z);\n"
+            "}\n");
+        // clang-format on
+    }
 
     MString *clip = mstring_new();
     bool webgpu = ps->opts.target == PGRAPH_GLSL_TARGET_WEBGPU;
@@ -1173,10 +1224,17 @@ static MString* psh_convert(struct PixelShader *ps)
                                 vars,
                                 "vec4 t%d = textureProj(texSamp%d, %s(pT%d.xyw));\n",
                                 i, i, tex_remap, i);
+                            g_autofree gchar *uvw = g_strdup_printf(
+                                "vec3(%s(pT%d.xyw).xy / pT%d.w, 0.0)",
+                                tex_remap, i, i);
+                            apply_border_color(ps, vars, i, uvw);
                         }
                     } else if (ps->state->dim_tex[i] == 3) {
                         mstring_append_fmt(vars, "vec4 t%d = textureProj(texSamp%d, vec4(pT%d.xy, 0.0, pT%d.w));\n",
                                            i, i, i, i);
+                        g_autofree gchar *uvw = g_strdup_printf(
+                            "vec3(pT%d.xy / pT%d.w, 0.0)", i, i);
+                        apply_border_color(ps, vars, i, uvw);
                     } else {
                         fprintf(stderr, "Unhandled texture dimensions in PROJECT2D: stage=%d dim_tex=%d cubemap=%d rect=%d\n",
                                 i, ps->state->dim_tex[i], ps->state->tex_cubemap[i], ps->state->rect_tex[i]);
@@ -1193,6 +1251,9 @@ static MString* psh_convert(struct PixelShader *ps)
                 apply_border_adjustment(ps, vars, i, "pT%d");
                 mstring_append_fmt(vars, "vec4 t%d = textureProj(texSamp%d, %s(pT%d.xyzw));\n",
                                    i, i, tex_remap, i);
+                g_autofree gchar *uvw = g_strdup_printf(
+                    "(%s(pT%d.xyzw).xyz / pT%d.w)", tex_remap, i, i);
+                apply_border_color(ps, vars, i, uvw);
             }
             break;
         case PS_TEXTUREMODES_CUBEMAP:
