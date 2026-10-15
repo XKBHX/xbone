@@ -92,6 +92,7 @@ void pgraph_glsl_set_psh_state(PGRAPHState *pg, PshState *state);
     DECL(S, surfaceScale, ivec2, 1)  \
     DECL(S, texBorderColor, vec4, 4) \
     DECL(S, texBorderMode, uint, 4)  \
+    DECL(S, texLodBias, float, 4)    \
     DECL(S, texScale, float, 4)
 
 DECL_UNIFORM_TYPES(PshUniform, PSH_UNIFORM_DECL_X)

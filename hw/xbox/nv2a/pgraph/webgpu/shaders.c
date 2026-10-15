@@ -333,6 +333,9 @@ void pgraph_wgpu_update_uniforms(PGRAPHState *pg, bool *vsh_changed,
             pgraph_reg_r(pg, NV_PGRAPH_BORDERCOLOR0 + i * 4),
             psh_values.texBorderColor[i]);
         psh_values.texBorderMode[i] = get_texture_border_mode(pg, i);
+        psh_values.texLodBias[i] = pgraph_convert_lod_bias_to_float(
+            GET_MASK(pgraph_reg_r(pg, NV_PGRAPH_TEXFILTER0 + i * 4),
+                     NV_PGRAPH_TEXFILTER0_MIPMAP_LOD_BIAS));
     }
     memset(r->psh_uniform_data, 0, b->psh_ubo_size);
     pack_uniforms(r->psh_uniform_data, PshUniformInfo, PshUniform__COUNT,
