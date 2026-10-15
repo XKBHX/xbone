@@ -209,11 +209,14 @@ typedef struct QueryReport {
     unsigned int query_count;
 } QueryReport;
 
+typedef struct WgpuBlobCache WgpuBlobCache;
+
 typedef struct PGRAPHWgpuState {
     WGPUInstance instance;
     WGPUAdapter adapter;
     WGPUDevice device;
     WGPUQueue queue;
+    WgpuBlobCache *blob_cache;
 
     WGPUCommandEncoder encoder;
     unsigned int encoder_start_time;

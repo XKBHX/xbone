@@ -48,7 +48,10 @@ What exists:
   shaders are translated from the GLSL generator. Pack, unpack, clears,
   depth upload, and the display composite are written in WGSL. The WebGPU
   backend does not link glslang. A shader the translator or Tint rejects
-  is not drawn.
+  is not drawn. Dawn's compiled pipelines are stored in
+  `webgpu-pipeline-cache` under the xemu base path. A draw waits for its
+  pipeline. Blend color and the stencil reference are dynamic state, so
+  they do not create another pipeline.
 
 What blocks an xemu WASM build today:
 
