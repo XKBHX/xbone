@@ -378,8 +378,13 @@ static WGPURenderPipeline create_draw_pipeline(PGRAPHState *pg,
         attributes[i].offset = vl->attributes[i].offset;
         attributes[i].shaderLocation = vl->attributes[i].location;
     }
+    /* WebGPU points are one pixel, so every point is drawn as an instance
+     * of a quad that the vertex shader expands */
+    bool point_quads = key->topology == WGPUPrimitiveTopology_PointList;
+
     WGPUVertexBufferLayout vertex_buffer = WGPU_VERTEX_BUFFER_LAYOUT_INIT;
-    vertex_buffer.stepMode = WGPUVertexStepMode_Vertex;
+    vertex_buffer.stepMode =
+        point_quads ? WGPUVertexStepMode_Instance : WGPUVertexStepMode_Vertex;
     vertex_buffer.arrayStride = vl->stride;
     vertex_buffer.attributeCount = vl->num_attributes;
     vertex_buffer.attributes = attributes;
@@ -392,12 +397,13 @@ static WGPURenderPipeline create_draw_pipeline(PGRAPHState *pg,
     desc.vertex.buffers = &vertex_buffer;
 
     uint32_t setupraster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
-    desc.primitive.topology = key->topology;
+    desc.primitive.topology =
+        point_quads ? WGPUPrimitiveTopology_TriangleStrip : key->topology;
     desc.primitive.frontFace = (setupraster & NV_PGRAPH_SETUPRASTER_FRONTFACE) ?
                                    WGPUFrontFace_CCW :
                                    WGPUFrontFace_CW;
     desc.primitive.cullMode = WGPUCullMode_None;
-    if (setupraster & NV_PGRAPH_SETUPRASTER_CULLENABLE) {
+    if (!point_quads && (setupraster & NV_PGRAPH_SETUPRASTER_CULLENABLE)) {
         uint32_t cull_face =
             GET_MASK(setupraster, NV_PGRAPH_SETUPRASTER_CULLCTRL);
         assert(cull_face < ARRAY_SIZE(pgraph_cull_face_wgpu_map));
@@ -829,12 +835,7 @@ void pgraph_wgpu_flush_draw(NV2AState *d)
     if (geom->polygon_front_mode != geom->polygon_back_mode) {
         NV2A_UNIMPLEMENTED("Different front and back polygon modes");
     }
-    WgpuPrimState prim = {
-        .primitive_mode = geom->primitive_mode,
-        .polygon_mode = geom->polygon_front_mode,
-        .flat = !geom->smooth_shading,
-        .first_vertex_is_provoking = geom->first_vertex_is_provoking,
-    };
+    WgpuPrimState prim = pgraph_wgpu_get_prim_state(geom);
     bool expand;
     WGPUPrimitiveTopology topology = pgraph_wgpu_prim_topology(&prim, &expand);
     if (culls_all_triangles(pg, topology)) {
@@ -854,7 +855,35 @@ void pgraph_wgpu_flush_draw(NV2AState *d)
         max_indices = num_elements;
     }
 
-    size_t vertex_size = (size_t)num_vertices * r->vertex_layout.stride;
+    /* Point quads read their vertex as instance data, which can't be
+     * indexed, so an indexed point list packs its vertices in draw order */
+    bool points = topology == WGPUPrimitiveTopology_PointList;
+    g_autofree uint32_t *point_list = NULL;
+    size_t num_points = 0;
+    if (points && max_indices) {
+        point_list = g_new(uint32_t, max_indices);
+        if (expand && pg->draw_arrays_length) {
+            for (int i = 0; i < pg->draw_arrays_length; i++) {
+                num_points += pgraph_wgpu_prim_expand(
+                    &prim, NULL, pg->draw_arrays_start[i],
+                    pg->draw_arrays_count[i], point_list + num_points);
+            }
+        } else if (expand) {
+            num_points = pgraph_wgpu_prim_expand(
+                &prim, elements, first, elements ? num_elements : num_vertices,
+                point_list);
+        } else {
+            memcpy(point_list, elements, num_elements * sizeof(uint32_t));
+            num_points = num_elements;
+        }
+        if (!num_points) {
+            return;
+        }
+        max_indices = 0;
+    }
+
+    size_t vertex_size = (size_t)(point_list ? num_points : num_vertices) *
+                         r->vertex_layout.stride;
     pgraph_wgpu_stream_reserve(pg, WGPU_STREAM_VERTEX, vertex_size);
     pgraph_wgpu_stream_reserve(pg, WGPU_STREAM_INDEX,
                                max_indices * sizeof(uint32_t));
@@ -870,7 +899,15 @@ void pgraph_wgpu_flush_draw(NV2AState *d)
         void *ptr;
         vertex_offset = pgraph_wgpu_stream_alloc(r, WGPU_STREAM_VERTEX,
                                                  vertex_size, 4, &ptr);
-        pgraph_wgpu_pack_vertices(r, ptr, first, num_vertices);
+        if (point_list) {
+            for (size_t i = 0; i < num_points; i++) {
+                pgraph_wgpu_pack_vertices(
+                    r, (uint8_t *)ptr + i * r->vertex_layout.stride,
+                    point_list[i], 1);
+            }
+        } else {
+            pgraph_wgpu_pack_vertices(r, ptr, first, num_vertices);
+        }
     }
     if (pg->inline_buffer_length) {
         for (int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
@@ -904,7 +941,18 @@ void pgraph_wgpu_flush_draw(NV2AState *d)
     set_draw_state(pg, pipeline, vertex_offset, vertex_size);
 
     WGPURenderPassEncoder pass = r->render_pass;
-    if (max_indices) {
+    if (points) {
+        if (point_list) {
+            wgpuRenderPassEncoderDraw(pass, 4, num_points, 0, 0);
+        } else if (pg->draw_arrays_length) {
+            for (int i = 0; i < pg->draw_arrays_length; i++) {
+                wgpuRenderPassEncoderDraw(pass, 4, pg->draw_arrays_count[i], 0,
+                                          pg->draw_arrays_start[i] - first);
+            }
+        } else {
+            wgpuRenderPassEncoderDraw(pass, 4, num_vertices, 0, 0);
+        }
+    } else if (max_indices) {
         if (!num_indices) {
             return;
         }
@@ -925,4 +973,14 @@ void pgraph_wgpu_flush_draw(NV2AState *d)
     } else {
         wgpuRenderPassEncoderDraw(pass, num_vertices, 1, 0, 0);
     }
+}
+
+WgpuPrimState pgraph_wgpu_get_prim_state(const GeomState *geom)
+{
+    return (WgpuPrimState){
+        .primitive_mode = geom->primitive_mode,
+        .polygon_mode = geom->polygon_front_mode,
+        .flat = !geom->smooth_shading,
+        .first_vertex_is_provoking = geom->first_vertex_is_provoking,
+    };
 }

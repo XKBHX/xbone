@@ -187,9 +187,13 @@ static ShaderBinding *create_shader_binding(PGRAPHWgpuState *r,
 
     nv2a_profile_inc_counter(NV2A_PROF_SHADER_GEN);
 
+    WgpuPrimState prim = pgraph_wgpu_get_prim_state(&state->geom);
+    bool expand;
     GenVshGlslOptions vsh_opts = {
         .target = PGRAPH_GLSL_TARGET_WEBGPU,
         .ubo_binding = VSH_UBO_BINDING,
+        .point_quads = pgraph_wgpu_prim_topology(&prim, &expand) ==
+                       WGPUPrimitiveTopology_PointList,
     };
     MString *vsh_code = pgraph_glsl_gen_vsh(&state->vsh, vsh_opts);
     b->vsh = create_module(r, GLSLANG_STAGE_VERTEX, "PGRAPH vertex", vsh_code);

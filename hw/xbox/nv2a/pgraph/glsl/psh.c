@@ -1116,9 +1116,11 @@ static MString* psh_convert(struct PixelShader *ps)
     mstring_append(vars, "vec4 pT0 = vtxT0;\n");
     mstring_append(vars, "vec4 pT1 = vtxT1;\n");
     mstring_append(vars, "vec4 pT2 = vtxT2;\n");
-    if (ps->state->point_sprite && !webgpu) {
+    if (ps->state->point_sprite) {
         assert(!ps->state->rect_tex[3]);
-        mstring_append(vars, "vec4 pT3 = vec4(gl_PointCoord, 1.0, 1.0);\n");
+        mstring_append(vars, webgpu ?
+                                 "vec4 pT3 = vtxPtCoord;\n" :
+                                 "vec4 pT3 = vec4(gl_PointCoord, 1.0, 1.0);\n");
     } else {
         mstring_append(vars, "vec4 pT3 = vtxT3;\n");
     }
