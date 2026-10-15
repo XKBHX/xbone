@@ -8,6 +8,7 @@ if webgpu.found()
     'instance.c',
     'prim.c',
     'renderer.c',
+    'reports.c',
     'shaders.c',
     'surface.c',
     'surface-compute.c',

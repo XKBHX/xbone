@@ -174,7 +174,7 @@ Each phase ends with a demonstrable exit criterion.
 | --- | --- |
 | 0. Groundwork | Done. Natively on macOS arm64 (Dawn Metal backend, Apple M1 Pro), `display.renderer = "WEBGPU"` creates a device and boots with a black screen and no asserts. Not yet run on Linux or Windows. |
 | 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 needs a Dawn built with the SPIR-V reader (see the step 4 notes). |
-| 2. Feature completeness | Steps 1–6 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite, read back into a GL texture for the existing UI. The NV09F image blit was already in phase 1. Step 7 has not started. |
+| 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite, read back into a GL texture for the existing UI. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
 | 3. WGSL generator | Not started. |
 | 4. Performance | Not started. |
 | 5. WebGPU UI and browser | Not started. |
@@ -635,7 +635,57 @@ Phase 2 notes (step 6, display composite):
 - The GL texture name belongs to the UI context. Shutdown retires it and the
   next present on that context deletes it.
 - Checked by compiling the display shader with Tint and the renderer against
-  the SPIR-V Dawn SDK. Not yet compared on screen with Vulkan.
+  the SPIR-V Dawn SDK. The native check build has no Vulkan renderer, so
+  `renderer = 'VULKAN'` falls back to OpenGL. On the ZPass frames below the
+  framebuffer is upright and the rectangles, line, and point match that
+  OpenGL picture. The filtered PVIDEO cases did not appear before the test
+  XBE rebooted, so the overlay itself was not compared.
+
+Phase 2 notes (step 7, reports and surface scale):
+
+- `reports.c` follows `vk/reports.c`. `GET_REPORT` and `CLEAR_REPORT_VALUE`
+  queue a watermark of how many occlusion queries have been started.
+  `ZPASS_PIXEL_CNT` is the only report type. The count is divided by
+  `surface_scale_factor` squared, as in Vulkan.
+- WebGPU occlusion queries begin and end inside one render pass, and the
+  pass must name the query set. Ending the pass ends the query. The next
+  counted draw starts another, and the sample counts are added together, so
+  a Vulkan query that stayed open across several passes has the same total.
+  Clears and draws with ZPASS disabled close the query without counting.
+- Results are resolved when a report is queued or the 1024-query set is
+  full, then read back with `wgpuBufferMapAsync`. Vulkan reads its query
+  pool from `finish` as well. `BACK_END_WRITE_SEMAPHORE_RELEASE` calls
+  `surface_update`, which downloads dirty surfaces before the CPU stores
+  the semaphore. With TCG that download waits for a later guest read, as in
+  Vulkan. `pre_savevm_*` was already the Vulkan sequence: download every
+  dirty surface, then wait. `pre_shutdown_*` stays empty, as in Vulkan.
+- The WebGPU spec only requires an occlusion query to tell zero from
+  non-zero. Dawn's Metal backend records
+  `MTLVisibilityResultModeBoolean`, so a passing query comes back as 1.
+  That value is stored as returned. Dividing it by the scale factor
+  squared is wrong when the scale is greater than 1.
+- The scale factor comes from `display.quality.surface_scale`. Changing it
+  downloads dirty surfaces at the old factor, then flushes and reloads, as
+  in Vulkan. Surfaces, viewports, scissors, the display target, and
+  surface-to-texture copies were already multiplied by the factor. The pack
+  and unpack kernels already scale. Direct copies (`A8R8G8B8`, `X8R8G8B8`,
+  `B8`, `G8B8`) now take the top-left texel of each block on the way down
+  and repeat it on the way up, which is what those kernels do. WebGPU lines
+  stay one pixel wide, so a scaled frame's lines are thinner than Vulkan's.
+- Compared on screen with OpenGL, because this native check build does not
+  register Vulkan and a `VULKAN` config switches to OpenGL. nxdk_pgraph_tests
+  release `v2026-10-10_21-27-19`, scale 1, macOS arm64 (M1 Pro). Semaphores
+  `0xABC` and `0xCBA` pass on both. The pictures match: the same rectangles
+  on `ZPass`, the same one-pixel line on `ZPassLineWidth-0x0001` and
+  `0x0008`, and the same point on `ZPassPointSize-0x0008` and `0x0040`.
+  OpenGL reports `40960` and `49152` for the two `ZPass` queries, `16448`
+  for both line widths and for point size `0x0040`, and `16385` for point
+  size `0x0008`, and those tests pass. WebGPU reports `1` for each of those
+  except the second `ZPass` query, which is `0`, and those tests fail.
+  There were no WebGPU validation errors. `surface_scale` 2 and a save
+  state round trip were not run. The suite then failed to load
+  `e:/nxdk_pgraph_tests/nxdk_pgraph_tests_config.json` and rebooted, so the
+  PVIDEO cases in the same disc config were not shown.
 
 ### Phase 0: groundwork and refactors (small, landable on its own)
 

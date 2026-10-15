@@ -16,8 +16,8 @@
 /*
  * WebGPU cannot render to packed 16-bit colour, or copy a depth aspect
  * to or from a buffer as Z16/Z24S8. These kernels convert on the GPU.
- * width_in/width_out carry the same nearest scale as vk/surface-compute.c
- * (scale is 1 until the surface scale factor is implemented). Swizzle
+ * width_in/width_out carry the same nearest scale as vk/surface-compute.c.
+ * Swizzle
  * stays on the CPU, as it does in Vulkan.
  *
  * Z24 packing matches vk/surface-compute.c for D32_SFLOAT_S8 and the

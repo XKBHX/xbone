@@ -16,10 +16,102 @@
 #include "qemu/osdep.h"
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "hw/xbox/nv2a/pgraph/swizzle.h"
+#include "ui/xemu-settings.h"
 #include "renderer.h"
 
 static const int num_invalid_surfaces_to_keep = 10;
 static const int max_surface_frame_time_delta = 5;
+
+void pgraph_wgpu_set_surface_scale_factor(NV2AState *d, unsigned int scale)
+{
+    g_config.display.quality.surface_scale = scale < 1 ? 1 : scale;
+
+    qemu_mutex_lock(&d->pfifo.lock);
+    qatomic_set(&d->pfifo.halt, true);
+    qemu_mutex_unlock(&d->pfifo.lock);
+
+    /* Download at the old factor, then flush reloads the new one. */
+    qemu_mutex_lock(&d->pgraph.lock);
+    qemu_event_reset(
+        &d->pgraph.wgpu_renderer_state->dirty_surfaces_download_complete);
+    qatomic_set(&d->pgraph.wgpu_renderer_state->download_dirty_surfaces_pending,
+                true);
+    qemu_mutex_unlock(&d->pgraph.lock);
+    qemu_mutex_lock(&d->pfifo.lock);
+    pfifo_kick(d);
+    qemu_mutex_unlock(&d->pfifo.lock);
+    qemu_event_wait(
+        &d->pgraph.wgpu_renderer_state->dirty_surfaces_download_complete);
+
+    qemu_mutex_lock(&d->pgraph.lock);
+    qemu_event_reset(&d->pgraph.flush_complete);
+    qatomic_set(&d->pgraph.flush_pending, true);
+    qemu_mutex_unlock(&d->pgraph.lock);
+    qemu_mutex_lock(&d->pfifo.lock);
+    pfifo_kick(d);
+    qemu_mutex_unlock(&d->pfifo.lock);
+    qemu_event_wait(&d->pgraph.flush_complete);
+
+    qemu_mutex_lock(&d->pfifo.lock);
+    qatomic_set(&d->pfifo.halt, false);
+    pfifo_kick(d);
+    qemu_mutex_unlock(&d->pfifo.lock);
+}
+
+unsigned int pgraph_wgpu_get_surface_scale_factor(NV2AState *d)
+{
+    return d->pgraph.surface_scale_factor;
+}
+
+void pgraph_wgpu_reload_surface_scale_factor(PGRAPHState *pg)
+{
+    int factor = g_config.display.quality.surface_scale;
+    pg->surface_scale_factor = MAX(factor, 1);
+}
+
+/* Nearest sample of the top-left texel in each scale x scale block. That is
+ * what the pack kernels do. A pixel-center blit is implementation-defined
+ * when the sample lands on a texel edge. */
+static void downsample_nearest(uint8_t *dst, unsigned int dst_pitch,
+                               const uint8_t *src, uint32_t src_stride,
+                               unsigned int width, unsigned int height,
+                               unsigned int scale, unsigned int bpp)
+{
+    if (scale <= 1) {
+        for (unsigned int y = 0; y < height; y++) {
+            memcpy(dst + (size_t)y * dst_pitch, src + (uint64_t)y * src_stride,
+                   (size_t)width * bpp);
+        }
+        return;
+    }
+
+    for (unsigned int y = 0; y < height; y++) {
+        const uint8_t *src_row = src + (uint64_t)(y * scale) * src_stride;
+        uint8_t *dst_row = dst + (size_t)y * dst_pitch;
+        for (unsigned int x = 0; x < width; x++) {
+            memcpy(dst_row + (size_t)x * bpp,
+                   src_row + (size_t)(x * scale) * bpp, bpp);
+        }
+    }
+}
+
+static void upsample_nearest(uint8_t *dst, uint32_t dst_stride,
+                             const uint8_t *src, unsigned int src_pitch,
+                             unsigned int width, unsigned int height,
+                             unsigned int scale, unsigned int bpp)
+{
+    unsigned int scaled_h = height * scale;
+
+    for (unsigned int y = 0; y < scaled_h; y++) {
+        const uint8_t *src_row = src + (size_t)(y / scale) * src_pitch;
+        uint8_t *dst_row = dst + (uint64_t)y * dst_stride;
+        unsigned int scaled_w = width * scale;
+        for (unsigned int x = 0; x < scaled_w; x++) {
+            memcpy(dst_row + (size_t)x * bpp,
+                   src_row + (size_t)(x / scale) * bpp, bpp);
+        }
+    }
+}
 
 static const char depth_upload_wgsl[] =
     "@group(0) @binding(0) var depth_tex: texture_2d<f32>;\n"
@@ -98,7 +190,8 @@ static void ensure_readback_buffer(PGRAPHWgpuState *r, uint64_t size)
 static void copy_aspect_to_buffer(WGPUCommandEncoder encoder,
                                   SurfaceBinding *surface,
                                   WGPUTextureAspect aspect, WGPUBuffer buffer,
-                                  uint64_t offset, uint32_t bytes_per_row)
+                                  uint64_t offset, uint32_t bytes_per_row,
+                                  unsigned int width, unsigned int height)
 {
     WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
     src.texture = surface->texture;
@@ -108,9 +201,9 @@ static void copy_aspect_to_buffer(WGPUCommandEncoder encoder,
     dst.buffer = buffer;
     dst.layout.offset = offset;
     dst.layout.bytesPerRow = bytes_per_row;
-    dst.layout.rowsPerImage = surface->height;
+    dst.layout.rowsPerImage = height;
 
-    WGPUExtent3D extent = { surface->width, surface->height, 1 };
+    WGPUExtent3D extent = { width, height, 1 };
     wgpuCommandEncoderCopyTextureToBuffer(encoder, &src, &dst, &extent);
 }
 
@@ -151,14 +244,17 @@ static void download_surface_to_buffer(NV2AState *d, SurfaceBinding *surface,
         return;
     }
 
+    unsigned int scale = pg->surface_scale_factor;
+    unsigned int scaled_w = surface->width * scale;
+    unsigned int scaled_h = surface->height * scale;
     uint32_t main_bpp = surface->host_fmt.host_bytes_per_pixel;
-    uint32_t main_row = ROUND_UP(surface->width * main_bpp, 256);
-    uint64_t total_size = (uint64_t)main_row * surface->height;
+    uint32_t main_row = ROUND_UP(scaled_w * main_bpp, 256);
+    uint64_t total_size = (uint64_t)main_row * scaled_h;
     ensure_readback_buffer(r, total_size);
 
     WGPUCommandEncoder encoder = pgraph_wgpu_ensure_encoder(pg);
     copy_aspect_to_buffer(encoder, surface, WGPUTextureAspect_All,
-                          r->readback_buffer, 0, main_row);
+                          r->readback_buffer, 0, main_row, scaled_w, scaled_h);
     nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_1);
     pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_SURFACE_DOWN, false);
 
@@ -176,10 +272,8 @@ static void download_surface_to_buffer(NV2AState *d, SurfaceBinding *surface,
         out = swizzle_buf;
     }
 
-    for (unsigned int y = 0; y < surface->height; y++) {
-        memcpy(out + (size_t)y * out_pitch, mapped + (uint64_t)y * main_row,
-               (size_t)surface->width * main_bpp);
-    }
+    downsample_nearest(out, out_pitch, mapped, main_row, surface->width,
+                       surface->height, scale, main_bpp);
 
     wgpuBufferUnmap(r->readback_buffer);
     if (surface->swizzle) {
@@ -621,15 +715,29 @@ void pgraph_wgpu_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
         surface->host_fmt.conversion != WGPU_SURFACE_CONV_NONE) {
         pgraph_wgpu_unpack_converted_surface(pg, surface, buf, pitch);
     } else {
-        uint32_t row_size = surface->width * surface->fmt.bytes_per_pixel;
-        size_t size = (size_t)row_size * surface->height;
-        g_autofree uint8_t *host_buf = g_malloc(size);
-        for (unsigned int y = 0; y < surface->height; y++) {
-            memcpy(host_buf + (size_t)y * row_size, buf + (size_t)y * pitch,
-                   row_size);
+        unsigned int scale = pg->surface_scale_factor;
+        unsigned int bpp = surface->fmt.bytes_per_pixel;
+        if (scale <= 1) {
+            uint32_t row_size = surface->width * bpp;
+            size_t size = (size_t)row_size * surface->height;
+            g_autofree uint8_t *host_buf = g_malloc(size);
+            for (unsigned int y = 0; y < surface->height; y++) {
+                memcpy(host_buf + (size_t)y * row_size, buf + (size_t)y * pitch,
+                       row_size);
+            }
+            write_texture(r, surface->texture, WGPUTextureAspect_All, host_buf,
+                          size, row_size, surface->width, surface->height);
+        } else {
+            unsigned int scaled_w = surface->width * scale;
+            unsigned int scaled_h = surface->height * scale;
+            uint32_t row_size = ROUND_UP(scaled_w * bpp, 256);
+            size_t size = (size_t)row_size * scaled_h;
+            g_autofree uint8_t *host_buf = g_malloc(size);
+            upsample_nearest(host_buf, row_size, buf, pitch, surface->width,
+                             surface->height, scale, bpp);
+            write_texture(r, surface->texture, WGPUTextureAspect_All, host_buf,
+                          size, row_size, scaled_w, scaled_h);
         }
-        write_texture(r, surface->texture, WGPUTextureAspect_All, host_buf,
-                      size, row_size, surface->width, surface->height);
     }
 
     surface->initialized = true;
@@ -1079,6 +1187,7 @@ void pgraph_wgpu_init_surfaces(PGRAPHState *pg)
 
     create_depth_upload_pipeline(r);
     pgraph_wgpu_init_surface_compute(r);
+    pgraph_wgpu_reload_surface_scale_factor(pg);
 }
 
 void pgraph_wgpu_finalize_surfaces(PGRAPHState *pg)
@@ -1127,4 +1236,5 @@ void pgraph_wgpu_surface_flush(NV2AState *d)
         invalidate_surface(d, s);
     }
     prune_invalid_surfaces(r, 0);
+    pgraph_wgpu_reload_surface_scale_factor(pg);
 }

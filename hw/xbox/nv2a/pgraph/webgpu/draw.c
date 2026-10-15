@@ -613,6 +613,8 @@ static void ensure_draw_render_pass(PGRAPHState *pg)
         desc.depthStencilAttachment = &ds_attachment;
     }
 
+    desc.occlusionQuerySet = r->query_set;
+
     WGPUCommandEncoder encoder = pgraph_wgpu_ensure_encoder(pg);
     r->render_pass = wgpuCommandEncoderBeginRenderPass(encoder, &desc);
     r->framebuffer_dirty = false;
@@ -757,6 +759,10 @@ void pgraph_wgpu_flush_draw(NV2AState *d)
     if (!(r->color_binding || r->zeta_binding)) {
         return;
     }
+
+    /* Before this draw's vertex data is packed. Finishing afterwards would
+     * submit that data and then let the next upload overwrite it. */
+    pgraph_wgpu_reserve_occlusion_query(pg);
 
     /* Vertices [first, first + num_vertices) are packed for the draw */
     unsigned int first = 0, num_vertices = 0;
@@ -940,6 +946,11 @@ void pgraph_wgpu_flush_draw(NV2AState *d)
     ensure_draw_render_pass(pg);
     set_draw_state(pg, pipeline, vertex_offset, vertex_size);
 
+    if (max_indices && !num_indices) {
+        return;
+    }
+    pgraph_wgpu_prepare_occlusion_query(pg);
+
     WGPURenderPassEncoder pass = r->render_pass;
     if (points) {
         if (point_list) {
@@ -953,9 +964,6 @@ void pgraph_wgpu_flush_draw(NV2AState *d)
             wgpuRenderPassEncoderDraw(pass, 4, num_vertices, 0, 0);
         }
     } else if (max_indices) {
-        if (!num_indices) {
-            return;
-        }
         wgpuRenderPassEncoderSetIndexBuffer(
             pass, r->stream_buffers[WGPU_STREAM_INDEX].buffer,
             WGPUIndexFormat_Uint32, index_offset,
