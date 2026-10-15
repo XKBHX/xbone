@@ -196,6 +196,17 @@ typedef struct PGRAPHWgpuState {
     WGPUBindGroupLayout depth_upload_bind_group_layout;
     WGPURenderPipeline depth_upload_pipeline;
 
+    /* Pack/unpack kernels for 16-bit colour and depth surfaces. */
+    WGPUShaderModule surface_compute_modules[8];
+    WGPUBindGroupLayout surface_compute_layouts[8];
+    WGPUPipelineLayout surface_compute_pipeline_layouts[8];
+    WGPUComputePipeline surface_compute_pipelines[8];
+    WGPUBuffer surface_compute_uniform;
+    WGPUBuffer surface_compute_storage[3];
+    uint64_t surface_compute_storage_size[3];
+    WGPUBuffer surface_compute_readback;
+    uint64_t surface_compute_readback_size;
+
     bool depth_clip_control;
     bool float32_filterable;
 
@@ -322,6 +333,18 @@ void pgraph_wgpu_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
 void pgraph_wgpu_surface_update(NV2AState *d, bool upload, bool color_write,
                                 bool zeta_write);
 void pgraph_wgpu_set_surface_dirty(PGRAPHState *pg, bool color, bool zeta);
+
+// surface-compute.c
+void pgraph_wgpu_init_surface_compute(PGRAPHWgpuState *r);
+void pgraph_wgpu_finalize_surface_compute(PGRAPHWgpuState *r);
+/* Guest-layout rows, `pitch` bytes apart. Swizzle stays with the caller. */
+void pgraph_wgpu_pack_converted_surface(PGRAPHState *pg,
+                                        SurfaceBinding *surface, uint8_t *dst,
+                                        unsigned int pitch);
+void pgraph_wgpu_unpack_converted_surface(PGRAPHState *pg,
+                                          SurfaceBinding *surface,
+                                          const uint8_t *src,
+                                          unsigned int pitch);
 
 // draw.c
 void pgraph_wgpu_init_pipelines(PGRAPHState *pg);

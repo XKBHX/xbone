@@ -9,6 +9,7 @@ if webgpu.found()
     'renderer.c',
     'shaders.c',
     'surface.c',
+    'surface-compute.c',
     'texture.c',
     'vertex.c',
   )])

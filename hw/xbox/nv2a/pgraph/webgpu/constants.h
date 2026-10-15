@@ -44,7 +44,7 @@ static const BasicSurfaceFormatInfo kelvin_surface_color_format_map[] = {
 };
 
 /* WebGPU cannot render to packed 16-bit formats, so those surfaces live in
- * rgba8unorm and are converted on the CPU during upload and download.
+ * rgba8unorm and are packed and unpacked by the compute kernels.
  */
 static const WgpuSurfaceFormatInfo kelvin_surface_color_format_wgpu_map[] = {
     [NV097_SET_SURFACE_FORMAT_COLOR_LE_X1R5G5B5_Z1R5G5B5] = {
