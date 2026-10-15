@@ -745,10 +745,25 @@ static void psh_append_shadowmap(const struct PixelShader *ps, int i, bool compa
 
     bool extract_msb_24b = ps->state->tex_x8y24[i] && psh_uses_spirv(ps);
 
-    mstring_append_fmt(
-        vars, "%svec4 t%d_depth%s = textureProj(texSamp%d, %s(pT%d.xyw)%s);\n",
-        extract_msb_24b ? "u" : "", i, extract_msb_24b ? "_raw" : "", i,
-        tex_remap, i, get_lod_bias_arg(ps, i));
+    if (extract_msb_24b && ps->opts.target == PGRAPH_GLSL_TARGET_WEBGPU) {
+        /* WGSL can't sample integer textures, so fetch the texel that a
+         * nearest-filtered, clamp-to-edge sample would return. */
+        mstring_append_fmt(
+            vars,
+            "vec3 t%d_coord = %s(pT%d.xyw);\n"
+            "ivec2 t%d_size = textureSize(texSamp%d, 0);\n"
+            "ivec2 t%d_texel = ivec2(floor(t%d_coord.xy / t%d_coord.z *\n"
+            "                              vec2(t%d_size)));\n"
+            "uvec4 t%d_depth_raw = texelFetch(texSamp%d,\n"
+            "    clamp(t%d_texel, ivec2(0), t%d_size - 1), 0);\n",
+            i, tex_remap, i, i, i, i, i, i, i, i, i, i, i);
+    } else {
+        mstring_append_fmt(
+            vars,
+            "%svec4 t%d_depth%s = textureProj(texSamp%d, %s(pT%d.xyw)%s);\n",
+            extract_msb_24b ? "u" : "", i, extract_msb_24b ? "_raw" : "", i,
+            tex_remap, i, get_lod_bias_arg(ps, i));
+    }
 
     if (extract_msb_24b) {
         mstring_append_fmt(vars,
