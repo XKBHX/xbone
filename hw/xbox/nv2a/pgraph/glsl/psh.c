@@ -708,6 +708,24 @@ static const char *shadow_comparison_map[] = {
     [SHADOW_DEPTH_FUNC_GEQUAL] = ">=",
 };
 
+
+/* WebGPU samplers have no LOD bias, so the WebGPU target passes it to every
+ * implicit-LOD sample instead. WGSL only allows a bias on float textures. */
+static const char *get_lod_bias_arg(const struct PixelShader *ps, int tex_index)
+{
+    static const char *args[NV2A_MAX_TEXTURES] = {
+        ", texLodBias[0]",
+        ", texLodBias[1]",
+        ", texLodBias[2]",
+        ", texLodBias[3]",
+    };
+
+    if (ps->opts.target != PGRAPH_GLSL_TARGET_WEBGPU ||
+        ps->state->tex_x8y24[tex_index]) {
+        return "";
+    }
+    return args[tex_index];
+}
 static void psh_append_shadowmap(const struct PixelShader *ps, int i, bool compare_z, MString *vars)
 {
     if (ps->state->shadow_depth_func == SHADOW_DEPTH_FUNC_NEVER) {
@@ -728,9 +746,9 @@ static void psh_append_shadowmap(const struct PixelShader *ps, int i, bool compa
     bool extract_msb_24b = ps->state->tex_x8y24[i] && psh_uses_spirv(ps);
 
     mstring_append_fmt(
-        vars, "%svec4 t%d_depth%s = textureProj(texSamp%d, %s(pT%d.xyw));\n",
+        vars, "%svec4 t%d_depth%s = textureProj(texSamp%d, %s(pT%d.xyw)%s);\n",
         extract_msb_24b ? "u" : "", i, extract_msb_24b ? "_raw" : "", i,
-        tex_remap, i);
+        tex_remap, i, get_lod_bias_arg(ps, i));
 
     if (extract_msb_24b) {
         mstring_append_fmt(vars,
@@ -813,12 +831,15 @@ static void apply_convolution_filter(const struct PixelShader *ps, MString *vars
     const char *tex_remap = ps->state->rect_tex[tex] ? normalize_tex_coords : "";
 
     mstring_append_fmt(vars,
-        "vec4 t%d = vec4(0.0);\n"
-        "for (int i = 0; i < 9; i++) {\n"
-        "    vec3 texCoordDelta = vec3(convolution3x3[i], 0);\n"
-        "    texCoordDelta.xy /= textureSize(texSamp%d, 0);\n"
-        "    t%d += textureProj(texSamp%d, %s(pT%d.xyw) + texCoordDelta) * gaussian3x3[i];\n"
-        "}\n", tex, tex, tex, tex, tex_remap, tex);
+                       "vec4 t%d = vec4(0.0);\n"
+                       "for (int i = 0; i < 9; i++) {\n"
+                       "    vec3 texCoordDelta = vec3(convolution3x3[i], 0);\n"
+                       "    texCoordDelta.xy /= textureSize(texSamp%d, 0);\n"
+                       "    t%d += textureProj(texSamp%d, %s(pT%d.xyw) + "
+                       "texCoordDelta%s) * gaussian3x3[i];\n"
+                       "}\n",
+                       tex, tex, tex, tex, tex_remap, tex,
+                       get_lod_bias_arg(ps, tex));
 }
 
 static void define_colorkey_comparator(MString *preflight)
@@ -858,7 +879,8 @@ static MString* psh_convert(struct PixelShader *ps)
     for (int i = 0; i < ARRAY_SIZE(PshUniformInfo); i++) {
         const UniformInfo *info = &PshUniformInfo[i];
         const char *type_str = uniform_element_type_to_str[info->type];
-        if ((i == PshUniform_texBorderColor || i == PshUniform_texBorderMode) &&
+        if ((i == PshUniform_texBorderColor || i == PshUniform_texBorderMode ||
+             i == PshUniform_texLodBias) &&
             ps->opts.target != PGRAPH_GLSL_TARGET_WEBGPU) {
             continue;
         }
@@ -1189,6 +1211,7 @@ static MString* psh_convert(struct PixelShader *ps)
     for (int i = 0; i < 4; i++) {
 
         const char *sampler_type = get_sampler_type(ps, ps->tex_modes[i], i);
+        const char *bias = get_lod_bias_arg(ps, i);
 
         g_autofree gchar *normalize_tex_coords = g_strdup_printf("norm%d", i);
         const char *tex_remap = ps->state->rect_tex[i] ? normalize_tex_coords : "";
@@ -1217,21 +1240,25 @@ static MString* psh_convert(struct PixelShader *ps)
                         if (ps->state->tex_cubemap[i]) {
                             mstring_append_fmt(
                                 vars,
-                                "vec4 t%d = texture(texSamp%d, remap2DToCube(%s(pT%d.xyw)));\n",
-                                i, i, tex_remap, i);
+                                "vec4 t%d = texture(texSamp%d, "
+                                "remap2DToCube(%s(pT%d.xyw))%s);\n",
+                                i, i, tex_remap, i, bias);
                         } else {
                             mstring_append_fmt(
                                 vars,
-                                "vec4 t%d = textureProj(texSamp%d, %s(pT%d.xyw));\n",
-                                i, i, tex_remap, i);
+                                "vec4 t%d = textureProj(texSamp%d, "
+                                "%s(pT%d.xyw)%s);\n",
+                                i, i, tex_remap, i, bias);
                             g_autofree gchar *uvw = g_strdup_printf(
                                 "vec3(%s(pT%d.xyw).xy / pT%d.w, 0.0)",
                                 tex_remap, i, i);
                             apply_border_color(ps, vars, i, uvw);
                         }
                     } else if (ps->state->dim_tex[i] == 3) {
-                        mstring_append_fmt(vars, "vec4 t%d = textureProj(texSamp%d, vec4(pT%d.xy, 0.0, pT%d.w));\n",
-                                           i, i, i, i);
+                        mstring_append_fmt(vars,
+                                           "vec4 t%d = textureProj(texSamp%d, "
+                                           "vec4(pT%d.xy, 0.0, pT%d.w)%s);\n",
+                                           i, i, i, i, bias);
                         g_autofree gchar *uvw = g_strdup_printf(
                             "vec3(pT%d.xy / pT%d.w, 0.0)", i, i);
                         apply_border_color(ps, vars, i, uvw);
@@ -1249,8 +1276,10 @@ static MString* psh_convert(struct PixelShader *ps)
                 psh_append_shadowmap(ps, i, true, vars);
             } else {
                 apply_border_adjustment(ps, vars, i, "pT%d");
-                mstring_append_fmt(vars, "vec4 t%d = textureProj(texSamp%d, %s(pT%d.xyzw));\n",
-                                   i, i, tex_remap, i);
+                mstring_append_fmt(
+                    vars,
+                    "vec4 t%d = textureProj(texSamp%d, %s(pT%d.xyzw)%s);\n", i,
+                    i, tex_remap, i, bias);
                 g_autofree gchar *uvw = g_strdup_printf(
                     "(%s(pT%d.xyzw).xyz / pT%d.w)", tex_remap, i, i);
                 apply_border_color(ps, vars, i, uvw);
@@ -1262,9 +1291,9 @@ static MString* psh_convert(struct PixelShader *ps)
                     "pT%d.xy = remapCubeTo2D(pT%d.xyz);\n",
                     i, i);
             }
-            mstring_append_fmt(vars,
-                "vec4 t%d = texture(texSamp%d, pT%d.xy%s);\n",
-                i, i, i, ps->state->tex_cubemap[i] ? "z" : "");
+            mstring_append_fmt(
+                vars, "vec4 t%d = texture(texSamp%d, pT%d.xy%s%s);\n", i, i, i,
+                ps->state->tex_cubemap[i] ? "z" : "", bias);
             break;
         case PS_TEXTUREMODES_PASSTHRU:
             assert(ps->state->border_logical_size[i][0] == 0.0f && "Unexpected border texture on passthru");
@@ -1297,12 +1326,16 @@ static MString* psh_convert(struct PixelShader *ps)
             mstring_append_fmt(vars, "dsdt%d = bumpMat[%d] * dsdt%d;\n", i, i, i);
 
             if (ps->state->dim_tex[i] == 2) {
-                mstring_append_fmt(vars, "vec4 t%d = texture(texSamp%d, %s(pT%d.xy + dsdt%d));\n",
-                    i, i, tex_remap, i, i);
+                mstring_append_fmt(
+                    vars,
+                    "vec4 t%d = texture(texSamp%d, %s(pT%d.xy + dsdt%d)%s);\n",
+                    i, i, tex_remap, i, i, bias);
             } else if (ps->state->dim_tex[i] == 3) {
                 // FIXME: Does hardware pass through the r/z coordinate or is it 0?
-                mstring_append_fmt(vars, "vec4 t%d = texture(texSamp%d, vec3(pT%d.xy + dsdt%d, pT%d.z));\n",
-                    i, i, i, i, i);
+                mstring_append_fmt(vars,
+                                   "vec4 t%d = texture(texSamp%d, vec3(pT%d.xy "
+                                   "+ dsdt%d, pT%d.z)%s);\n",
+                                   i, i, i, i, i, bias);
             } else {
                 fprintf(stderr,"Unhandled texture dimensions in BUMPENVMAP: stage=%d dim_tex=%d\n",
                         i, ps->state->dim_tex[i]);
@@ -1326,12 +1359,16 @@ static MString* psh_convert(struct PixelShader *ps)
                                i, i, i);
 
             if (ps->state->dim_tex[i] == 2) {
-                mstring_append_fmt(vars, "vec4 t%d = texture(texSamp%d, %s(pT%d.xy + dsdtl%d.st));\n",
-                    i, i, tex_remap, i, i);
+                mstring_append_fmt(vars,
+                                   "vec4 t%d = texture(texSamp%d, %s(pT%d.xy + "
+                                   "dsdtl%d.st)%s);\n",
+                                   i, i, tex_remap, i, i, bias);
             } else if (ps->state->dim_tex[i] == 3) {
                 // FIXME: Does hardware pass through the r/z coordinate or is it 0?
-                mstring_append_fmt(vars, "vec4 t%d = texture(texSamp%d, vec3(pT%d.xy + dsdtl%d.st, pT%d.z));\n",
-                    i, i, i, i, i);
+                mstring_append_fmt(vars,
+                                   "vec4 t%d = texture(texSamp%d, vec3(pT%d.xy "
+                                   "+ dsdtl%d.st, pT%d.z)%s);\n",
+                                   i, i, i, i, i, bias);
             } else {
                 fprintf(stderr, "Unhandled texture dimensions in BUMPENVMAP_LUM: stage=%d dim_tex=%d\n",
                         i, ps->state->dim_tex[i]);
@@ -1356,8 +1393,9 @@ static MString* psh_convert(struct PixelShader *ps)
                 i, i, dotmap_func, ps->input_tex[i], i, i-1, i);
 
             apply_border_adjustment(ps, vars, i, "dotST%d");
-            mstring_append_fmt(vars, "vec4 t%d = texture(texSamp%d, %s(dotST%d));\n",
-                i, i, tex_remap, i);
+            mstring_append_fmt(
+                vars, "vec4 t%d = texture(texSamp%d, %s(dotST%d)%s);\n", i, i,
+                tex_remap, i, bias);
             break;
         case PS_TEXTUREMODES_DOT_ZW:
             assert(i >= 2);
@@ -1382,9 +1420,9 @@ static MString* psh_convert(struct PixelShader *ps)
                 mstring_append_fmt(vars,
                     "n_%d.xy = remapCubeTo2D(n_%d);\n", i, i);
             }
-            mstring_append_fmt(vars,
-                "vec4 t%d = texture(texSamp%d, n_%d%s);\n",
-                i, i, i, ps->state->tex_cubemap[i] ? "" : ".xy");
+            mstring_append_fmt(
+                vars, "vec4 t%d = texture(texSamp%d, n_%d%s%s);\n", i, i, i,
+                ps->state->tex_cubemap[i] ? "" : ".xy", bias);
             break;
         case PS_TEXTUREMODES_DOT_RFLCT_SPEC:
             assert(i == 3);
@@ -1402,9 +1440,9 @@ static MString* psh_convert(struct PixelShader *ps)
                 mstring_append_fmt(vars,
                     "rv_%d.xy = remapCubeTo2D(rv_%d);\n", i, i);
             }
-            mstring_append_fmt(vars,
-                "vec4 t%d = texture(texSamp%d, rv_%d%s);\n",
-                i, i, i, ps->state->tex_cubemap[i] ? "" : ".xy");
+            mstring_append_fmt(
+                vars, "vec4 t%d = texture(texSamp%d, rv_%d%s%s);\n", i, i, i,
+                ps->state->tex_cubemap[i] ? "" : ".xy", bias);
             break;
         case PS_TEXTUREMODES_DOT_STR_3D:
             assert(i == 3);
@@ -1416,9 +1454,9 @@ static MString* psh_convert(struct PixelShader *ps)
                 i, i-2, i-1, i);
 
             apply_border_adjustment(ps, vars, i, "dotSTR%d");
-            mstring_append_fmt(vars,
-                "vec4 t%d = texture(texSamp%d, %s(dotSTR%d%s));\n",
-                i, i, tex_remap, i, ps->state->dim_tex[i] == 2 ? ".xy" : "");
+            mstring_append_fmt(
+                vars, "vec4 t%d = texture(texSamp%d, %s(dotSTR%d%s)%s);\n", i,
+                i, tex_remap, i, ps->state->dim_tex[i] == 2 ? ".xy" : "", bias);
             break;
         case PS_TEXTUREMODES_DOT_STR_CUBE:
             assert(i == 3);
@@ -1433,25 +1471,27 @@ static MString* psh_convert(struct PixelShader *ps)
                     "dotSTR%dCube.xy = remapCubeTo2D(dotSTR%dCube);\n",
                     i, i);
             }
-            mstring_append_fmt(vars,
-                "vec4 t%d = texture(texSamp%d, dotSTR%dCube%s);\n",
-                i, i, i, ps->state->tex_cubemap[i] ? "" : ".xy");
+            mstring_append_fmt(
+                vars, "vec4 t%d = texture(texSamp%d, dotSTR%dCube%s%s);\n", i,
+                i, i, ps->state->tex_cubemap[i] ? "" : ".xy", bias);
             break;
         case PS_TEXTUREMODES_DPNDNT_AR:
             assert(i >= 1);
             assert(!ps->state->rect_tex[i]);
             mstring_append_fmt(vars, "vec2 t%dAR = t%d.ar;\n", i, ps->input_tex[i]);
             apply_border_adjustment(ps, vars, i, "t%dAR");
-            mstring_append_fmt(vars, "vec4 t%d = texture(texSamp%d, %s(t%dAR));\n",
-                i, i, tex_remap, i);
+            mstring_append_fmt(vars,
+                               "vec4 t%d = texture(texSamp%d, %s(t%dAR)%s);\n",
+                               i, i, tex_remap, i, bias);
             break;
         case PS_TEXTUREMODES_DPNDNT_GB:
             assert(i >= 1);
             assert(!ps->state->rect_tex[i]);
             mstring_append_fmt(vars, "vec2 t%dGB = t%d.gb;\n", i, ps->input_tex[i]);
             apply_border_adjustment(ps, vars, i, "t%dGB");
-            mstring_append_fmt(vars, "vec4 t%d = texture(texSamp%d, %s(t%dGB));\n",
-                i, i, tex_remap, i);
+            mstring_append_fmt(vars,
+                               "vec4 t%d = texture(texSamp%d, %s(t%dGB)%s);\n",
+                               i, i, tex_remap, i, bias);
             break;
         case PS_TEXTUREMODES_DOTPRODUCT:
             assert(i == 1 || i == 2);

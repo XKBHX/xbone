@@ -174,7 +174,7 @@ Each phase ends with a demonstrable exit criterion.
 | --- | --- |
 | 0. Groundwork | Done. Natively on macOS arm64 (Dawn Metal backend, Apple M1 Pro), `display.renderer = "WEBGPU"` creates a device and boots with a black screen and no asserts. Not yet run on Linux or Windows. |
 | 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 needs a Dawn built with the SPIR-V reader (see the step 4 notes). |
-| 2. Feature completeness | Step 1 (primitive assembly, with host unit tests in `tests/xbox/prim`) and step 2 (point size and point sprites) are done. Step 3 is in progress: border colour is done; LOD bias and the remaining texture work are next. Steps 4–7 have not started. |
+| 2. Feature completeness | Step 1 (primitive assembly, with host unit tests in `tests/xbox/prim`) and step 2 (point size and point sprites) are done. Step 3 is in progress: border colour and LOD bias are done; the remaining texture work is next. Steps 4–7 have not started. |
 | 3. WGSL generator | Not started. |
 | 4. Performance | Not started. |
 | 5. WebGPU UI and browser | Not started. |
@@ -363,9 +363,9 @@ Phase 1 notes (step 5, textures):
   surfaces. Sampling surfaces directly is phase 2 step 5.
 - Border textures are allocated at the doubled border size that the shader's
   border adjustment expects.
-- Not yet handled: border colour (handled since phase 2 step 3), LOD bias,
-  the signed-channel filter bits (also unimplemented in Vulkan) and
-  convolution filters. They belong to phase 2 step 3. Only the dashboard's formats have been checked on screen.
+- Not yet handled: border colour and LOD bias (both handled since phase 2
+  step 3), the signed-channel filter bits (also unimplemented in Vulkan)
+  and convolution filters. They belong to phase 2 step 3. Only the dashboard's formats have been checked on screen.
   The depth, `Y16`, `R6G5B5`, cube and 3D paths compile, but nothing has
   exercised them yet.
 
@@ -472,6 +472,13 @@ Phase 2 notes (step 3, textures):
   own border texels, so they skip the mix. So do cube maps and `x8y24`
   depth textures.
 - `CLAMP_OGL` stays clamp-to-edge, as in Vulkan.
+- WebGPU samplers have no LOD bias either. The WebGPU target adds a
+  `texLodBias` pixel shader uniform, from
+  `NV_PGRAPH_TEXFILTER0_MIPMAP_LOD_BIAS`, and passes it as the bias
+  argument of every implicit-LOD `texture()` and `textureProj()` call. Tint
+  turns these into `textureSampleBias`, which clamps the bias to
+  [-16, 15.99]; the register's range is [-16, 15.996]. `x8y24` textures get
+  no bias, because WGSL only allows a bias on float textures.
 - Checked with the nxdk_pgraph_tests release `v2026-10-10_21-27-19` on
   macOS arm64, with no WebGPU validation errors:
   - `Texture border/2D` matches the hardware golden image.
@@ -480,6 +487,17 @@ Phase 2 notes (step 3, textures):
     border opaque for some formats.
   - The rest of the `Texture border` suite (3D and cube textures with
     texture borders) renders as before.
+- The LOD bias change was checked on the same release, with no WebGPU
+  validation errors. `Bump map`, `Texture cubemap`, `Texture 3D as 2D` and
+  part of `Texture shadow comparator` render the same as Vulkan. These
+  cover the projective, cube map, bump map, dot product and shadow sampling
+  paths. Two problems limited testing:
+  - The `Texture LOD Bias` suite doesn't run from this release ISO on
+    either renderer, so the bias values themselves haven't been compared
+    with hardware.
+  - `Bump env lum` and `Bump map` stop partway with an abort on the
+    unimplemented texture colour format `0x33` in `pgraph/texture.c`, which
+    every renderer shares.
 
 ### Phase 0: groundwork and refactors (small, landable on its own)
 
