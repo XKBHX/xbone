@@ -731,37 +731,30 @@ static void bind_texture(PGRAPHState *pg, int texture_idx)
     upload_texture_data(pg, binding);
 }
 
-static bool check_textures_dirty(PGRAPHState *pg)
-{
-    PGRAPHWgpuState *r = pg->wgpu_renderer_state;
-
-    for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
-        if (pg->texture_dirty[i] ||
-            (!r->texture_bindings[i] && pgraph_is_texture_enabled(pg, i))) {
-            return true;
-        }
-    }
-    return false;
-}
-
+/* Guest CPU writes to texture memory don't set texture_dirty, so every enabled
+ * texture is looked up again on each draw, which checks its pages. The bind
+ * group is only rebuilt when a binding or its texture object changes. */
 void pgraph_wgpu_bind_textures(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
 
-    if (!check_textures_dirty(pg)) {
-        return;
-    }
-
     for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
+        TextureBinding *old_binding = r->texture_bindings[i];
+        WGPUTextureView old_view = old_binding ? old_binding->view : NULL;
+
         if (pgraph_is_texture_enabled(pg, i)) {
             bind_texture(pg, i);
         } else {
             r->texture_bindings[i] = NULL;
         }
         pg->texture_dirty[i] = false;
+
+        TextureBinding *binding = r->texture_bindings[i];
+        if (binding != old_binding || (binding && binding->view != old_view)) {
+            r->texture_bindings_changed = true;
+        }
     }
-    r->texture_bindings_changed = true;
 }
 
 WGPUBindGroup pgraph_wgpu_get_texture_bind_group(PGRAPHWgpuState *r,

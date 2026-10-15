@@ -488,8 +488,9 @@ Phase 2 notes (step 3, textures):
   - The rest of the `Texture border` suite (3D and cube textures with
     texture borders) renders as before.
 - The LOD bias change was checked on the same release, with no WebGPU
-  validation errors. `Bump map`, `Texture cubemap`, `Texture 3D as 2D` and
-  part of `Texture shadow comparator` render the same as Vulkan. These
+  validation errors. `Bump map`, `Texture cubemap`, `Texture 3D as 2D`
+  (apart from the CPU-update case described below) and part of
+  `Texture shadow comparator` render the same as Vulkan. These
   cover the projective, cube map, bump map, dot product and shadow sampling
   paths. Two problems limited testing:
   - The `Texture LOD Bias` suite doesn't run from this release ISO on
@@ -498,6 +499,13 @@ Phase 2 notes (step 3, textures):
   - `Bump env lum` and `Bump map` stop partway with an abort on the
     unimplemented texture colour format `0x33` in `pgraph/texture.c`, which
     every renderer shares.
+- Textures are looked up again on every draw. Guest CPU writes to texture
+  memory set the page dirty bits but not `texture_dirty`, so binding only
+  after state changes kept stale texels. `Texture 3D as 2D/Volumetric_as_2D`
+  showed this. Vulkan rechecks on every draw because its dirty check also
+  fires for disabled stages. A lookup whose binding and texture object are
+  unchanged doesn't rebuild the bind group. With this, the `Texture CPU
+  Update` suite and `Volumetric_as_2D` match the hardware golden images.
 
 ### Phase 0: groundwork and refactors (small, landable on its own)
 
