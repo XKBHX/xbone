@@ -566,18 +566,35 @@ static void copy_storage_to_texture(WGPUCommandEncoder encoder,
     wgpuCommandEncoderCopyBufferToTexture(encoder, &src, &dst, &extent);
 }
 
-void pgraph_wgpu_pack_converted_surface(PGRAPHState *pg,
-                                        SurfaceBinding *surface, uint8_t *dst,
-                                        unsigned int pitch)
+void pgraph_wgpu_converted_download_layout(const SurfaceBinding *surface,
+                                           uint32_t *stride, uint64_t *bytes)
+{
+    uint32_t bpp = surface->fmt.bytes_per_pixel;
+    uint32_t dst_stride = ROUND_UP(surface->width * bpp, 4);
+
+    *stride = dst_stride;
+    *bytes = (uint64_t)dst_stride * surface->height;
+}
+
+void pgraph_wgpu_reserve_pack_output(PGRAPHWgpuState *r, uint64_t size)
+{
+    ensure_buffer(r, 1, size, WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc,
+                  "Surface pack output");
+}
+
+void pgraph_wgpu_record_converted_download(PGRAPHState *pg,
+                                           SurfaceBinding *surface,
+                                           WGPUBuffer dst, uint64_t offset)
 {
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
     int op = compute_op(surface, true);
     unsigned int scaled_w, scaled_h;
     scaled_size(pg, surface, &scaled_w, &scaled_h);
 
-    uint32_t bpp = surface->fmt.bytes_per_pixel;
-    uint32_t dst_stride = ROUND_UP(surface->width * bpp, 4);
-    uint64_t dst_bytes = (uint64_t)dst_stride * surface->height;
+    uint32_t dst_stride;
+    uint64_t dst_bytes;
+    pgraph_wgpu_converted_download_layout(surface, &dst_stride, &dst_bytes);
+    pgraph_wgpu_reserve_pack_output(r, dst_bytes);
 
     SurfaceComputeParams params = {
         .width_in = scaled_w,
@@ -630,19 +647,9 @@ void pgraph_wgpu_pack_converted_surface(PGRAPHState *pg,
     dispatch_compute(pg, op, &params, entries, nentries,
                      WGPU_FINISH_REASON_SURFACE_DOWN);
 
-    WGPUBuffer readback = ensure_readback(r, dst_bytes);
     wgpuCommandEncoderCopyBufferToBuffer(pgraph_wgpu_ensure_encoder(pg), out, 0,
-                                         readback, 0, ROUND_UP(dst_bytes, 4));
+                                         dst, offset, ROUND_UP(dst_bytes, 4));
     pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_SURFACE_DOWN, false);
-
-    const uint8_t *mapped = pgraph_wgpu_read_buffer(r, readback, dst_bytes);
-    if (mapped) {
-        for (unsigned int y = 0; y < surface->height; y++) {
-            memcpy(dst + (size_t)y * pitch, mapped + (uint64_t)y * dst_stride,
-                   (size_t)surface->width * bpp);
-        }
-        wgpuBufferUnmap(readback);
-    }
 
     if (depth_view) {
         wgpuTextureViewRelease(depth_view);
@@ -652,6 +659,29 @@ void pgraph_wgpu_pack_converted_surface(PGRAPHState *pg,
     }
     if (color_view) {
         wgpuTextureViewRelease(color_view);
+    }
+}
+
+void pgraph_wgpu_pack_converted_surface(PGRAPHState *pg,
+                                        SurfaceBinding *surface, uint8_t *dst,
+                                        unsigned int pitch)
+{
+    PGRAPHWgpuState *r = pg->wgpu_renderer_state;
+    uint32_t dst_stride;
+    uint64_t dst_bytes;
+    uint32_t bpp = surface->fmt.bytes_per_pixel;
+
+    pgraph_wgpu_converted_download_layout(surface, &dst_stride, &dst_bytes);
+    WGPUBuffer readback = ensure_readback(r, dst_bytes);
+    pgraph_wgpu_record_converted_download(pg, surface, readback, 0);
+
+    const uint8_t *mapped = pgraph_wgpu_read_buffer(r, readback, dst_bytes);
+    if (mapped) {
+        for (unsigned int y = 0; y < surface->height; y++) {
+            memcpy(dst + (size_t)y * pitch, mapped + (uint64_t)y * dst_stride,
+                   (size_t)surface->width * bpp);
+        }
+        wgpuBufferUnmap(readback);
     }
 }
 

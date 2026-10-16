@@ -194,6 +194,8 @@ cache** (`gl/surface.c`, `vk/surface.c`). Each entry maps a
 - **Deferred downloads**: Vulkan batches readbacks
   (`downloads_pending`, `download_dirty_surfaces_pending`) and does them in
   `process_pending`, so the PFIFO thread doesn't stall on every draw.
+  WebGPU does the same: dirty surfaces in one batch share one submit and
+  one `wgpuBufferMapAsync`.
 
 ### 3.5 Shader generation (`hw/xbox/nv2a/pgraph/glsl/`)
 
