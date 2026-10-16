@@ -43,8 +43,10 @@ What exists:
   (polygon modes and the flat-shading provoking vertex), point size and
   point sprites, surface pack and unpack, copies of a render target into
   a texture, the PCRTC/PVIDEO display composite, ZPASS occlusion queries,
-  and the surface scale factor. The composite is read back and uploaded to
-  a GL texture for the existing UI. Every shader module is WGSL. Draw
+  and the surface scale factor. The composite is shared into the GL texture
+  the UI already samples when the platform can import it (an IOSurface on
+  macOS, a dma-buf on Linux, a DXGI shared handle on Windows). Otherwise it
+  is read back. Every shader module is WGSL. Draw
   shaders are translated from the GLSL generator. Pack, unpack, clears,
   depth upload, texture upload, and the display composite are written in
   WGSL. The WebGPU

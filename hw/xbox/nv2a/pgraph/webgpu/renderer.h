@@ -215,10 +215,41 @@ typedef struct WgpuDisplayState {
     size_t pixels_size;
     bool pixels_valid;
 
+    /*
+     * Native builds can render the composite into memory that GL samples
+     * directly. The readback above is the fallback when that import fails,
+     * and the only path in the browser.
+     */
+#ifndef __EMSCRIPTEN__
+    WGPUSharedTextureMemory shared_memory;
+    bool shared;
+    bool shared_initialized;
+    bool shared_access;
+    int shared_gl_failed;
+    uint32_t shared_serial;
+#ifdef __APPLE__
+    void *io_surface;
+#endif
+#ifdef __linux__
+    int drm_fd;
+    uint32_t dumb_handle;
+    int prime_fd;
+    uint64_t prime_size;
+#endif
+#ifdef _WIN32
+    void *d3d_device;
+    void *d3d_context;
+    void *d3d_texture;
+    void *shared_handle;
+#endif
+#endif
+
 #ifdef CONFIG_OPENGL
     GLuint gl_texture;
+    GLuint gl_memory;
     unsigned int gl_width;
     unsigned int gl_height;
+    uint32_t gl_serial;
 #endif
 } WgpuDisplayState;
 
@@ -303,6 +334,8 @@ typedef struct PGRAPHWgpuState {
 
     bool depth_clip_control;
     bool float32_filterable;
+    /* Display target can be imported into GL. Browser builds leave this off. */
+    bool shared_display;
 
     WgpuStreamBuffer stream_buffers[WGPU_STREAM__COUNT];
 

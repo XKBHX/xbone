@@ -19,6 +19,40 @@
 
 #include <math.h>
 
+#ifdef CONFIG_OPENGL
+#include <epoxy/gl.h>
+#endif
+
+#if defined(CONFIG_OPENGL) && !defined(__EMSCRIPTEN__)
+#ifdef __APPLE__
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOSurface/IOSurface.h>
+#include <OpenGL/CGLCurrent.h>
+#include <OpenGL/CGLIOSurface.h>
+/* kCVPixelFormatType_32RGBA. Dawn maps those bytes to rgba8unorm. */
+#define DISPLAY_IOSURFACE_RGBA 0x52474241u
+#elif defined(__linux__)
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <linux/types.h>
+#ifndef GL_HANDLE_TYPE_OPAQUE_FD_EXT
+#define GL_HANDLE_TYPE_OPAQUE_FD_EXT 0x9586
+#endif
+#ifndef GL_LINEAR_TILING_EXT
+#define GL_LINEAR_TILING_EXT 0x9585
+#endif
+#elif defined(_WIN32)
+#include <d3d11.h>
+#ifndef GL_HANDLE_TYPE_D3D11_IMAGE_KMT_EXT
+#define GL_HANDLE_TYPE_D3D11_IMAGE_KMT_EXT 0x958C
+#endif
+#ifndef GL_OPTIMAL_TILING_EXT
+#define GL_OPTIMAL_TILING_EXT 0x9584
+#endif
+#endif
+#endif
+
 /* std140-style layout matching the WGSL DisplayParams struct. vec3f is
  * aligned to 16, so pvideo_color_key starts at byte 64 and the struct ends
  * at 80. */
@@ -69,8 +103,10 @@ typedef struct PvideoState {
 } PvideoState;
 
 /* Same composite as vk/display.c, including the Y flip. WebGPU stores row 0
- * at the top. glTexImage2D treats that row as the bottom, and the UI samples
- * the texture with flip disabled, so the flip makes the picture upright.
+ * at the top. glTexImage2D treats that row as the bottom. The shared path
+ * blits an IOSurface into the same 2D texture, and that blit matches the
+ * readback byte for byte, so the flip keeps the picture upright. The UI
+ * samples with flip disabled.
  * The overlay sample stays in uniform control flow: WGSL rejects
  * textureSample under a per-pixel branch. */
 static const char display_wgsl[] =
@@ -131,12 +167,59 @@ static const char display_wgsl[] =
  * not necessarily in finalize. A name retired at shutdown is deleted the
  * next time that context presents. */
 static GLuint retired_gl_texture;
+static GLuint retired_gl_memory;
 
-static void retire_gl_texture(GLuint tex)
+#ifdef __APPLE__
+/* CGLTexImageIOSurface2D only accepts GL_TEXTURE_RECTANGLE. The UI samples
+ * a 2D texture, so the rectangle is blitted into gl_texture. */
+static GLuint iosurface_rect;
+static GLuint iosurface_read_fbo;
+static GLuint iosurface_draw_fbo;
+
+static void delete_iosurface_gl(void)
+{
+    if (iosurface_rect) {
+        glDeleteTextures(1, &iosurface_rect);
+        iosurface_rect = 0;
+    }
+    if (iosurface_read_fbo) {
+        glDeleteFramebuffers(1, &iosurface_read_fbo);
+        iosurface_read_fbo = 0;
+    }
+    if (iosurface_draw_fbo) {
+        glDeleteFramebuffers(1, &iosurface_draw_fbo);
+        iosurface_draw_fbo = 0;
+    }
+}
+#endif
+
+static void retire_gl_objects(GLuint tex, GLuint mem)
 {
     if (tex) {
         retired_gl_texture = tex;
     }
+    if (mem) {
+        retired_gl_memory = mem;
+    }
+}
+
+static void delete_retired_gl_objects(void)
+{
+    if (retired_gl_texture) {
+        glDeleteTextures(1, &retired_gl_texture);
+        retired_gl_texture = 0;
+#ifdef __APPLE__
+        delete_iosurface_gl();
+#endif
+    }
+#if defined(__linux__) || defined(_WIN32)
+    if (retired_gl_memory) {
+        glDeleteMemoryObjectsEXT(1, &retired_gl_memory);
+        retired_gl_memory = 0;
+    }
+#else
+    retired_gl_memory = 0;
+#endif
 }
 #endif
 
@@ -159,6 +242,445 @@ static void destroy_texture(WGPUTexture *texture, WGPUTextureView *view)
         *texture = NULL;
     }
 }
+
+static void log_shared_failure(const char *why)
+{
+    static int logged;
+
+    if (logged) {
+        return;
+    }
+    logged = 1;
+    fprintf(stderr,
+            "[WebGPU] Display share unavailable (%s); reading the frame "
+            "back\n",
+            why);
+}
+
+#ifndef __EMSCRIPTEN__
+#ifdef __linux__
+struct display_drm_create_dumb {
+    uint32_t height;
+    uint32_t width;
+    uint32_t bpp;
+    uint32_t flags;
+    uint32_t handle;
+    uint32_t pitch;
+    uint64_t size;
+};
+
+struct display_drm_destroy_dumb {
+    uint32_t handle;
+};
+
+struct display_drm_prime_handle {
+    uint32_t handle;
+    uint32_t flags;
+    int32_t fd;
+};
+
+#define DISPLAY_DRM_IOCTL_CREATE_DUMB \
+    _IOWR('d', 0xB2, struct display_drm_create_dumb)
+#define DISPLAY_DRM_IOCTL_DESTROY_DUMB \
+    _IOWR('d', 0xB3, struct display_drm_destroy_dumb)
+#define DISPLAY_DRM_IOCTL_PRIME_HANDLE_TO_FD \
+    _IOWR('d', 0x2d, struct display_drm_prime_handle)
+/* DRM_FORMAT_ABGR8888: little-endian R, G, B, A. Dawn's rgba8unorm. */
+#define DISPLAY_DRM_FORMAT_ABGR8888 0x34324241u
+#endif
+
+static bool end_shared_access(PGRAPHWgpuState *r)
+{
+    WgpuDisplayState *disp = &r->display;
+    WGPUSharedTextureMemoryEndAccessState end =
+        WGPU_SHARED_TEXTURE_MEMORY_END_ACCESS_STATE_INIT;
+    bool ok;
+
+    if (!disp->shared_access) {
+        return true;
+    }
+    ok = wgpuSharedTextureMemoryEndAccess(disp->shared_memory, disp->image,
+                                          &end) == WGPUStatus_Success;
+    disp->shared_access = false;
+    if (ok) {
+        disp->shared_initialized = end.initialized;
+    }
+    /* Frees the fence list and releases each fence. */
+    wgpuSharedTextureMemoryEndAccessStateFreeMembers(end);
+    return ok;
+}
+
+static void destroy_shared_display(PGRAPHWgpuState *r)
+{
+    WgpuDisplayState *disp = &r->display;
+
+    if (disp->shared_access) {
+        end_shared_access(r);
+    }
+    destroy_texture(&disp->image, &disp->image_view);
+    if (disp->shared_memory) {
+        wgpuSharedTextureMemoryRelease(disp->shared_memory);
+        disp->shared_memory = NULL;
+    }
+#ifdef __APPLE__
+    if (disp->io_surface) {
+        CFRelease((IOSurfaceRef)disp->io_surface);
+        disp->io_surface = NULL;
+    }
+#endif
+#ifdef __linux__
+    if (disp->prime_fd >= 0) {
+        close(disp->prime_fd);
+        disp->prime_fd = -1;
+    }
+    if (disp->drm_fd >= 0 && disp->dumb_handle) {
+        struct display_drm_destroy_dumb destroy = {
+            .handle = disp->dumb_handle,
+        };
+        ioctl(disp->drm_fd, DISPLAY_DRM_IOCTL_DESTROY_DUMB, &destroy);
+        disp->dumb_handle = 0;
+    }
+#endif
+#ifdef _WIN32
+    if (disp->d3d_texture) {
+        ID3D11Texture2D *texture = disp->d3d_texture;
+
+        texture->lpVtbl->Release(texture);
+        disp->d3d_texture = NULL;
+        disp->shared_handle = NULL;
+    }
+#endif
+    disp->shared = false;
+    disp->shared_initialized = false;
+    disp->width = 0;
+    disp->height = 0;
+}
+
+static void finalize_shared_os(WgpuDisplayState *disp)
+{
+#ifdef __linux__
+    if (disp->drm_fd >= 0) {
+        close(disp->drm_fd);
+        disp->drm_fd = -1;
+    }
+#endif
+#ifdef _WIN32
+    if (disp->d3d_context) {
+        ID3D11DeviceContext *context = disp->d3d_context;
+
+        context->lpVtbl->Release(context);
+        disp->d3d_context = NULL;
+    }
+    if (disp->d3d_device) {
+        ID3D11Device *device = disp->d3d_device;
+
+        device->lpVtbl->Release(device);
+        disp->d3d_device = NULL;
+    }
+#endif
+    (void)disp;
+}
+
+static bool adopt_shared_texture(PGRAPHWgpuState *r,
+                                 WGPUSharedTextureMemory memory,
+                                 unsigned int width, unsigned int height)
+{
+    WgpuDisplayState *disp = &r->display;
+    WGPUSharedTextureMemoryProperties props =
+        WGPU_SHARED_TEXTURE_MEMORY_PROPERTIES_INIT;
+    WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+    WGPUTexture texture;
+    WGPUTextureView view;
+    WGPUTextureUsage need =
+        WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc;
+
+    if (!memory ||
+        wgpuSharedTextureMemoryGetProperties(memory, &props) !=
+            WGPUStatus_Success ||
+        props.format != WGPUTextureFormat_RGBA8Unorm ||
+        props.size.width != width || props.size.height != height ||
+        (props.usage & need) != need) {
+        return false;
+    }
+
+    desc.label = pgraph_wgpu_str("Display");
+    desc.usage = need;
+    desc.dimension = WGPUTextureDimension_2D;
+    desc.format = props.format;
+    desc.size = props.size;
+    texture = wgpuSharedTextureMemoryCreateTexture(memory, &desc);
+    if (!texture) {
+        return false;
+    }
+    view = wgpuTextureCreateView(texture, NULL);
+    if (!view) {
+        wgpuTextureRelease(texture);
+        return false;
+    }
+
+    destroy_shared_display(r);
+    disp->shared_memory = memory;
+    disp->image = texture;
+    disp->image_view = view;
+    disp->width = width;
+    disp->height = height;
+    disp->shared = true;
+    disp->shared_initialized = false;
+    disp->shared_serial++;
+    return true;
+}
+
+#ifdef __APPLE__
+static void iosurface_dict_set_int(CFMutableDictionaryRef dict, CFStringRef key,
+                                   int value)
+{
+    CFNumberRef number =
+        CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &value);
+
+    CFDictionarySetValue(dict, key, number);
+    CFRelease(number);
+}
+
+static bool create_shared_display(PGRAPHWgpuState *r, unsigned int width,
+                                  unsigned int height)
+{
+    int row_bytes =
+        (int)IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, (size_t)width * 4);
+    CFMutableDictionaryRef props = CFDictionaryCreateMutable(
+        kCFAllocatorDefault, 0, &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks);
+    IOSurfaceRef surface;
+    WGPUSharedTextureMemoryIOSurfaceDescriptor ios =
+        WGPU_SHARED_TEXTURE_MEMORY_IO_SURFACE_DESCRIPTOR_INIT;
+    WGPUSharedTextureMemoryDescriptor mem_desc =
+        WGPU_SHARED_TEXTURE_MEMORY_DESCRIPTOR_INIT;
+    WGPUSharedTextureMemory memory;
+
+    iosurface_dict_set_int(props, kIOSurfaceWidth, (int)width);
+    iosurface_dict_set_int(props, kIOSurfaceHeight, (int)height);
+    iosurface_dict_set_int(props, kIOSurfaceBytesPerElement, 4);
+    iosurface_dict_set_int(props, kIOSurfaceBytesPerRow, row_bytes);
+    iosurface_dict_set_int(props, kIOSurfacePixelFormat,
+                           (int)DISPLAY_IOSURFACE_RGBA);
+    surface = IOSurfaceCreate(props);
+    CFRelease(props);
+    if (!surface) {
+        return false;
+    }
+
+    ios.ioSurface = surface;
+    ios.allowStorageBinding = WGPU_FALSE;
+    mem_desc.label = pgraph_wgpu_str("Display shared");
+    mem_desc.nextInChain = &ios.chain;
+    memory = wgpuDeviceImportSharedTextureMemory(r->device, &mem_desc);
+    if (!memory || !adopt_shared_texture(r, memory, width, height)) {
+        if (memory) {
+            wgpuSharedTextureMemoryRelease(memory);
+        }
+        CFRelease(surface);
+        return false;
+    }
+    r->display.io_surface = surface;
+    return true;
+}
+#elif defined(__linux__)
+static bool create_shared_display(PGRAPHWgpuState *r, unsigned int width,
+                                  unsigned int height)
+{
+    WgpuDisplayState *disp = &r->display;
+    struct display_drm_create_dumb create = {
+        .width = width,
+        .height = height,
+        .bpp = 32,
+    };
+    struct display_drm_prime_handle prime = { 0 };
+    WGPUSharedTextureMemoryDmaBufPlane plane =
+        WGPU_SHARED_TEXTURE_MEMORY_DMA_BUF_PLANE_INIT;
+    WGPUSharedTextureMemoryDmaBufDescriptor dma =
+        WGPU_SHARED_TEXTURE_MEMORY_DMA_BUF_DESCRIPTOR_INIT;
+    WGPUSharedTextureMemoryDescriptor mem_desc =
+        WGPU_SHARED_TEXTURE_MEMORY_DESCRIPTOR_INIT;
+    WGPUSharedTextureMemory memory = NULL;
+
+    if (disp->drm_fd < 0) {
+        disp->drm_fd = open("/dev/dri/renderD128", O_RDWR | O_CLOEXEC);
+    }
+    if (disp->drm_fd < 0 ||
+        ioctl(disp->drm_fd, DISPLAY_DRM_IOCTL_CREATE_DUMB, &create) != 0 ||
+        !create.handle || create.pitch != width * 4) {
+        if (disp->drm_fd >= 0 && create.handle) {
+            struct display_drm_destroy_dumb destroy = { .handle =
+                                                            create.handle };
+            ioctl(disp->drm_fd, DISPLAY_DRM_IOCTL_DESTROY_DUMB, &destroy);
+        }
+        return false;
+    }
+
+    prime.handle = create.handle;
+    prime.flags = O_CLOEXEC | O_RDWR;
+    if (ioctl(disp->drm_fd, DISPLAY_DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime) !=
+            0 ||
+        prime.fd < 0) {
+        struct display_drm_destroy_dumb destroy = { .handle = create.handle };
+        ioctl(disp->drm_fd, DISPLAY_DRM_IOCTL_DESTROY_DUMB, &destroy);
+        return false;
+    }
+
+    plane.fd = prime.fd;
+    plane.stride = create.pitch;
+    dma.size = (WGPUExtent3D){ width, height, 1 };
+    dma.drmFormat = DISPLAY_DRM_FORMAT_ABGR8888;
+    dma.planeCount = 1;
+    dma.planes = &plane;
+    mem_desc.label = pgraph_wgpu_str("Display shared");
+    mem_desc.nextInChain = &dma.chain;
+    memory = wgpuDeviceImportSharedTextureMemory(r->device, &mem_desc);
+    if (!memory || !adopt_shared_texture(r, memory, width, height)) {
+        if (memory) {
+            wgpuSharedTextureMemoryRelease(memory);
+        }
+        close(prime.fd);
+        struct display_drm_destroy_dumb destroy = { .handle = create.handle };
+        ioctl(disp->drm_fd, DISPLAY_DRM_IOCTL_DESTROY_DUMB, &destroy);
+        return false;
+    }
+    /* Dawn duplicated the fd. This one is closed with the dumb buffer. */
+    disp->prime_fd = prime.fd;
+    disp->dumb_handle = create.handle;
+    disp->prime_size = create.size;
+    return true;
+}
+#elif defined(_WIN32)
+static const IID display_iid_dxgi_resource = { 0x035f3ab4,
+                                               0x482e,
+                                               0x4e50,
+                                               { 0xb4, 0x1f, 0x8a, 0x7f, 0x8b,
+                                                 0xd8, 0x96, 0x0b } };
+
+typedef HRESULT(WINAPI *DisplayD3D11CreateDeviceFn)(
+    IDXGIAdapter *, D3D_DRIVER_TYPE, HMODULE, UINT, const D3D_FEATURE_LEVEL *,
+    UINT, UINT, ID3D11Device **, D3D_FEATURE_LEVEL *, ID3D11DeviceContext **);
+
+static bool ensure_d3d11_device(WgpuDisplayState *disp)
+{
+    HMODULE library;
+    DisplayD3D11CreateDeviceFn create_device;
+    ID3D11Device *device = NULL;
+    ID3D11DeviceContext *context = NULL;
+    D3D_FEATURE_LEVEL level;
+    HRESULT hr;
+
+    if (disp->d3d_device) {
+        return true;
+    }
+    library = LoadLibraryA("d3d11.dll");
+    if (!library) {
+        return false;
+    }
+    create_device = (DisplayD3D11CreateDeviceFn)GetProcAddress(
+        library, "D3D11CreateDevice");
+    if (!create_device) {
+        return false;
+    }
+    hr = create_device(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0,
+                       D3D11_SDK_VERSION, &device, &level, &context);
+    if (FAILED(hr)) {
+        return false;
+    }
+    disp->d3d_device = device;
+    disp->d3d_context = context;
+    return true;
+}
+
+static bool create_shared_display(PGRAPHWgpuState *r, unsigned int width,
+                                  unsigned int height)
+{
+    WgpuDisplayState *disp = &r->display;
+    ID3D11Device *device;
+    ID3D11Texture2D *texture = NULL;
+    IDXGIResource *resource = NULL;
+    HANDLE handle = NULL;
+    D3D11_TEXTURE2D_DESC desc = { 0 };
+    WGPUSharedTextureMemoryDXGISharedHandleDescriptor dxgi =
+        WGPU_SHARED_TEXTURE_MEMORY_DXGI_SHARED_HANDLE_DESCRIPTOR_INIT;
+    WGPUSharedTextureMemoryDescriptor mem_desc =
+        WGPU_SHARED_TEXTURE_MEMORY_DESCRIPTOR_INIT;
+    WGPUSharedTextureMemory memory = NULL;
+    HRESULT hr;
+
+    if (!ensure_d3d11_device(disp)) {
+        return false;
+    }
+    device = disp->d3d_device;
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    hr = device->lpVtbl->CreateTexture2D(device, &desc, NULL, &texture);
+    if (FAILED(hr)) {
+        return false;
+    }
+    hr = texture->lpVtbl->QueryInterface(texture, &display_iid_dxgi_resource,
+                                         (void **)&resource);
+    if (FAILED(hr)) {
+        texture->lpVtbl->Release(texture);
+        return false;
+    }
+    hr = resource->lpVtbl->GetSharedHandle(resource, &handle);
+    resource->lpVtbl->Release(resource);
+    if (FAILED(hr) || !handle) {
+        texture->lpVtbl->Release(texture);
+        return false;
+    }
+
+    dxgi.handle = handle;
+    dxgi.useKeyedMutex = WGPU_FALSE;
+    mem_desc.label = pgraph_wgpu_str("Display shared");
+    mem_desc.nextInChain = &dxgi.chain;
+    memory = wgpuDeviceImportSharedTextureMemory(r->device, &mem_desc);
+    if (!memory || !adopt_shared_texture(r, memory, width, height)) {
+        if (memory) {
+            wgpuSharedTextureMemoryRelease(memory);
+        }
+        texture->lpVtbl->Release(texture);
+        return false;
+    }
+    /* The texture owns the handle. Do not CloseHandle it. */
+    disp->d3d_texture = texture;
+    disp->shared_handle = handle;
+    return true;
+}
+#else
+static bool create_shared_display(PGRAPHWgpuState *r, unsigned int width,
+                                  unsigned int height)
+{
+    (void)r;
+    (void)width;
+    (void)height;
+    return false;
+}
+#endif
+
+static bool begin_shared_access(PGRAPHWgpuState *r)
+{
+    WgpuDisplayState *disp = &r->display;
+    WGPUSharedTextureMemoryBeginAccessDescriptor begin =
+        WGPU_SHARED_TEXTURE_MEMORY_BEGIN_ACCESS_DESCRIPTOR_INIT;
+
+    begin.initialized = disp->shared_initialized ? WGPU_TRUE : WGPU_FALSE;
+    if (wgpuSharedTextureMemoryBeginAccess(disp->shared_memory, disp->image,
+                                           &begin) != WGPUStatus_Success) {
+        return false;
+    }
+    disp->shared_access = true;
+    return true;
+}
+#endif
 
 static float pvideo_calculate_scale(unsigned int din_dout,
                                     unsigned int output_size)
@@ -310,6 +832,32 @@ static void ensure_texture(PGRAPHWgpuState *r, WGPUTexture *texture,
     *cur_h = height;
 }
 
+static void ensure_display_target(PGRAPHWgpuState *r, unsigned int width,
+                                  unsigned int height)
+{
+    WgpuDisplayState *disp = &r->display;
+
+#ifndef __EMSCRIPTEN__
+    if (r->shared_display && !qatomic_read(&disp->shared_gl_failed)) {
+        if (disp->shared && disp->image && disp->width == width &&
+            disp->height == height) {
+            return;
+        }
+        if (create_shared_display(r, width, height)) {
+            return;
+        }
+        log_shared_failure("import failed");
+        qatomic_set(&disp->shared_gl_failed, 1);
+    } else if (disp->shared) {
+        destroy_shared_display(r);
+    }
+#endif
+    ensure_texture(r, &disp->image, &disp->image_view, &disp->width,
+                   &disp->height, width, height,
+                   WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc,
+                   "Display");
+}
+
 static void upload_pvideo_image(PGRAPHState *pg, const PvideoState *state)
 {
     NV2AState *d = container_of(pg, NV2AState, pgraph);
@@ -366,7 +914,27 @@ static void ensure_readback(PGRAPHWgpuState *r, uint64_t size)
     disp->readback_size = desc.size;
 }
 
-static bool readback_display(PGRAPHState *pg)
+static void record_display_readback(PGRAPHState *pg)
+{
+    PGRAPHWgpuState *r = pg->wgpu_renderer_state;
+    WgpuDisplayState *disp = &r->display;
+    uint32_t packed_row = disp->width * 4;
+    uint32_t src_row = ROUND_UP(packed_row, 256);
+    uint64_t src_size = (uint64_t)src_row * disp->height;
+    WGPUCommandEncoder encoder = pgraph_wgpu_ensure_encoder(pg);
+    WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+    WGPUTexelCopyBufferInfo dst = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+    WGPUExtent3D extent = { disp->width, disp->height, 1 };
+
+    ensure_readback(r, src_size);
+    src.texture = disp->image;
+    dst.buffer = disp->readback;
+    dst.layout.bytesPerRow = src_row;
+    dst.layout.rowsPerImage = disp->height;
+    wgpuCommandEncoderCopyTextureToBuffer(encoder, &src, &dst, &extent);
+}
+
+static bool map_display_readback(PGRAPHState *pg)
 {
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
     WgpuDisplayState *disp = &r->display;
@@ -374,24 +942,9 @@ static bool readback_display(PGRAPHState *pg)
     uint32_t src_row = ROUND_UP(packed_row, 256);
     uint64_t src_size = (uint64_t)src_row * disp->height;
     size_t packed_size = (size_t)packed_row * disp->height;
-
-    ensure_readback(r, src_size);
-
-    WGPUCommandEncoder encoder = pgraph_wgpu_ensure_encoder(pg);
-    WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
-    WGPUTexelCopyBufferInfo dst = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
-    WGPUExtent3D extent = { disp->width, disp->height, 1 };
-    src.texture = disp->image;
-    dst.buffer = disp->readback;
-    dst.layout.bytesPerRow = src_row;
-    dst.layout.rowsPerImage = disp->height;
-    wgpuCommandEncoderCopyTextureToBuffer(encoder, &src, &dst, &extent);
-
-    nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_5);
-    pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_PRESENTING, false);
-
     const uint8_t *mapped =
         pgraph_wgpu_read_buffer(r, disp->readback, src_size);
+
     if (!mapped) {
         return false;
     }
@@ -406,6 +959,14 @@ static bool readback_display(PGRAPHState *pg)
     }
     wgpuBufferUnmap(disp->readback);
     return true;
+}
+
+static bool readback_display(PGRAPHState *pg)
+{
+    record_display_readback(pg);
+    nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_5);
+    pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_PRESENTING, false);
+    return map_display_readback(pg);
 }
 
 static void update_bind_group(PGRAPHWgpuState *r, WGPUTextureView frame)
@@ -506,6 +1067,11 @@ void pgraph_wgpu_init_display(PGRAPHState *pg)
     WgpuDisplayState *disp = &r->display;
     WGPUBindGroupLayoutEntry entries[5];
 
+#if defined(__linux__) && !defined(__EMSCRIPTEN__)
+    disp->drm_fd = -1;
+    disp->prime_fd = -1;
+#endif
+
     disp->module = pgraph_wgpu_create_wgsl_module(r, "Display", display_wgsl);
 
     entries[0] = texture_entry(0);
@@ -571,7 +1137,12 @@ void pgraph_wgpu_finalize_display(PGRAPHState *pg)
     WgpuDisplayState *disp = &r->display;
 
     release_bind_group(disp);
+#ifndef __EMSCRIPTEN__
+    destroy_shared_display(r);
+    finalize_shared_os(disp);
+#else
     destroy_texture(&disp->image, &disp->image_view);
+#endif
     destroy_texture(&disp->pvideo_image, &disp->pvideo_view);
     disp->width = 0;
     disp->height = 0;
@@ -614,10 +1185,12 @@ void pgraph_wgpu_finalize_display(PGRAPHState *pg)
     }
 
 #ifdef CONFIG_OPENGL
-    retire_gl_texture(disp->gl_texture);
+    retire_gl_objects(disp->gl_texture, disp->gl_memory);
     disp->gl_texture = 0;
+    disp->gl_memory = 0;
     disp->gl_width = 0;
     disp->gl_height = 0;
+    disp->gl_serial = 0;
 #endif
 }
 
@@ -666,10 +1239,7 @@ void pgraph_wgpu_render_display(PGRAPHState *pg)
         upload_pvideo_image(pg, &pvideo);
     }
 
-    ensure_texture(r, &disp->image, &disp->image_view, &disp->width,
-                   &disp->height, width, height,
-                   WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc,
-                   "Display");
+    ensure_display_target(r, width, height);
 
     DisplayParams params = { 0 };
     int line_offset = vga_display_params.line_offset ?
@@ -703,19 +1273,273 @@ void pgraph_wgpu_render_display(PGRAPHState *pg)
     pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_PRESENTING, false);
     wgpuQueueWriteBuffer(r->queue, disp->uniform, 0, &params, sizeof(params));
     update_bind_group(r, surface->view);
+
+#ifndef __EMSCRIPTEN__
+    if (disp->shared) {
+        if (!begin_shared_access(r)) {
+            log_shared_failure("begin failed");
+            qatomic_set(&disp->shared_gl_failed, 1);
+            destroy_shared_display(r);
+            ensure_texture(r, &disp->image, &disp->image_view, &disp->width,
+                           &disp->height, width, height,
+                           WGPUTextureUsage_RenderAttachment |
+                               WGPUTextureUsage_CopySrc,
+                           "Display");
+        } else {
+            record_display_pass(pg);
+            pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_PRESENTING, false);
+            if (!end_shared_access(r)) {
+                log_shared_failure("end failed");
+                qatomic_set(&disp->shared_gl_failed, 1);
+            }
+            pgraph_wgpu_wait_idle(r);
+            return;
+        }
+    }
+#endif
     record_display_pass(pg);
     disp->pixels_valid = readback_display(pg);
 }
 
 #ifdef CONFIG_OPENGL
+static void drop_gl_binding(WgpuDisplayState *disp)
+{
+    if (disp->gl_texture) {
+        glDeleteTextures(1, &disp->gl_texture);
+        disp->gl_texture = 0;
+    }
+#if defined(__linux__) || defined(_WIN32)
+    if (disp->gl_memory) {
+        glDeleteMemoryObjectsEXT(1, &disp->gl_memory);
+        disp->gl_memory = 0;
+    }
+#endif
+#ifdef __APPLE__
+    delete_iosurface_gl();
+#endif
+    disp->gl_width = 0;
+    disp->gl_height = 0;
+    disp->gl_serial = 0;
+}
+
+#ifndef __EMSCRIPTEN__
+#ifdef __APPLE__
+static bool bind_shared_display(WgpuDisplayState *disp)
+{
+    CGLContextObj ctx = CGLGetCurrentContext();
+    GLint previous_draw = 0;
+    GLint previous_read = 0;
+    GLenum status;
+
+    if (!ctx || !disp->io_surface) {
+        return false;
+    }
+    if (!iosurface_rect) {
+        glGenTextures(1, &iosurface_rect);
+    }
+    if (!disp->gl_texture) {
+        glGenTextures(1, &disp->gl_texture);
+    }
+    if (!iosurface_read_fbo) {
+        glGenFramebuffers(1, &iosurface_read_fbo);
+    }
+    if (!iosurface_draw_fbo) {
+        glGenFramebuffers(1, &iosurface_draw_fbo);
+    }
+
+    /*
+     * GL_BGRA + UNSIGNED_INT_8_8_8_8_REV is the 8-bit color pair CGL
+     * accepts, and on little-endian it is the byte order R, G, B, A.
+     * That matches the rgba8unorm IOSurface. The target has to be a
+     * rectangle texture, which the UI cannot sample, so blit it to 2D.
+     */
+    glBindTexture(GL_TEXTURE_RECTANGLE, iosurface_rect);
+    if (disp->gl_serial != disp->shared_serial) {
+        CGLError err = CGLTexImageIOSurface2D(
+            ctx, GL_TEXTURE_RECTANGLE, GL_RGBA8, disp->width, disp->height,
+            GL_BGRA, GL_UNSIGNED_INT_8_8_8_8_REV,
+            (IOSurfaceRef)disp->io_surface, 0);
+
+        if (err != kCGLNoError) {
+            fprintf(stderr, "[WebGPU] CGLTexImageIOSurface2D failed (%d)\n",
+                    err);
+            return false;
+        }
+        glBindTexture(GL_TEXTURE_2D, disp->gl_texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, disp->width, disp->height, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        disp->gl_width = disp->width;
+        disp->gl_height = disp->height;
+        disp->gl_serial = disp->shared_serial;
+    }
+
+    /* Rebind so this context sees Metal's writes to the IOSurface. */
+    glBindTexture(GL_TEXTURE_RECTANGLE, iosurface_rect);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previous_draw);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previous_read);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, iosurface_read_fbo);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_RECTANGLE, iosurface_rect, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, iosurface_draw_fbo);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, disp->gl_texture, 0);
+    status = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER);
+    if (status != GL_FRAMEBUFFER_COMPLETE ||
+        glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) !=
+            GL_FRAMEBUFFER_COMPLETE) {
+        fprintf(stderr,
+                "[WebGPU] IOSurface blit framebuffer incomplete "
+                "(%u)\n",
+                status);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previous_draw);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, previous_read);
+        return false;
+    }
+    glBlitFramebuffer(0, 0, disp->width, disp->height, 0, 0, disp->width,
+                      disp->height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, previous_draw);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, previous_read);
+    return true;
+}
+#elif defined(__linux__)
+static bool bind_shared_display(WgpuDisplayState *disp)
+{
+    int fd;
+    GLuint memory = 0;
+    GLuint texture = 0;
+
+    if (disp->gl_texture && disp->gl_memory &&
+        disp->gl_serial == disp->shared_serial) {
+        glBindTexture(GL_TEXTURE_2D, disp->gl_texture);
+        return true;
+    }
+    if (disp->prime_fd < 0 || !disp->prime_size) {
+        return false;
+    }
+    fd = dup(disp->prime_fd);
+    if (fd < 0) {
+        return false;
+    }
+
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    glCreateMemoryObjectsEXT(1, &memory);
+    glImportMemoryFdEXT(memory, disp->prime_size, GL_HANDLE_TYPE_OPAQUE_FD_EXT,
+                        fd);
+    if (glGetError() != GL_NO_ERROR) {
+        close(fd);
+        if (memory) {
+            glDeleteMemoryObjectsEXT(1, &memory);
+        }
+        return false;
+    }
+
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_TILING_EXT, GL_LINEAR_TILING_EXT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexStorageMem2DEXT(GL_TEXTURE_2D, 1, GL_RGBA8, disp->width, disp->height,
+                         memory, 0);
+    if (glGetError() != GL_NO_ERROR) {
+        glDeleteTextures(1, &texture);
+        glDeleteMemoryObjectsEXT(1, &memory);
+        return false;
+    }
+
+    drop_gl_binding(disp);
+    disp->gl_texture = texture;
+    disp->gl_memory = memory;
+    disp->gl_width = disp->width;
+    disp->gl_height = disp->height;
+    disp->gl_serial = disp->shared_serial;
+    return true;
+}
+#elif defined(_WIN32)
+static bool bind_shared_display(WgpuDisplayState *disp)
+{
+    GLuint memory = 0;
+    GLuint texture = 0;
+    GLuint64 size = (GLuint64)disp->width * disp->height * 4;
+
+    if (disp->gl_texture && disp->gl_memory &&
+        disp->gl_serial == disp->shared_serial) {
+        glBindTexture(GL_TEXTURE_2D, disp->gl_texture);
+        return true;
+    }
+    if (!disp->shared_handle) {
+        return false;
+    }
+
+    while (glGetError() != GL_NO_ERROR) {
+    }
+    glCreateMemoryObjectsEXT(1, &memory);
+    glImportMemoryWin32HandleEXT(
+        memory, size, GL_HANDLE_TYPE_D3D11_IMAGE_KMT_EXT, disp->shared_handle);
+    if (glGetError() != GL_NO_ERROR) {
+        if (memory) {
+            glDeleteMemoryObjectsEXT(1, &memory);
+        }
+        return false;
+    }
+
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_TILING_EXT,
+                    GL_OPTIMAL_TILING_EXT);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexStorageMem2DEXT(GL_TEXTURE_2D, 1, GL_RGBA8, disp->width, disp->height,
+                         memory, 0);
+    if (glGetError() != GL_NO_ERROR) {
+        glDeleteTextures(1, &texture);
+        glDeleteMemoryObjectsEXT(1, &memory);
+        return false;
+    }
+
+    drop_gl_binding(disp);
+    disp->gl_texture = texture;
+    disp->gl_memory = memory;
+    disp->gl_width = disp->width;
+    disp->gl_height = disp->height;
+    disp->gl_serial = disp->shared_serial;
+    return true;
+}
+#else
+static bool bind_shared_display(WgpuDisplayState *disp)
+{
+    (void)disp;
+    return false;
+}
+#endif
+#endif
+
 GLuint pgraph_wgpu_present_display(PGRAPHWgpuState *r)
 {
     WgpuDisplayState *disp = &r->display;
 
-    if (retired_gl_texture) {
-        glDeleteTextures(1, &retired_gl_texture);
-        retired_gl_texture = 0;
+    delete_retired_gl_objects();
+
+#ifndef __EMSCRIPTEN__
+    if (disp->shared && !qatomic_read(&disp->shared_gl_failed)) {
+        static int logged;
+
+        if (bind_shared_display(disp)) {
+            if (!logged) {
+                fprintf(stderr, "[WebGPU] Display image is shared with GL\n");
+                logged = 1;
+            }
+            return disp->gl_texture;
+        }
+        log_shared_failure("GL bind failed");
+        qatomic_set(&disp->shared_gl_failed, 1);
+        drop_gl_binding(disp);
     }
+#endif
+
     if (!disp->pixels_valid || !disp->pixels || !disp->width || !disp->height) {
         return 0;
     }
