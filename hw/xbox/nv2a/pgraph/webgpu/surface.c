@@ -157,18 +157,47 @@ static bool check_surface_overlaps_range(const SurfaceBinding *surface,
     return !(surface->vram_addr >= range_end || range_start >= surface_end);
 }
 
+static void download_surface_list(NV2AState *d, SurfaceBinding **surfaces,
+                                  int count);
+
+void pgraph_wgpu_download_surfaces_covering(PGRAPHState *pg,
+                                            const WgpuMemoryRange *ranges,
+                                            int count)
+{
+    PGRAPHWgpuState *r = pg->wgpu_renderer_state;
+    g_autoptr(GPtrArray) list = g_ptr_array_new();
+
+    if (!count) {
+        return;
+    }
+
+    SurfaceBinding *surface;
+    QTAILQ_FOREACH (surface, &r->surfaces, entry) {
+        if (!surface->draw_dirty || !surface->width || !surface->height) {
+            continue;
+        }
+        for (int i = 0; i < count; i++) {
+            if (!ranges[i].size) {
+                continue;
+            }
+            if (check_surface_overlaps_range(surface, ranges[i].addr,
+                                             ranges[i].size)) {
+                g_ptr_array_add(list, surface);
+                break;
+            }
+        }
+    }
+
+    download_surface_list(container_of(pg, NV2AState, pgraph),
+                          (SurfaceBinding **)list->pdata, list->len);
+}
+
 void pgraph_wgpu_download_surfaces_in_range_if_dirty(PGRAPHState *pg,
                                                      hwaddr start, hwaddr size)
 {
-    PGRAPHWgpuState *r = pg->wgpu_renderer_state;
-    SurfaceBinding *surface;
+    WgpuMemoryRange range = { .addr = start, .size = size };
 
-    QTAILQ_FOREACH (surface, &r->surfaces, entry) {
-        if (check_surface_overlaps_range(surface, start, size)) {
-            pgraph_wgpu_surface_download_if_dirty(
-                container_of(pg, NV2AState, pgraph), surface);
-        }
-    }
+    pgraph_wgpu_download_surfaces_covering(pg, &range, 1);
 }
 
 static void ensure_readback_buffer(PGRAPHWgpuState *r, uint64_t size)
@@ -207,79 +236,169 @@ static void copy_aspect_to_buffer(WGPUCommandEncoder encoder,
     wgpuCommandEncoderCopyTextureToBuffer(encoder, &src, &dst, &extent);
 }
 
-static void download_surface_to_buffer(NV2AState *d, SurfaceBinding *surface,
-                                       uint8_t *pixels)
+typedef struct SurfaceDownload {
+    SurfaceBinding *surface;
+    uint8_t *pixels;
+    bool converted;
+    uint64_t offset;
+    uint64_t gpu_bytes;
+    uint32_t src_pitch;
+    unsigned int scale;
+} SurfaceDownload;
+
+/* Copy every surface, then map the readback once. A converted surface is
+ * submitted on its own because the pack kernel reuses one storage buffer,
+ * but it lands in the same readback so the CPU still waits once. */
+static void download_surface_list(NV2AState *d, SurfaceBinding **surfaces,
+                                  int count)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
+    g_autoptr(GArray) jobs = g_array_new(false, true, sizeof(SurfaceDownload));
+    uint64_t cursor = 0;
+    uint64_t max_pack = 0;
 
-    if (!surface->width || !surface->height) {
+    for (int i = 0; i < count; i++) {
+        SurfaceBinding *surface = surfaces[i];
+        bool seen = false;
+
+        if (!surface || !surface->width || !surface->height) {
+            continue;
+        }
+        for (guint j = 0; j < jobs->len; j++) {
+            if (g_array_index(jobs, SurfaceDownload, j).surface == surface) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) {
+            continue;
+        }
+
+        SurfaceDownload job = {
+            .surface = surface,
+            .pixels = d->vram_ptr + surface->vram_addr,
+            .converted = surface->host_fmt.conversion != WGPU_SURFACE_CONV_NONE,
+        };
+        if (job.converted) {
+            uint32_t stride;
+            uint64_t bytes;
+            pgraph_wgpu_converted_download_layout(surface, &stride, &bytes);
+            job.src_pitch = stride;
+            /* The pack copy rounds the byte count up to 4. */
+            job.gpu_bytes = ROUND_UP(bytes, 256);
+            max_pack = MAX(max_pack, bytes);
+        } else {
+            unsigned int scale = pg->surface_scale_factor;
+            unsigned int scaled_w = surface->width * scale;
+            uint32_t bpp = surface->host_fmt.host_bytes_per_pixel;
+
+            job.scale = scale;
+            job.src_pitch = ROUND_UP(scaled_w * bpp, 256);
+            job.gpu_bytes = (uint64_t)job.src_pitch * surface->height * scale;
+        }
+        cursor = ROUND_UP(cursor, 256);
+        job.offset = cursor;
+        cursor += job.gpu_bytes;
+        g_array_append_val(jobs, job);
+
+        nv2a_profile_inc_counter(NV2A_PROF_SURF_DOWNLOAD);
+        trace_nv2a_pgraph_surface_download(
+            surface->color ? "COLOR" : "ZETA", surface->swizzle ? "sz" : "lin",
+            surface->vram_addr, surface->width, surface->height, surface->pitch,
+            surface->fmt.bytes_per_pixel);
+    }
+
+    if (!jobs->len || !cursor) {
         return;
     }
 
-    nv2a_profile_inc_counter(NV2A_PROF_SURF_DOWNLOAD);
-
+    /* Draws that produced these surfaces have to be submitted first. */
     pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_SURFACE_DOWN, false);
+    if (max_pack) {
+        pgraph_wgpu_reserve_pack_output(r, max_pack);
+    }
+    ensure_readback_buffer(r, cursor);
 
-    trace_nv2a_pgraph_surface_download(
-        surface->color ? "COLOR" : "ZETA", surface->swizzle ? "sz" : "lin",
-        surface->vram_addr, surface->width, surface->height, surface->pitch,
-        surface->fmt.bytes_per_pixel);
+    bool recorded_direct = false;
+    for (guint i = 0; i < jobs->len; i++) {
+        SurfaceDownload *job = &g_array_index(jobs, SurfaceDownload, i);
+        SurfaceBinding *surface = job->surface;
 
-    /* 16-bit colour and depth are packed on the GPU. Swizzle stays here,
-     * matching Vulkan. */
-    if (surface->host_fmt.conversion != WGPU_SURFACE_CONV_NONE) {
-        uint8_t *out = pixels;
-        g_autofree uint8_t *swizzle_buf = NULL;
-        if (surface->swizzle) {
-            swizzle_buf = g_malloc(surface->size);
-            out = swizzle_buf;
+        if (job->converted) {
+            continue;
         }
-        pgraph_wgpu_pack_converted_surface(pg, surface, out, surface->pitch);
-        if (surface->swizzle) {
-            swizzle_rect(swizzle_buf, surface->width, surface->height, pixels,
-                         surface->pitch, surface->fmt.bytes_per_pixel);
-            nv2a_profile_inc_counter(NV2A_PROF_SURF_SWIZZLE);
-        }
-        return;
+        copy_aspect_to_buffer(
+            pgraph_wgpu_ensure_encoder(pg), surface, WGPUTextureAspect_All,
+            r->readback_buffer, job->offset, job->src_pitch,
+            surface->width * job->scale, surface->height * job->scale);
+        recorded_direct = true;
     }
 
-    unsigned int scale = pg->surface_scale_factor;
-    unsigned int scaled_w = surface->width * scale;
-    unsigned int scaled_h = surface->height * scale;
-    uint32_t main_bpp = surface->host_fmt.host_bytes_per_pixel;
-    uint32_t main_row = ROUND_UP(scaled_w * main_bpp, 256);
-    uint64_t total_size = (uint64_t)main_row * scaled_h;
-    ensure_readback_buffer(r, total_size);
+    for (guint i = 0; i < jobs->len; i++) {
+        SurfaceDownload *job = &g_array_index(jobs, SurfaceDownload, i);
 
-    WGPUCommandEncoder encoder = pgraph_wgpu_ensure_encoder(pg);
-    copy_aspect_to_buffer(encoder, surface, WGPUTextureAspect_All,
-                          r->readback_buffer, 0, main_row, scaled_w, scaled_h);
-    nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_1);
-    pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_SURFACE_DOWN, false);
+        if (!job->converted) {
+            continue;
+        }
+        /* Submits any direct copies still in the encoder, then this pack. */
+        pgraph_wgpu_record_converted_download(pg, job->surface,
+                                              r->readback_buffer, job->offset);
+        recorded_direct = false;
+    }
+
+    if (recorded_direct) {
+        nv2a_profile_inc_counter(NV2A_PROF_QUEUE_SUBMIT_1);
+        pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_SURFACE_DOWN, false);
+    }
 
     const uint8_t *mapped =
-        pgraph_wgpu_read_buffer(r, r->readback_buffer, total_size);
-    if (!mapped) {
-        return;
+        pgraph_wgpu_read_buffer(r, r->readback_buffer, cursor);
+    if (mapped) {
+        for (guint i = 0; i < jobs->len; i++) {
+            SurfaceDownload *job = &g_array_index(jobs, SurfaceDownload, i);
+            SurfaceBinding *surface = job->surface;
+            uint8_t *out = job->pixels;
+            g_autofree uint8_t *swizzle_buf = NULL;
+
+            if (surface->swizzle) {
+                swizzle_buf = g_malloc(surface->size);
+                out = swizzle_buf;
+            }
+            if (job->converted) {
+                uint32_t bpp = surface->fmt.bytes_per_pixel;
+                for (unsigned int y = 0; y < surface->height; y++) {
+                    memcpy(out + (size_t)y * surface->pitch,
+                           mapped + job->offset + (uint64_t)y * job->src_pitch,
+                           (size_t)surface->width * bpp);
+                }
+            } else {
+                downsample_nearest(out, surface->pitch, mapped + job->offset,
+                                   job->src_pitch, surface->width,
+                                   surface->height, job->scale,
+                                   surface->host_fmt.host_bytes_per_pixel);
+            }
+            if (surface->swizzle) {
+                swizzle_rect(swizzle_buf, surface->width, surface->height,
+                             job->pixels, surface->pitch,
+                             surface->fmt.bytes_per_pixel);
+                nv2a_profile_inc_counter(NV2A_PROF_SURF_SWIZZLE);
+            }
+        }
+        wgpuBufferUnmap(r->readback_buffer);
     }
 
-    uint8_t *out = pixels;
-    g_autofree uint8_t *swizzle_buf = NULL;
-    unsigned int out_pitch = surface->pitch;
-    if (surface->swizzle) {
-        swizzle_buf = g_malloc(surface->size);
-        out = swizzle_buf;
-    }
+    for (guint i = 0; i < jobs->len; i++) {
+        SurfaceBinding *surface =
+            g_array_index(jobs, SurfaceDownload, i).surface;
+        hwaddr bytes = surface->pitch * surface->height;
 
-    downsample_nearest(out, out_pitch, mapped, main_row, surface->width,
-                       surface->height, scale, main_bpp);
-
-    wgpuBufferUnmap(r->readback_buffer);
-    if (surface->swizzle) {
-        swizzle_rect(swizzle_buf, surface->width, surface->height, pixels,
-                     surface->pitch, surface->fmt.bytes_per_pixel);
-        nv2a_profile_inc_counter(NV2A_PROF_SURF_SWIZZLE);
+        memory_region_set_client_dirty(d->vram, surface->vram_addr, bytes,
+                                       DIRTY_MEMORY_VGA);
+        memory_region_set_client_dirty(d->vram, surface->vram_addr, bytes,
+                                       DIRTY_MEMORY_NV2A_TEX);
+        surface->download_pending = false;
+        surface->draw_dirty = false;
     }
 }
 
@@ -290,17 +409,7 @@ static void download_surface(NV2AState *d, SurfaceBinding *surface, bool force)
         return;
     }
 
-    download_surface_to_buffer(d, surface, d->vram_ptr + surface->vram_addr);
-
-    memory_region_set_client_dirty(d->vram, surface->vram_addr,
-                                   surface->pitch * surface->height,
-                                   DIRTY_MEMORY_VGA);
-    memory_region_set_client_dirty(d->vram, surface->vram_addr,
-                                   surface->pitch * surface->height,
-                                   DIRTY_MEMORY_NV2A_TEX);
-
-    surface->download_pending = false;
-    surface->draw_dirty = false;
+    download_surface_list(d, &surface, 1);
 }
 
 void pgraph_wgpu_wait_for_surface_download(SurfaceBinding *surface)
@@ -322,11 +431,15 @@ void pgraph_wgpu_wait_for_surface_download(SurfaceBinding *surface)
 void pgraph_wgpu_process_pending_downloads(NV2AState *d)
 {
     PGRAPHWgpuState *r = d->pgraph.wgpu_renderer_state;
+    g_autoptr(GPtrArray) list = g_ptr_array_new();
     SurfaceBinding *surface;
 
     QTAILQ_FOREACH (surface, &r->surfaces, entry) {
-        download_surface(d, surface, false);
+        if (surface->download_pending) {
+            g_ptr_array_add(list, surface);
+        }
     }
+    download_surface_list(d, (SurfaceBinding **)list->pdata, list->len);
 
     qatomic_set(&r->downloads_pending, false);
     qemu_event_set(&r->downloads_complete);
@@ -335,11 +448,15 @@ void pgraph_wgpu_process_pending_downloads(NV2AState *d)
 void pgraph_wgpu_download_dirty_surfaces(NV2AState *d)
 {
     PGRAPHWgpuState *r = d->pgraph.wgpu_renderer_state;
+    g_autoptr(GPtrArray) list = g_ptr_array_new();
     SurfaceBinding *surface;
 
     QTAILQ_FOREACH (surface, &r->surfaces, entry) {
-        pgraph_wgpu_surface_download_if_dirty(d, surface);
+        if (surface->draw_dirty) {
+            g_ptr_array_add(list, surface);
+        }
     }
+    download_surface_list(d, (SurfaceBinding **)list->pdata, list->len);
 
     qatomic_set(&r->download_dirty_surfaces_pending, false);
     qemu_event_set(&r->dirty_surfaces_download_complete);
@@ -472,13 +589,22 @@ static void invalidate_overlapping_surfaces(NV2AState *d,
 {
     PGRAPHWgpuState *r = d->pgraph.wgpu_renderer_state;
 
+    g_autoptr(GPtrArray) list = g_ptr_array_new();
     SurfaceBinding *other_surface, *next_surface;
+
+    QTAILQ_FOREACH (other_surface, &r->surfaces, entry) {
+        if (check_surfaces_overlap(surface, other_surface) &&
+            other_surface->draw_dirty) {
+            g_ptr_array_add(list, other_surface);
+        }
+    }
+    download_surface_list(d, (SurfaceBinding **)list->pdata, list->len);
+
     QTAILQ_FOREACH_SAFE (other_surface, &r->surfaces, entry, next_surface) {
         if (check_surfaces_overlap(surface, other_surface)) {
             trace_nv2a_pgraph_surface_evict_overlapping(
                 other_surface->vram_addr, other_surface->width,
                 other_surface->height, other_surface->pitch);
-            pgraph_wgpu_surface_download_if_dirty(d, other_surface);
             invalidate_surface(d, other_surface);
         }
     }
@@ -616,12 +742,21 @@ static void expire_old_surfaces(NV2AState *d)
 {
     PGRAPHWgpuState *r = d->pgraph.wgpu_renderer_state;
 
+    g_autoptr(GPtrArray) list = g_ptr_array_new();
     SurfaceBinding *s, *next;
+
+    QTAILQ_FOREACH (s, &r->surfaces, entry) {
+        int last_used = d->pgraph.frame_time - s->frame_time;
+        if (last_used >= max_surface_frame_time_delta && s->draw_dirty) {
+            g_ptr_array_add(list, s);
+        }
+    }
+    download_surface_list(d, (SurfaceBinding **)list->pdata, list->len);
+
     QTAILQ_FOREACH_SAFE (s, &r->surfaces, entry, next) {
         int last_used = d->pgraph.frame_time - s->frame_time;
         if (last_used >= max_surface_frame_time_delta) {
             trace_nv2a_pgraph_surface_evict_reason("old", s->vram_addr);
-            pgraph_wgpu_surface_download_if_dirty(d, s);
             invalidate_surface(d, s);
         }
     }
@@ -1230,9 +1365,17 @@ void pgraph_wgpu_surface_flush(NV2AState *d)
     unbind_surface(d, true);
     unbind_surface(d, false);
 
+    g_autoptr(GPtrArray) list = g_ptr_array_new();
     SurfaceBinding *s, *next;
+
+    QTAILQ_FOREACH (s, &r->surfaces, entry) {
+        if (s->draw_dirty) {
+            g_ptr_array_add(list, s);
+        }
+    }
+    download_surface_list(d, (SurfaceBinding **)list->pdata, list->len);
+
     QTAILQ_FOREACH_SAFE (s, &r->surfaces, entry, next) {
-        pgraph_wgpu_surface_download_if_dirty(d, s);
         invalidate_surface(d, s);
     }
     prune_invalid_surfaces(r, 0);

@@ -387,8 +387,17 @@ SurfaceBinding *pgraph_wgpu_surface_get(NV2AState *d, hwaddr addr);
 SurfaceBinding *pgraph_wgpu_surface_get_within(NV2AState *d, hwaddr addr);
 void pgraph_wgpu_wait_for_surface_download(SurfaceBinding *surface);
 void pgraph_wgpu_download_dirty_surfaces(NV2AState *d);
+typedef struct WgpuMemoryRange {
+    hwaddr addr;
+    hwaddr size;
+} WgpuMemoryRange;
+
 void pgraph_wgpu_download_surfaces_in_range_if_dirty(PGRAPHState *pg,
                                                      hwaddr start, hwaddr size);
+/* One readback for every draw_dirty surface that overlaps any range. */
+void pgraph_wgpu_download_surfaces_covering(PGRAPHState *pg,
+                                            const WgpuMemoryRange *ranges,
+                                            int count);
 void pgraph_wgpu_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
                                      bool force);
 void pgraph_wgpu_surface_update(NV2AState *d, bool upload, bool color_write,
@@ -421,6 +430,15 @@ void pgraph_wgpu_finalize_surface_compute(PGRAPHWgpuState *r);
 void pgraph_wgpu_pack_converted_surface(PGRAPHState *pg,
                                         SurfaceBinding *surface, uint8_t *dst,
                                         unsigned int pitch);
+/* Byte size of a converted download, and the GPU row stride. */
+void pgraph_wgpu_converted_download_layout(const SurfaceBinding *surface,
+                                           uint32_t *stride, uint64_t *bytes);
+/* Pack into `dst` at `offset` and submit. Does not map. */
+void pgraph_wgpu_record_converted_download(PGRAPHState *pg,
+                                           SurfaceBinding *surface,
+                                           WGPUBuffer dst, uint64_t offset);
+/* Keep the pack storage buffer large enough for every download in a batch. */
+void pgraph_wgpu_reserve_pack_output(PGRAPHWgpuState *r, uint64_t size);
 void pgraph_wgpu_unpack_converted_surface(PGRAPHState *pg,
                                           SurfaceBinding *surface,
                                           const uint8_t *src,

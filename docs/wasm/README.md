@@ -51,7 +51,9 @@ What exists:
   is not drawn. Dawn's compiled pipelines are stored in
   `webgpu-pipeline-cache` under the xemu base path. A draw waits for its
   pipeline. Blend color and the stencil reference are dynamic state, so
-  they do not create another pipeline.
+  they do not create another pipeline. Surface readbacks are coalesced:
+  several dirty surfaces are copied in one submit and mapped once, and
+  only a surface a draw has dirtied is read back.
 
 What blocks an xemu WASM build today:
 

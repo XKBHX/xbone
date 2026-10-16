@@ -87,6 +87,52 @@ static void reset_attributes(PGRAPHState *pg)
     memset(&r->vertex_layout, 0, sizeof(r->vertex_layout));
 }
 
+static int compare_ranges(const void *a, const void *b)
+{
+    const WgpuMemoryRange *ra = a;
+    const WgpuMemoryRange *rb = b;
+
+    if (ra->addr < rb->addr) {
+        return -1;
+    }
+    if (ra->addr > rb->addr) {
+        return 1;
+    }
+    return 0;
+}
+
+/* Page-align, then merge overlapping ranges so one readback covers them. */
+static int merge_vertex_ranges(WgpuMemoryRange *ranges, int count)
+{
+    int merged;
+
+    if (count <= 0) {
+        return 0;
+    }
+    for (int i = 0; i < count; i++) {
+        hwaddr end = ranges[i].addr + ranges[i].size;
+
+        ranges[i].addr &= TARGET_PAGE_MASK;
+        end = ROUND_UP(end, TARGET_PAGE_SIZE);
+        ranges[i].size = end - ranges[i].addr;
+    }
+    qsort(ranges, count, sizeof(ranges[0]), compare_ranges);
+
+    merged = 1;
+    for (int i = 1; i < count; i++) {
+        WgpuMemoryRange *prev = &ranges[merged - 1];
+        hwaddr prev_end = prev->addr + prev->size;
+        hwaddr end = ranges[i].addr + ranges[i].size;
+
+        if (ranges[i].addr <= prev_end) {
+            prev->size = MAX(prev_end, end) - prev->addr;
+        } else {
+            ranges[merged++] = ranges[i];
+        }
+    }
+    return merged;
+}
+
 bool pgraph_wgpu_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
                                         unsigned int max_element,
                                         bool inline_data,
@@ -98,6 +144,36 @@ bool pgraph_wgpu_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
     unsigned int num_elements = max_element - min_element + 1;
 
     reset_attributes(pg);
+
+    if (!inline_data) {
+        WgpuMemoryRange ranges[NV2A_VERTEXSHADER_ATTRIBUTES];
+        int nranges = 0;
+
+        for (int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
+            VertexAttribute *attr = &pg->vertex_attributes[i];
+            hwaddr dma_len;
+            uint8_t *attr_data;
+            hwaddr start;
+
+            if (!attr->count) {
+                continue;
+            }
+            attr_data = (uint8_t *)nv_dma_map(
+                d, attr->dma_select ? pg->dma_vertex_b : pg->dma_vertex_a,
+                &dma_len);
+            assert(attr->offset < dma_len);
+            start = attr_data + attr->offset - d->vram_ptr +
+                    min_element * attr->stride;
+            ranges[nranges].addr = start;
+            ranges[nranges].size = num_elements * MAX(attr->stride, 1);
+            nranges++;
+        }
+        nranges = merge_vertex_ranges(ranges, nranges);
+        /* A draw_dirty surface under these vertices is read back once.
+         * DIRTY_MEMORY_NV2A is a CPU write, and this path already reads
+         * RAM. Semaphore release downloads before the semaphore store. */
+        pgraph_wgpu_download_surfaces_covering(pg, ranges, nranges);
+    }
 
     for (int i = 0; i < NV2A_VERTEXSHADER_ATTRIBUTES; i++) {
         VertexAttribute *attr = &pg->vertex_attributes[i];
@@ -122,9 +198,6 @@ bool pgraph_wgpu_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
             assert(attr->offset < dma_len);
             data = attr_data + attr->offset;
             stride = attr->stride;
-            hwaddr start = data - d->vram_ptr + min_element * stride;
-            pgraph_wgpu_download_surfaces_in_range_if_dirty(
-                pg, start, num_elements * MAX(stride, 1));
         }
 
         if (!stride) {

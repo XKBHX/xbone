@@ -121,7 +121,7 @@ Implement this as a standalone, unit-testable module
 | NV2A need | WebGPU | Strategy |
 | --- | --- | --- |
 | ZPASS pixel counts | occlusion query sets. The spec only guarantees zero vs. non-zero | Use `WGPUQueryType_Occlusion`. Native Dawn backends generally report real sample counts; verify this per backend in the phase 2 tests. Document the gap for implementations where results are binary. |
-| Synchronous surface download (CPU reads, semaphores, save states) | `wgpuBufferMapAsync` only | Natively: `wgpuInstanceWaitAny` with a timeout. Browser: the wait needs Asyncify (already enabled by `configs/meson/emscripten.txt`) or JSPI to yield to the worker's event loop. Batch and defer downloads like `downloads_pending` in Vulkan, so each frame pays for at most a few waits. |
+| Synchronous surface download (CPU reads, semaphores, save states) | `wgpuBufferMapAsync` only | Natively: `wgpuInstanceWaitAny` with a timeout. Browser: the wait needs Asyncify (already enabled by `configs/meson/emscripten.txt`) or JSPI to yield to the worker's event loop. Phase 4 step 2 batches surfaces that are downloaded together into one submit and one map, the same idea as `downloads_pending` in Vulkan. |
 
 ## 4. Proposed code layout
 
@@ -176,7 +176,7 @@ Each phase ends with a demonstrable exit criterion.
 | 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 originally needed a Dawn built with the SPIR-V reader. Phase 3 step 3 removed that requirement. |
 | 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite, read back into a GL texture for the existing UI. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
 | 3. WGSL generator | Steps 1–3 are done. Step 1 translates draw shaders from the WebGPU-targeted GLSL. Step 2 did not need new shaders: the pack and unpack kernels and the display composite were already WGSL in phase 2. Step 3 creates every shader module with `WGPUShaderSourceWGSL`. The WebGPU backend no longer links glslang and does not request `ShaderSourceSPIRV`. glslang remains for Vulkan. A translation or Tint failure skips that draw. |
-| 4. Performance | Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline, so compilation does not drop geometry. Blend color and the stencil reference stay dynamic and are not part of the pipeline key. Steps 2–5 are not started. Frame times have not been compared with Vulkan. |
+| 4. Performance | Steps 1–2 are done. Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline. Blend color and the stencil reference stay dynamic. Step 2 coalesces surface readbacks into one submit and one map, and reads a surface back only when a draw has made it dirty and a consumer needs RAM. Steps 3–5 are not started. Frame times have not been compared with Vulkan. |
 | 5. WebGPU UI and browser | Not started. |
 
 Phase 0 notes:
@@ -303,8 +303,9 @@ Phase 1 notes (step 4, draw path):
   - `S32K` is converted to float;
   - `CMP` stays `sint32` and is decoded in the shader.
 
-  Surfaces that overlap the vertex data are downloaded first. The VRAM
-  mirror with dirty tracking moves to phase 4.
+  Surfaces that overlap the vertex data are downloaded first, in one
+  readback (phase 4 step 2). The VRAM mirror with dirty tracking is phase 4
+  step 3.
 - Phase 2 primitive expansion was pulled forward, because WebGPU has no
   fans, quads or polygons. `prim.c` turns fans, polygons, quads, quad
   strips and line loops into index lists. Triangle and line lists, strips,
@@ -861,6 +862,22 @@ Phase 4 notes (step 1, pipeline cache):
   The in-memory map remains the `PipelineKey` hash table.
 - On macOS arm64, a boot of nxdk_pgraph_tests wrote the cache (102 files
   on that run) and a second boot loaded it with no Dawn hash failure.
+
+Phase 4 notes (step 2, fewer readback stalls):
+
+- Dirty surfaces that are downloaded together share one readback buffer.
+  Direct copies are recorded in one command encoder. A 16-bit or depth
+  surface is packed with the compute kernel into that same buffer. The CPU
+  maps the buffer once and writes every surface back to RAM.
+- Vertex ranges are merged before that readback. A surface is read back
+  only when `draw_dirty` is set and the range overlaps it: a vertex fetch,
+  a texture upload, PVIDEO, a CPU read, or eviction. `DIRTY_MEMORY_NV2A`
+  marks a CPU write, which the vertex path reads from RAM without a
+  readback. Semaphore release still downloads dirty surfaces in
+  `surface_update` before the semaphore is stored.
+- Save state, flush, and overlapping eviction use the same batch. The
+  display composite still maps its own buffer every present. Removing that
+  readback is step 5.
 
 **Exit**: frame times within about 20% of Vulkan on the same machine for the
 curated titles.
