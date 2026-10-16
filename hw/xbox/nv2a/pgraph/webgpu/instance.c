@@ -200,6 +200,60 @@ static void device_lost_callback(WGPUDevice const *device,
             (int)message.length, message.data);
 }
 
+/*
+ * Sharing is optional. Depth32FloatStencil8 stays required. The fence
+ * feature is requested with the memory feature because EndAccess rejects
+ * the texture without it.
+ */
+static void add_shared_display_features(PGRAPHWgpuState *r, WGPUAdapter adapter,
+                                        WGPUFeatureName *features,
+                                        size_t *count)
+{
+#if defined(CONFIG_OPENGL) && !defined(__EMSCRIPTEN__)
+    bool have_memory = false;
+    bool have_fence = false;
+    WGPUFeatureName memory_feature = 0;
+    WGPUFeatureName fence_feature = 0;
+
+#ifdef __APPLE__
+    memory_feature = WGPUFeatureName_SharedTextureMemoryIOSurface;
+    fence_feature = WGPUFeatureName_SharedFenceMTLSharedEvent;
+    have_memory = true;
+    have_fence = true;
+#elif defined(__linux__)
+    memory_feature = WGPUFeatureName_SharedTextureMemoryDmaBuf;
+    have_memory = true;
+    if (wgpuAdapterHasFeature(adapter, WGPUFeatureName_SharedFenceSyncFD)) {
+        fence_feature = WGPUFeatureName_SharedFenceSyncFD;
+        have_fence = true;
+    } else if (wgpuAdapterHasFeature(
+                   adapter, WGPUFeatureName_SharedFenceVkSemaphoreOpaqueFD)) {
+        fence_feature = WGPUFeatureName_SharedFenceVkSemaphoreOpaqueFD;
+        have_fence = true;
+    }
+#elif defined(_WIN32)
+    memory_feature = WGPUFeatureName_SharedTextureMemoryDXGISharedHandle;
+    fence_feature = WGPUFeatureName_SharedFenceDXGISharedHandle;
+    have_memory = true;
+    have_fence = true;
+#endif
+
+    if (!have_memory || !have_fence ||
+        !wgpuAdapterHasFeature(adapter, memory_feature) ||
+        !wgpuAdapterHasFeature(adapter, fence_feature)) {
+        return;
+    }
+    features[(*count)++] = memory_feature;
+    features[(*count)++] = fence_feature;
+    r->shared_display = true;
+#else
+    (void)r;
+    (void)adapter;
+    (void)features;
+    (void)count;
+#endif
+}
+
 static WGPUDevice request_device(PGRAPHWgpuState *r, Error **errp)
 {
     WGPUInstance instance = r->instance;
@@ -209,7 +263,7 @@ static WGPUDevice request_device(PGRAPHWgpuState *r, Error **errp)
     WGPURequestDeviceCallbackInfo callback =
         WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
     WGPUFutureWaitInfo wait_info = WGPU_FUTURE_WAIT_INFO_INIT;
-    WGPUFeatureName required_features[3] = {
+    WGPUFeatureName required_features[8] = {
         WGPUFeatureName_Depth32FloatStencil8,
     };
     size_t num_required_features = 1;
@@ -233,6 +287,8 @@ static WGPUDevice request_device(PGRAPHWgpuState *r, Error **errp)
         required_features[num_required_features++] =
             WGPUFeatureName_Float32Filterable;
     }
+    add_shared_display_features(r, adapter, required_features,
+                                &num_required_features);
     descriptor.requiredFeatureCount = num_required_features;
     descriptor.requiredFeatures = required_features;
     descriptor.uncapturedErrorCallbackInfo.callback = uncaptured_error_callback;

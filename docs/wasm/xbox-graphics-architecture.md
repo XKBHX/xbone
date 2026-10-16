@@ -246,6 +246,12 @@ Backend use:
     `glImportMemoryFdEXT`/`Win32HandleEXT`. **Without external memory**
     (`HAVE_EXTERNAL_MEMORY == 0`), it downloads the surface into guest RAM and
     returns `0`.
+  - **WebGPU backend**: renders that composite in `webgpu/display.c`. When
+    the device can import shared memory, the image is an IOSurface (macOS),
+    a dma-buf (Linux), or a DXGI shared handle (Windows). macOS blits the
+    IOSurface from a rectangle texture to the 2D texture the UI samples.
+    Otherwise the composite is read back and uploaded with `glTexImage2D`.
+    Without OpenGL it downloads the surface and returns `0`.
   - A return value of `0` makes the UI use the **VGA fallback**. It uploads
     the scanout region of guest RAM as a GL texture
     (`xb_surface_gl_create_texture`).

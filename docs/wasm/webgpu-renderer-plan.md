@@ -38,7 +38,7 @@ Non-goals for this plan:
 | Threading | The device is created and used **only on the PFIFO thread**, like the Vulkan backend | Matches the existing locking model. In the browser, WebGPU objects can't move between workers, so this is mandatory there. |
 | Shader language | **Bring-up only**: reuse the GLSL generator, compile to SPIR-V with the existing glslang code, and feed SPIR-V to Dawn natively. **Then a native WGSL generator** (phase 3), built before the performance work | Gets pixels quickly while keeping the long-term path free of translation layers. The browser only accepts WGSL, and no Tint has to ship inside the WASM binary. |
 | Primitives that need geometry shaders | CPU index rewriting, plus instanced quads for point sprites | WebGPU has no geometry stage, no quads, no fans, and no polygon mode. |
-| Display (native) | Composite on the GPU, read the image back, and upload it to a GL texture on the UI thread | There is no shared-memory import yet (phase 4). The UI already displays a returned GL texture, so it needs no changes. Without OpenGL, fall back to the VGA read of guest RAM. |
+| Display (native) | Composite on the GPU into memory GL samples. Read the image back only when that share cannot be created | macOS uses an IOSurface, Linux a dma-buf, and Windows a DXGI shared handle. The UI already displays a returned GL texture, so it needs no changes. Without OpenGL, fall back to the VGA read of guest RAM. |
 | Display and UI (browser) | **The UI moves to WebGPU.** One device and one canvas (`OffscreenCanvas`), both owned by the PFIFO worker. ImGui draw data is built on the UI thread and handed to the PFIFO thread, which records the UI pass after the game frame | Avoids WebGPU↔WebGL interop, which browsers don't offer, and the game frame never leaves the GPU. WebGPU objects can't cross workers, so the UI pass has to be recorded on the device's thread. |
 | Native CI dependency | **Prebuilt Dawn**, pinned by version and checksum | Building Dawn from source makes CI much slower. A pinned prebuilt keeps builds reproducible. |
 
@@ -160,7 +160,7 @@ How the `PGRAPHRenderer` ops map to the Vulkan implementation they model:
 | `flip_stall` | `command.c` finish + submit |
 | `process_pending` | deferred downloads, display sync and flush (`pgraph_vk_process_pending`) |
 | `pre_savevm_*` / `pre_shutdown_*` | download every dirty surface and signal the `QemuEvent` |
-| `get_framebuffer_surface` | native: composite, read back, return a GL texture. No color surface, or no OpenGL: download and return `0`. Browser canvas present is phase 5 |
+| `get_framebuffer_surface` | native: composite into a GL texture, shared when the platform allows it, otherwise read back. No color surface, or no OpenGL: download and return `0`. Browser canvas present is phase 5 |
 | `set/get_surface_scale_factor` | `surface.c` |
 | `get_gpu_properties` | `instance.c` (constant winding, since there is no geometry shader) |
 
@@ -174,9 +174,9 @@ Each phase ends with a demonstrable exit criterion.
 | --- | --- |
 | 0. Groundwork | Done. Natively on macOS arm64 (Dawn Metal backend, Apple M1 Pro), `display.renderer = "WEBGPU"` creates a device and boots with a black screen and no asserts. Not yet run on Linux or Windows. |
 | 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 originally needed a Dawn built with the SPIR-V reader. Phase 3 step 3 removed that requirement. |
-| 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite, read back into a GL texture for the existing UI. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
+| 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite. Phase 4 step 5 shares that image with GL; the readback remains the fallback. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
 | 3. WGSL generator | Steps 1–3 are done. Step 1 translates draw shaders from the WebGPU-targeted GLSL. Step 2 did not need new shaders: the pack and unpack kernels and the display composite were already WGSL in phase 2. Step 3 creates every shader module with `WGPUShaderSourceWGSL`. The WebGPU backend no longer links glslang and does not request `ShaderSourceSPIRV`. glslang remains for Vulkan. A translation or Tint failure skips that draw. |
-| 4. Performance | Steps 1–4 are done. Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline. Blend color and the stencil reference stay dynamic. Step 2 coalesces surface readbacks into one submit and one map, and reads a surface back only when a draw has made it dirty and a consumer needs RAM. Step 3 caches texture bind groups and keeps a guest-RAM vertex buffer, uploaded in 64 KiB blocks. Attributes WebGPU cannot fetch stay on the CPU packer. Step 4 expands packed texture texels in a compute shader. Step 5 is not started. Frame times have not been compared with Vulkan. |
+| 4. Performance | Steps 1–5 are done. Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline. Blend color and the stencil reference stay dynamic. Step 2 coalesces surface readbacks into one submit and one map, and reads a surface back only when a draw has made it dirty and a consumer needs RAM. Step 3 caches texture bind groups and keeps a guest-RAM vertex buffer, uploaded in 64 KiB blocks. Attributes WebGPU cannot fetch stay on the CPU packer. Step 4 expands packed texture texels in a compute shader. Step 5 imports the display composite into the GL texture the UI already samples. Frame times have not been compared with Vulkan. |
 | 5. WebGPU UI and browser | Not started. |
 
 Phase 0 notes:
@@ -632,12 +632,12 @@ Phase 2 notes (step 6, display composite):
   not stale.
 - The overlay sample is taken in uniform control flow. WGSL rejects
   `textureSample` under the per-pixel clip test.
-- There is no GL memory import yet. That is phase 4. `get_framebuffer_surface`
-  asks the PFIFO thread to render the composite and read it back, then
-  uploads the pixels with `glTexImage2D` on the UI thread, which already has
-  the GL context current. The UI is unchanged. If there is no colour surface,
-  the readback fails, or the build has no OpenGL, it still returns 0 and the
-  VGA path reads guest RAM.
+- `get_framebuffer_surface` asks the PFIFO thread to render the composite.
+  Phase 4 step 5 shares that image with GL when the device can import it.
+  This readback remains the fallback: the UI thread, which already has the
+  GL context current, uploads the pixels with `glTexImage2D`. The UI is
+  unchanged. If there is no colour surface, the readback fails, or the build
+  has no OpenGL, it still returns 0 and the VGA path reads guest RAM.
 - The GL texture name belongs to the UI context. Shutdown retires it and the
   next present on that context deletes it.
 - Checked by compiling the display shader with Tint and the renderer against
@@ -881,8 +881,8 @@ Phase 4 notes (step 2, fewer readback stalls):
   readback. Semaphore release still downloads dirty surfaces in
   `surface_update` before the semaphore is stored.
 - Save state, flush, and overlapping eviction use the same batch. The
-  display composite still maps its own buffer every present. Removing that
-  readback is step 5.
+  display composite is shared with GL when the device can import it
+  (step 5). The map remains when that import fails.
 
 Phase 4 notes (step 3, bind groups and the RAM mirror):
 
@@ -925,6 +925,41 @@ Phase 4 notes (step 4, texture upload conversion):
   including `rgba16float` and `rgba32float`, odd pitches, a component
   swizzle, and a 3D extent. A boot of nxdk_pgraph_tests showed no
   validation errors.
+
+Phase 4 notes (step 5, shared display):
+
+- The composite is rendered into an OS image Dawn imports with
+  `SharedTextureMemory`, and the existing UI samples that memory as a GL
+  texture. The CPU readback and `glTexImage2D` remain when the share cannot
+  be created or GL cannot bind it. They are the only path in the browser.
+  No colour surface, or no OpenGL, still returns 0.
+- The memory feature is requested only together with the fence `EndAccess`
+  requires, and only if the adapter has both. That is IOSurface plus
+  `SharedFenceMTLSharedEvent`, a dma-buf plus a sync FD or an opaque Vulkan
+  FD, or a DXGI shared handle plus `SharedFenceDXGISharedHandle`. Device
+  creation does not require them.
+- The PFIFO thread calls `BeginAccess`, records the display pass, submits,
+  calls `EndAccess`, and waits until the queue is idle before waking the UI.
+  The next frame cannot begin until that UI present has returned.
+- On macOS the image is an IOSurface in `kCVPixelFormatType_32RGBA`, which
+  Dawn maps to `rgba8unorm`. `CGLTexImageIOSurface2D` accepts
+  `GL_TEXTURE_RECTANGLE` with `GL_BGRA` and `GL_UNSIGNED_INT_8_8_8_8_REV`.
+  On little-endian that is the byte order R, G, B, A. A rectangle texture
+  cannot be sampled with the UI's normalized coordinates, so it is blitted
+  to a `GL_TEXTURE_2D`. The WGSL Y flip is unchanged. One frame of that 2D
+  texture matched a `CopySrc` readback of the same image at 640×480, so the
+  shared picture is not inverted. The comparison was removed.
+- Linux creates a linear dumb buffer on `/dev/dri/renderD128` with
+  `DRM_FORMAT_ABGR8888` and imports the dma-buf. GL uses
+  `glImportMemoryFdEXT` and `glTexStorageMem2DEXT`, as `vk/display.c` does.
+  A pitch other than `width * 4` falls back to the readback. This path was
+  not booted.
+- Windows creates a D3D11 texture with `D3D11_RESOURCE_MISC_SHARED` and
+  imports `IDXGIResource::GetSharedHandle`. The texture owns that handle.
+  GL uses `glImportMemoryWin32HandleEXT` with
+  `GL_HANDLE_TYPE_D3D11_IMAGE_KMT_EXT`. This path was not booted.
+- On macOS arm64 a boot of nxdk_pgraph_tests logged that the display image
+  is shared with GL, and there were no validation errors.
 
 **Exit**: frame times within about 20% of Vulkan on the same machine for the
 curated titles.
