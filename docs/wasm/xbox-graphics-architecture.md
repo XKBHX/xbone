@@ -195,8 +195,9 @@ cache** (`gl/surface.c`, `vk/surface.c`). Each entry maps a
   (`downloads_pending`, `download_dirty_surfaces_pending`) and does them in
   `process_pending`, so the PFIFO thread doesn't stall on every draw.
   WebGPU does the same: dirty surfaces in one batch share one submit and
-  one `wgpuBufferMapAsync`. WebGPU also keeps a guest-RAM vertex buffer and
-  reuses texture bind groups for a repeated texture and sampler set.
+  one `wgpuBufferMapAsync`. WebGPU also keeps a guest-RAM vertex buffer,
+  reuses texture bind groups for a repeated texture and sampler set, and
+  expands packed texture texels in a compute shader at upload.
 
 ### 3.5 Shader generation (`hw/xbox/nv2a/pgraph/glsl/`)
 

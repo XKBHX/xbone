@@ -82,7 +82,7 @@ Implement this as a standalone, unit-testable module
 
 | NV2A need | WebGPU | Strategy |
 | --- | --- | --- |
-| `R5G6B5`, `A1R5G5B5`, `A4R4G4B4` | no packed 16-bit formats | Expand to `rgba8unorm` on upload. Start on the CPU in `pgraph_convert_texture_data`, then move to a compute shader. |
+| `R5G6B5`, `A1R5G5B5`, `A4R4G4B4` | no packed 16-bit formats | Expand to `rgba8unorm` in the texture-upload compute shader (phase 4 step 4). The expansion replicates bits, matching `decode_texels`. |
 | `R8G8B8_SNORM` | no 3-component formats | `rgba8snorm`. |
 | `R16_UNORM` | optional feature | Use `r16unorm` when available. Otherwise use `r16uint` and normalize in the shader, or convert to `r32float`. |
 | Component swizzle (`VkComponentMapping` in `vk/constants.h`) | no view swizzle in core | Bake the swizzle into the fragment shader (the shader key already depends on texture state), or apply it during upload conversion. |
@@ -176,7 +176,7 @@ Each phase ends with a demonstrable exit criterion.
 | 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 originally needed a Dawn built with the SPIR-V reader. Phase 3 step 3 removed that requirement. |
 | 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite, read back into a GL texture for the existing UI. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
 | 3. WGSL generator | Steps 1–3 are done. Step 1 translates draw shaders from the WebGPU-targeted GLSL. Step 2 did not need new shaders: the pack and unpack kernels and the display composite were already WGSL in phase 2. Step 3 creates every shader module with `WGPUShaderSourceWGSL`. The WebGPU backend no longer links glslang and does not request `ShaderSourceSPIRV`. glslang remains for Vulkan. A translation or Tint failure skips that draw. |
-| 4. Performance | Steps 1–3 are done. Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline. Blend color and the stencil reference stay dynamic. Step 2 coalesces surface readbacks into one submit and one map, and reads a surface back only when a draw has made it dirty and a consumer needs RAM. Step 3 caches texture bind groups and keeps a guest-RAM vertex buffer, uploaded in 64 KiB blocks. Attributes WebGPU cannot fetch stay on the CPU packer. Steps 4–5 are not started. Frame times have not been compared with Vulkan. |
+| 4. Performance | Steps 1–4 are done. Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline. Blend color and the stencil reference stay dynamic. Step 2 coalesces surface readbacks into one submit and one map, and reads a surface back only when a draw has made it dirty and a consumer needs RAM. Step 3 caches texture bind groups and keeps a guest-RAM vertex buffer, uploaded in 64 KiB blocks. Attributes WebGPU cannot fetch stay on the CPU packer. Step 4 expands packed texture texels in a compute shader. Step 5 is not started. Frame times have not been compared with Vulkan. |
 | 5. WebGPU UI and browser | Not started. |
 
 Phase 0 notes:
@@ -331,11 +331,12 @@ Phase 1 notes (step 5, textures):
   palette, filter, address mode and anisotropy. It uses the same
   `DIRTY_MEMORY_NV2A_TEX` page tracking with content hashing. The flush op
   marks every cached texture as possibly dirty, as in Vulkan.
-- Decoding runs on the CPU. The shared decoders in `pgraph/texture.c`
-  handle palette, YUV and `R6G5B5`, `s3tc_decompress_*` handles DXT1/3/5,
-  and `unswizzle_rect`/`unswizzle_box` handle swizzled 2D, cube and 3D
-  textures. Then `kelvin_color_format_wgpu_map` turns every format into a
-  core WebGPU format:
+- Palette, YUV, DXT and unswizzle stay on the CPU.
+  `pgraph_convert_texture_data` still expands palette, YUV and `R6G5B5`
+  (to 3-byte snorm) for every renderer. Per-texel expansion and the
+  component swizzle run in a compute shader (phase 4 step 4) and match
+  `decode_texels`. A level that is already in the host format is still
+  `wgpuQueueWriteTexture`.
   - `A8R8G8B8`, `I8`, `A8B8G8R8`, DXT and YUV are copied unchanged into
     `bgra8unorm` or `rgba8unorm`. The X8Y24 depth formats are copied
     unchanged into `r32uint`.
@@ -350,7 +351,9 @@ Phase 1 notes (step 5, textures):
     `float32-filterable` is available (requested at device creation), and
     `rgba16float` otherwise. Norm16 formats aren't used, because Dawn only
     makes them filterable with a Dawn-specific feature.
-- Uploads use `wgpuQueueWriteTexture`, one call per layer and mip level.
+- Expanded levels are decoded by the texture compute shader into a storage
+  buffer, then copied with `copyBufferToTexture`. Copy-compatible levels
+  still use `wgpuQueueWriteTexture`, one call per layer and mip level.
   Queue writes run before commands that haven't been submitted yet, so when
   a texture's contents change it gets a new `WGPUTexture`. The old one is
   only released, never written. Draws don't stall.
@@ -899,6 +902,29 @@ Phase 4 notes (step 3, bind groups and the RAM mirror):
   indexed point list. `S32K` and 3-component 8/16-bit attributes stay on
   the CPU packer, as do inline vertices. The shader still swizzles
   `UB_D3D` and decodes `CMP`.
+
+Phase 4 notes (step 4, texture upload conversion):
+
+- Packed texels are expanded by one WGSL compute shader, then copied into
+  the texture with `copyBufferToTexture`. The kernel matches `decode_texels`:
+  bit replication for `R5G6B5` and `A1R5G5B5`, `nibble * 0x11` for
+  `A4R4G4B4`, the component swizzle, snorm bytes with alpha `0x7f`, and
+  `R16` divided into `rgba32float` or `rgba16float`. Half values use the
+  same `frexp` / round-to-nearest-even path as `unorm_to_half`.
+- Levels that are already in the host format stay on
+  `wgpuQueueWriteTexture`. That includes DXT after `s3tc_decompress_*`,
+  palette and YUV after `pgraph_convert_texture_data`, and `A8R8G8B8`.
+  `R6G5B5` is still expanded to 3-byte snorm on the CPU, then the kernel
+  writes `rgba8snorm`. Unswizzle stays on the CPU.
+- The source is written with `wgpuQueueWriteBuffer`. The open encoder is
+  submitted first so that write does not replace bytes an earlier decode
+  in the same submit still reads. The copy is recorded before the draw
+  that samples the new texture. Rows are 256-byte aligned. One thread
+  handles one row.
+- On macOS arm64 the kernel matched `decode_texels` for every decode mode,
+  including `rgba16float` and `rgba32float`, odd pitches, a component
+  swizzle, and a 3D extent. A boot of nxdk_pgraph_tests showed no
+  validation errors.
 
 **Exit**: frame times within about 20% of Vulkan on the same machine for the
 curated titles.

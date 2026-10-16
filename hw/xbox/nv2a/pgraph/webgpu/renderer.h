@@ -290,6 +290,17 @@ typedef struct PGRAPHWgpuState {
     WGPUBuffer surface_compute_readback;
     uint64_t surface_compute_readback_size;
 
+    /* Expands packed texels on upload. Byte-identical copies do not use it. */
+    WGPUShaderModule texture_decode_module;
+    WGPUBindGroupLayout texture_decode_layout;
+    WGPUPipelineLayout texture_decode_pipeline_layout;
+    WGPUComputePipeline texture_decode_pipeline;
+    WGPUBuffer texture_decode_uniform;
+    WGPUBuffer texture_decode_src;
+    uint64_t texture_decode_src_size;
+    WGPUBuffer texture_decode_dst;
+    uint64_t texture_decode_dst_size;
+
     bool depth_clip_control;
     bool float32_filterable;
 
