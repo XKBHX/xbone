@@ -46,7 +46,8 @@ What exists:
   and the surface scale factor. The composite is read back and uploaded to
   a GL texture for the existing UI. Every shader module is WGSL. Draw
   shaders are translated from the GLSL generator. Pack, unpack, clears,
-  depth upload, and the display composite are written in WGSL. The WebGPU
+  depth upload, texture upload, and the display composite are written in
+  WGSL. The WebGPU
   backend does not link glslang. A shader the translator or Tint rejects
   is not drawn. Dawn's compiled pipelines are stored in
   `webgpu-pipeline-cache` under the xemu base path. A draw waits for its
@@ -56,7 +57,9 @@ What exists:
   only a surface a draw has dirtied is read back. Texture bind groups are
   cached by the views and samplers they name. A guest-RAM vertex buffer is
   uploaded in 64 KiB blocks and used when every attribute fits a core
-  vertex format. Other attributes are still packed on the CPU.
+  vertex format. Other attributes are still packed on the CPU. Packed
+  texture texels are expanded by a compute shader; palette, YUV, DXT and
+  unswizzle stay on the CPU.
 
 What blocks an xemu WASM build today:
 

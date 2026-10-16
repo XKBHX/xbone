@@ -116,6 +116,189 @@ static unsigned int get_decode_texel_size(WgpuTextureDecode decode)
     }
 }
 
+/* One dispatch covers the default maxComputeWorkgroupsPerDimension. A
+ * larger image uses another 256-byte uniform slot so queue writes of the
+ * params do not alias inside one submit. */
+#define TEXTURE_DECODE_ROWS_PER_DISPATCH (65535u * 64u)
+#define TEXTURE_DECODE_UNIFORM_SLOTS 16u
+#define TEXTURE_DECODE_UNIFORM_STRIDE 256u
+
+/* Matches decode_texels. Mode and swizzle numbers are the C enums. Bit
+ * expansion replicates bits; it is not the surface packer's rounding. */
+static const char texture_decode_wgsl[] =
+    "struct Params {\n"
+    "    width: u32,\n"
+    "    rows: u32,\n"
+    "    src_stride: u32,\n"
+    "    dst_stride: u32,\n"
+    "    src_bpp: u32,\n"
+    "    decode: u32,\n"
+    "    swizzle: u32,\n"
+    "    out_kind: u32,\n"
+    "    row_base: u32,\n"
+    "    pad0: u32,\n"
+    "    pad1: u32,\n"
+    "    pad2: u32,\n"
+    "}\n"
+    "struct Texel {\n"
+    "    c0: u32,\n"
+    "    c1: u32,\n"
+    "    c2: u32,\n"
+    "    c3: u32,\n"
+    "    one: u32,\n"
+    "}\n"
+    "@group(0) @binding(0) var<storage, read> src: array<u32>;\n"
+    "@group(0) @binding(1) var<storage, read_write> dst: array<u32>;\n"
+    "@group(0) @binding(2) var<uniform> params: Params;\n"
+    "fn load_byte(byte_off: u32) -> u32 {\n"
+    "    let word = byte_off / 4u;\n"
+    "    let shift = (byte_off % 4u) * 8u;\n"
+    "    return (src[word] >> shift) & 0xffu;\n"
+    "}\n"
+    "fn load_u16(byte_off: u32) -> u32 {\n"
+    "    return load_byte(byte_off) | (load_byte(byte_off + 1u) << 8u);\n"
+    "}\n"
+    "fn expand_bits(v: u32, bits: u32) -> u32 {\n"
+    "    return (v << (8u - bits)) | (v >> (2u * bits - 8u));\n"
+    "}\n"
+    "fn unorm_to_half(value: f32) -> u32 {\n"
+    "    if (value <= 0.0) { return 0u; }\n"
+    "    if (value >= 1.0) { return 0x3c00u; }\n"
+    "    let parts = frexp(value);\n"
+    "    var exponent = parts.exp + 14;\n"
+    "    if (exponent <= 0) {\n"
+    "        return u32(i32(round(value * 16777216.0)));\n"
+    "    }\n"
+    "    var mantissa = u32(i32(round((2.0 * parts.fract - 1.0) * 1024.0)));\n"
+    "    if (mantissa == 1024u) {\n"
+    "        mantissa = 0u;\n"
+    "        exponent = exponent + 1;\n"
+    "    }\n"
+    "    return (u32(exponent) << 10u) | mantissa;\n"
+    "}\n"
+    "fn decode_texel(byte_off: u32) -> Texel {\n"
+    "    var t: Texel;\n"
+    "    t.one = 0xffu;\n"
+    "    let mode = params.decode;\n"
+    "    if (mode == 1u) {\n"
+    "        t.c0 = load_byte(byte_off);\n"
+    "        t.c3 = 0xffu;\n"
+    "    } else if (mode == 2u) {\n"
+    "        t.c0 = load_byte(byte_off);\n"
+    "        t.c1 = load_byte(byte_off + 1u);\n"
+    "        t.c3 = 0xffu;\n"
+    "    } else if (mode == 3u) {\n"
+    "        let v = load_u16(byte_off);\n"
+    "        t.c0 = expand_bits((v >> 10u) & 0x1fu, 5u);\n"
+    "        t.c1 = expand_bits((v >> 5u) & 0x1fu, 5u);\n"
+    "        t.c2 = expand_bits(v & 0x1fu, 5u);\n"
+    "        if ((v & 0x8000u) != 0u) { t.c3 = 0xffu; }\n"
+    "    } else if (mode == 4u) {\n"
+    "        let v = load_u16(byte_off);\n"
+    "        t.c0 = expand_bits(v >> 11u, 5u);\n"
+    "        t.c1 = expand_bits((v >> 5u) & 0x3fu, 6u);\n"
+    "        t.c2 = expand_bits(v & 0x1fu, 5u);\n"
+    "        t.c3 = 0xffu;\n"
+    "    } else if (mode == 5u) {\n"
+    "        let v = load_u16(byte_off);\n"
+    "        t.c0 = ((v >> 8u) & 0xfu) * 0x11u;\n"
+    "        t.c1 = ((v >> 4u) & 0xfu) * 0x11u;\n"
+    "        t.c2 = (v & 0xfu) * 0x11u;\n"
+    "        t.c3 = (v >> 12u) * 0x11u;\n"
+    "    } else if (mode == 6u) {\n"
+    "        t.c0 = load_byte(byte_off + 2u);\n"
+    "        t.c1 = load_byte(byte_off + 1u);\n"
+    "        t.c2 = load_byte(byte_off);\n"
+    "        t.c3 = load_byte(byte_off + 3u);\n"
+    "    } else if (mode == 7u) {\n"
+    "        t.c0 = load_byte(byte_off);\n"
+    "        t.c1 = load_byte(byte_off + 1u);\n"
+    "        t.c2 = load_byte(byte_off + 2u);\n"
+    "        t.c3 = load_byte(byte_off + 3u);\n"
+    "    } else if (mode == 8u) {\n"
+    "        t.one = 0x7fu;\n"
+    "        t.c0 = load_byte(byte_off);\n"
+    "        t.c1 = load_byte(byte_off + 1u);\n"
+    "        t.c2 = load_byte(byte_off + 2u);\n"
+    "        t.c3 = t.one;\n"
+    "    } else if (mode == 9u) {\n"
+    "        t.one = 0xffffu;\n"
+    "        t.c0 = load_u16(byte_off);\n"
+    "        t.c3 = t.one;\n"
+    "    }\n"
+    "    return t;\n"
+    "}\n"
+    "fn channel(t: Texel, index: u32) -> u32 {\n"
+    "    switch index {\n"
+    "        case 0u: { return t.c0; }\n"
+    "        case 1u: { return t.c1; }\n"
+    "        case 2u: { return t.c2; }\n"
+    "        default: { return t.c3; }\n"
+    "    }\n"
+    "}\n"
+    "fn swizzle_channel(t: Texel, index: u32) -> u32 {\n"
+    "    let swz = (params.swizzle >> (index * 8u)) & 0xffu;\n"
+    "    switch swz {\n"
+    "        case 0u: { return channel(t, index); }\n"
+    "        case 1u: { return t.c0; }\n"
+    "        case 2u: { return t.c1; }\n"
+    "        case 3u: { return t.c2; }\n"
+    "        case 4u: { return t.c3; }\n"
+    "        case 5u: { return 0u; }\n"
+    "        default: { return t.one; }\n"
+    "    }\n"
+    "}\n"
+    "fn store_texel(byte_off: u32, t: Texel) {\n"
+    "    let o0 = swizzle_channel(t, 0u);\n"
+    "    let o1 = swizzle_channel(t, 1u);\n"
+    "    let o2 = swizzle_channel(t, 2u);\n"
+    "    let o3 = swizzle_channel(t, 3u);\n"
+    "    let word = byte_off / 4u;\n"
+    "    let denom = f32(t.one);\n"
+    "    if (params.out_kind == 0u) {\n"
+    "        dst[word] = (o0 & 0xffu) | ((o1 & 0xffu) << 8u) |\n"
+    "            ((o2 & 0xffu) << 16u) | ((o3 & 0xffu) << 24u);\n"
+    "    } else if (params.out_kind == 1u) {\n"
+    "        let h0 = unorm_to_half(f32(o0) / denom);\n"
+    "        let h1 = unorm_to_half(f32(o1) / denom);\n"
+    "        let h2 = unorm_to_half(f32(o2) / denom);\n"
+    "        let h3 = unorm_to_half(f32(o3) / denom);\n"
+    "        dst[word] = h0 | (h1 << 16u);\n"
+    "        dst[word + 1u] = h2 | (h3 << 16u);\n"
+    "    } else {\n"
+    "        dst[word] = bitcast<u32>(f32(o0) / denom);\n"
+    "        dst[word + 1u] = bitcast<u32>(f32(o1) / denom);\n"
+    "        dst[word + 2u] = bitcast<u32>(f32(o2) / denom);\n"
+    "        dst[word + 3u] = bitcast<u32>(f32(o3) / denom);\n"
+    "    }\n"
+    "}\n"
+    "@compute @workgroup_size(64)\n"
+    "fn main(@builtin(global_invocation_id) id: vec3u) {\n"
+    "    let y = params.row_base + id.x;\n"
+    "    if (y >= params.rows) { return; }\n"
+    "    var bpp: u32 = 4u;\n"
+    "    if (params.out_kind == 1u) { bpp = 8u; }\n"
+    "    else if (params.out_kind == 2u) { bpp = 16u; }\n"
+    "    for (var x: u32 = 0u; x < params.width; x++) {\n"
+    "        let src_off = y * params.src_stride + x * params.src_bpp;\n"
+    "        let dst_off = y * params.dst_stride + x * bpp;\n"
+    "        store_texel(dst_off, decode_texel(src_off));\n"
+    "    }\n"
+    "}\n";
+
+typedef struct TextureDecodeParams {
+    uint32_t width;
+    uint32_t rows;
+    uint32_t src_stride;
+    uint32_t dst_stride;
+    uint32_t src_bpp;
+    uint32_t decode;
+    uint32_t swizzle;
+    uint32_t out_kind;
+    uint32_t row_base;
+    uint32_t pad[3];
+} TextureDecodeParams;
+
 static uint32_t expand_bits(uint32_t v, unsigned int bits)
 {
     return (v << (8 - bits)) | (v >> (2 * bits - 8));
@@ -240,12 +423,12 @@ static void decode_texels(const WgpuColorFormatInfo *f,
     }
 }
 
-static void write_level(PGRAPHWgpuState *r, WGPUTexture texture,
-                        const WgpuColorFormatInfo *f, WGPUTextureFormat format,
-                        unsigned int layer, unsigned int level,
-                        unsigned int width, unsigned int height,
-                        unsigned int depth, const uint8_t *src,
-                        size_t src_pitch)
+static void write_level_cpu(PGRAPHWgpuState *r, WGPUTexture texture,
+                            const WgpuColorFormatInfo *f,
+                            WGPUTextureFormat format, unsigned int layer,
+                            unsigned int level, unsigned int width,
+                            unsigned int height, unsigned int depth,
+                            const uint8_t *src, size_t src_pitch)
 {
     size_t dst_pitch = width * get_host_texel_size(format);
     size_t size = dst_pitch * height * depth;
@@ -272,6 +455,342 @@ static void write_level(PGRAPHWgpuState *r, WGPUTexture texture,
 
     WGPUExtent3D extent = { width, height, depth };
     wgpuQueueWriteTexture(r->queue, &dst, data, size, &layout, &extent);
+}
+
+static WGPUBindGroupLayoutEntry
+texture_decode_layout_entry(uint32_t binding, WGPUBufferBindingType type)
+{
+    WGPUBindGroupLayoutEntry entry = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+
+    entry.binding = binding;
+    entry.visibility = WGPUShaderStage_Compute;
+    entry.buffer.type = type;
+    return entry;
+}
+
+static bool texture_decode_fits(PGRAPHWgpuState *r, uint64_t bytes)
+{
+    WGPULimits limits = WGPU_LIMITS_INIT;
+    uint64_t max_binding = (uint64_t)128 * 1024 * 1024;
+    uint64_t max_buffer = (uint64_t)256 * 1024 * 1024;
+
+    if (wgpuDeviceGetLimits(r->device, &limits) == WGPUStatus_Success) {
+        if (limits.maxStorageBufferBindingSize) {
+            max_binding = limits.maxStorageBufferBindingSize;
+        }
+        if (limits.maxBufferSize) {
+            max_buffer = limits.maxBufferSize;
+        }
+    }
+    return bytes <= max_binding && ROUND_UP(bytes, 1024 * 1024) <= max_buffer;
+}
+
+static WGPUBuffer ensure_texture_decode_buffer(PGRAPHWgpuState *r, bool source,
+                                               uint64_t size, const char *label)
+{
+    WGPUBuffer *slot = source ? &r->texture_decode_src : &r->texture_decode_dst;
+    uint64_t *capacity =
+        source ? &r->texture_decode_src_size : &r->texture_decode_dst_size;
+    WGPUBufferUsage usage =
+        source ? WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst :
+                 WGPUBufferUsage_Storage | WGPUBufferUsage_CopySrc;
+
+    size = ROUND_UP(size, 4);
+    if (*slot && *capacity >= size) {
+        return *slot;
+    }
+    if (*slot) {
+        wgpuBufferRelease(*slot);
+        *slot = NULL;
+    }
+
+    WGPUBufferDescriptor desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+    desc.label = pgraph_wgpu_str(label);
+    desc.size = ROUND_UP(size, 1024 * 1024);
+    desc.usage = usage;
+    *slot = wgpuDeviceCreateBuffer(r->device, &desc);
+    *capacity = desc.size;
+    return *slot;
+}
+
+static uint32_t pack_texture_swizzle(const uint8_t swizzle[4])
+{
+    return (uint32_t)swizzle[0] | ((uint32_t)swizzle[1] << 8) |
+           ((uint32_t)swizzle[2] << 16) | ((uint32_t)swizzle[3] << 24);
+}
+
+static uint32_t texture_decode_out_kind(WGPUTextureFormat format)
+{
+    switch (format) {
+    case WGPUTextureFormat_RGBA16Float:
+        return 1;
+    case WGPUTextureFormat_RGBA32Float:
+        return 2;
+    default:
+        return 0;
+    }
+}
+
+/* Returns false when this level stays on write_level_cpu. A queue write is
+ * visible to every command in the next submit, so the open encoder is
+ * submitted before the source buffer is reused. */
+static bool write_level_compute(PGRAPHState *pg, WGPUTexture texture,
+                                const WgpuColorFormatInfo *f,
+                                WGPUTextureFormat format, unsigned int layer,
+                                unsigned int level, unsigned int width,
+                                unsigned int height, unsigned int depth,
+                                const uint8_t *src, size_t src_pitch)
+{
+    PGRAPHWgpuState *r = pg->wgpu_renderer_state;
+    uint32_t src_bpp = get_decode_texel_size(f->decode);
+    uint32_t texel = get_host_texel_size(format);
+    uint64_t row_bytes = (uint64_t)width * texel;
+    uint64_t dst_stride = ROUND_UP(row_bytes, 256);
+    uint64_t rows64;
+    uint32_t rows, nchunks, chunk;
+    uint64_t src_bytes, src_upload, dst_bytes;
+    g_autofree uint8_t *padded = NULL;
+    const void *upload;
+    WGPUBuffer src_buffer, dst_buffer;
+    WGPUBindGroup groups[TEXTURE_DECODE_UNIFORM_SLOTS];
+    TextureDecodeParams params;
+
+    if (f->decode == WGPU_TEX_DECODE_COPY || !r->texture_decode_pipeline ||
+        !width || !height || !depth || !src_pitch || src_pitch > UINT32_MAX ||
+        dst_stride > UINT32_MAX || dst_stride == 0) {
+        return false;
+    }
+    if (height > UINT32_MAX / depth) {
+        return false;
+    }
+    rows64 = (uint64_t)height * depth;
+    if (rows64 > (uint64_t)TEXTURE_DECODE_UNIFORM_SLOTS *
+                     TEXTURE_DECODE_ROWS_PER_DISPATCH) {
+        return false;
+    }
+    rows = (uint32_t)rows64;
+    if (src_pitch > UINT64_MAX / rows || dst_stride > UINT64_MAX / rows) {
+        return false;
+    }
+    src_bytes = src_pitch * rows;
+    src_upload = ROUND_UP(src_bytes, 4);
+    dst_bytes = dst_stride * rows;
+    if (!src_upload || !texture_decode_fits(r, src_upload) ||
+        !texture_decode_fits(r, dst_bytes)) {
+        return false;
+    }
+
+    /* The previous submit may still be reading these buffers. Releasing a
+     * buffer the queue is using is safe; overwriting one an open encoder
+     * has already recorded is not. */
+    pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_FLUSH, false);
+
+    src_buffer = ensure_texture_decode_buffer(r, true, src_upload,
+                                              "Texture decode source");
+    dst_buffer = ensure_texture_decode_buffer(r, false, dst_bytes,
+                                              "Texture decode output");
+    if (!src_buffer || !dst_buffer) {
+        return false;
+    }
+
+    upload = src;
+    if (src_upload != src_bytes) {
+        padded = g_malloc0(src_upload);
+        memcpy(padded, src, src_bytes);
+        upload = padded;
+    }
+    wgpuQueueWriteBuffer(r->queue, src_buffer, 0, upload, src_upload);
+
+    params = (TextureDecodeParams){
+        .width = width,
+        .rows = rows,
+        .src_stride = src_pitch,
+        .dst_stride = dst_stride,
+        .src_bpp = src_bpp,
+        .decode = f->decode,
+        .swizzle = pack_texture_swizzle(f->swizzle),
+        .out_kind = texture_decode_out_kind(format),
+    };
+    nchunks = (rows + TEXTURE_DECODE_ROWS_PER_DISPATCH - 1) /
+              TEXTURE_DECODE_ROWS_PER_DISPATCH;
+    for (chunk = 0; chunk < nchunks; chunk++) {
+        WGPUBindGroupEntry entries[3];
+        WGPUBindGroupDescriptor bg_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+
+        params.row_base = chunk * TEXTURE_DECODE_ROWS_PER_DISPATCH;
+        wgpuQueueWriteBuffer(r->queue, r->texture_decode_uniform,
+                             (uint64_t)chunk * TEXTURE_DECODE_UNIFORM_STRIDE,
+                             &params, sizeof(params));
+
+        entries[0] = WGPU_BIND_GROUP_ENTRY_INIT;
+        entries[0].binding = 0;
+        entries[0].buffer = src_buffer;
+        entries[0].size = src_upload;
+        entries[1] = WGPU_BIND_GROUP_ENTRY_INIT;
+        entries[1].binding = 1;
+        entries[1].buffer = dst_buffer;
+        entries[1].size = dst_bytes;
+        entries[2] = WGPU_BIND_GROUP_ENTRY_INIT;
+        entries[2].binding = 2;
+        entries[2].buffer = r->texture_decode_uniform;
+        entries[2].offset = (uint64_t)chunk * TEXTURE_DECODE_UNIFORM_STRIDE;
+        entries[2].size = sizeof(params);
+
+        bg_desc.layout = r->texture_decode_layout;
+        bg_desc.entryCount = 3;
+        bg_desc.entries = entries;
+        groups[chunk] = wgpuDeviceCreateBindGroup(r->device, &bg_desc);
+    }
+
+    pgraph_wgpu_end_render_pass(r);
+    WGPUCommandEncoder encoder = pgraph_wgpu_ensure_encoder(pg);
+    WGPUComputePassDescriptor pass_desc = WGPU_COMPUTE_PASS_DESCRIPTOR_INIT;
+    pass_desc.label = pgraph_wgpu_str("Texture decode");
+    WGPUComputePassEncoder pass =
+        wgpuCommandEncoderBeginComputePass(encoder, &pass_desc);
+    wgpuComputePassEncoderSetPipeline(pass, r->texture_decode_pipeline);
+    for (chunk = 0; chunk < nchunks; chunk++) {
+        uint32_t batch = MIN(rows - chunk * TEXTURE_DECODE_ROWS_PER_DISPATCH,
+                             TEXTURE_DECODE_ROWS_PER_DISPATCH);
+
+        wgpuComputePassEncoderSetBindGroup(pass, 0, groups[chunk], 0, NULL);
+        wgpuComputePassEncoderDispatchWorkgroups(pass, (batch + 63) / 64, 1, 1);
+        wgpuBindGroupRelease(groups[chunk]);
+    }
+    wgpuComputePassEncoderEnd(pass);
+    wgpuComputePassEncoderRelease(pass);
+
+    WGPUTexelCopyBufferInfo copy_src = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+    copy_src.buffer = dst_buffer;
+    copy_src.layout.bytesPerRow = dst_stride;
+    copy_src.layout.rowsPerImage = height;
+
+    WGPUTexelCopyTextureInfo copy_dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+    copy_dst.texture = texture;
+    copy_dst.mipLevel = level;
+    copy_dst.origin.z = layer;
+
+    WGPUExtent3D extent = { width, height, depth };
+    wgpuCommandEncoderCopyBufferToTexture(encoder, &copy_src, &copy_dst,
+                                          &extent);
+    return true;
+}
+
+static void write_level(PGRAPHState *pg, WGPUTexture texture,
+                        const WgpuColorFormatInfo *f, WGPUTextureFormat format,
+                        unsigned int layer, unsigned int level,
+                        unsigned int width, unsigned int height,
+                        unsigned int depth, const uint8_t *src,
+                        size_t src_pitch)
+{
+    PGRAPHWgpuState *r = pg->wgpu_renderer_state;
+
+    if (write_level_compute(pg, texture, f, format, layer, level, width, height,
+                            depth, src, src_pitch)) {
+        return;
+    }
+    write_level_cpu(r, texture, f, format, layer, level, width, height, depth,
+                    src, src_pitch);
+}
+
+static void init_texture_decode(PGRAPHWgpuState *r)
+{
+    WGPUBindGroupLayoutEntry entries[3];
+    WGPUBindGroupLayoutDescriptor bgl_desc =
+        WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+    WGPUPipelineLayoutDescriptor layout_desc =
+        WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    WGPUComputePipelineDescriptor desc = WGPU_COMPUTE_PIPELINE_DESCRIPTOR_INIT;
+    WGPUBufferDescriptor uniform_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+
+    G_STATIC_ASSERT(sizeof(TextureDecodeParams) == 48);
+    G_STATIC_ASSERT(WGPU_TEX_DECODE_R8 == 1);
+    G_STATIC_ASSERT(WGPU_TEX_DECODE_RG8 == 2);
+    G_STATIC_ASSERT(WGPU_TEX_DECODE_A1R5G5B5 == 3);
+    G_STATIC_ASSERT(WGPU_TEX_DECODE_R5G6B5 == 4);
+    G_STATIC_ASSERT(WGPU_TEX_DECODE_A4R4G4B4 == 5);
+    G_STATIC_ASSERT(WGPU_TEX_DECODE_BGRA8 == 6);
+    G_STATIC_ASSERT(WGPU_TEX_DECODE_RGBA8 == 7);
+    G_STATIC_ASSERT(WGPU_TEX_DECODE_RGB8_SNORM == 8);
+    G_STATIC_ASSERT(WGPU_TEX_DECODE_R16 == 9);
+    G_STATIC_ASSERT(WGPU_SWZ_ID == 0);
+    G_STATIC_ASSERT(WGPU_SWZ_R == 1);
+    G_STATIC_ASSERT(WGPU_SWZ_G == 2);
+    G_STATIC_ASSERT(WGPU_SWZ_B == 3);
+    G_STATIC_ASSERT(WGPU_SWZ_A == 4);
+    G_STATIC_ASSERT(WGPU_SWZ_ZERO == 5);
+    G_STATIC_ASSERT(WGPU_SWZ_ONE == 6);
+
+    r->texture_decode_module = pgraph_wgpu_create_wgsl_module(
+        r, "Texture decode", texture_decode_wgsl);
+    if (!r->texture_decode_module) {
+        return;
+    }
+
+    entries[0] =
+        texture_decode_layout_entry(0, WGPUBufferBindingType_ReadOnlyStorage);
+    entries[1] = texture_decode_layout_entry(1, WGPUBufferBindingType_Storage);
+    entries[2] = texture_decode_layout_entry(2, WGPUBufferBindingType_Uniform);
+    bgl_desc.entryCount = 3;
+    bgl_desc.entries = entries;
+    r->texture_decode_layout =
+        wgpuDeviceCreateBindGroupLayout(r->device, &bgl_desc);
+
+    layout_desc.bindGroupLayoutCount = 1;
+    layout_desc.bindGroupLayouts = &r->texture_decode_layout;
+    r->texture_decode_pipeline_layout =
+        wgpuDeviceCreatePipelineLayout(r->device, &layout_desc);
+
+    desc.label = pgraph_wgpu_str("Texture decode");
+    desc.layout = r->texture_decode_pipeline_layout;
+    desc.compute.module = r->texture_decode_module;
+    desc.compute.entryPoint = pgraph_wgpu_str("main");
+    r->texture_decode_pipeline =
+        wgpuDeviceCreateComputePipeline(r->device, &desc);
+    if (!r->texture_decode_pipeline) {
+        return;
+    }
+
+    uniform_desc.label = pgraph_wgpu_str("Texture decode params");
+    uniform_desc.size =
+        TEXTURE_DECODE_UNIFORM_SLOTS * TEXTURE_DECODE_UNIFORM_STRIDE;
+    uniform_desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+    r->texture_decode_uniform =
+        wgpuDeviceCreateBuffer(r->device, &uniform_desc);
+}
+
+static void finalize_texture_decode(PGRAPHWgpuState *r)
+{
+    if (r->texture_decode_pipeline) {
+        wgpuComputePipelineRelease(r->texture_decode_pipeline);
+        r->texture_decode_pipeline = NULL;
+    }
+    if (r->texture_decode_pipeline_layout) {
+        wgpuPipelineLayoutRelease(r->texture_decode_pipeline_layout);
+        r->texture_decode_pipeline_layout = NULL;
+    }
+    if (r->texture_decode_layout) {
+        wgpuBindGroupLayoutRelease(r->texture_decode_layout);
+        r->texture_decode_layout = NULL;
+    }
+    if (r->texture_decode_module) {
+        wgpuShaderModuleRelease(r->texture_decode_module);
+        r->texture_decode_module = NULL;
+    }
+    if (r->texture_decode_uniform) {
+        wgpuBufferRelease(r->texture_decode_uniform);
+        r->texture_decode_uniform = NULL;
+    }
+    if (r->texture_decode_src) {
+        wgpuBufferRelease(r->texture_decode_src);
+        r->texture_decode_src = NULL;
+        r->texture_decode_src_size = 0;
+    }
+    if (r->texture_decode_dst) {
+        wgpuBufferRelease(r->texture_decode_dst);
+        r->texture_decode_dst = NULL;
+        r->texture_decode_dst_size = 0;
+    }
 }
 
 static enum S3TC_DECOMPRESS_FORMAT
@@ -362,7 +881,7 @@ static void upload_texture_data(PGRAPHState *pg, TextureBinding *binding)
         g_autofree uint8_t *converted = pgraph_convert_texture_data(
             s, texture_data, palette_data, adjusted_width, adjusted_height, 1,
             s.pitch, 0, NULL);
-        write_level(r, texture, wf, format, 0, 0, adjusted_width,
+        write_level(pg, texture, wf, format, 0, 0, adjusted_width,
                     adjusted_height, 1, converted ?: texture_data,
                     converted ? adjusted_width * decode_size : s.pitch);
         return;
@@ -392,7 +911,7 @@ static void upload_texture_data(PGRAPHState *pg, TextureBinding *binding)
                     g_autofree uint8_t *converted = s3tc_decompress_2d(
                         kelvin_format_to_s3tc_format(s.color_format), src,
                         width, height);
-                    write_level(r, texture, wf, format, layer, level, width,
+                    write_level(pg, texture, wf, format, layer, level, width,
                                 height, 1, converted, width * 4);
                     src +=
                         physical_width / 4 * physical_height / 4 * block_size;
@@ -404,7 +923,7 @@ static void upload_texture_data(PGRAPHState *pg, TextureBinding *binding)
                     g_autofree uint8_t *converted = pgraph_convert_texture_data(
                         s, unswizzled, palette_data, width, height, 1, pitch, 0,
                         NULL);
-                    write_level(r, texture, wf, format, layer, level, width,
+                    write_level(pg, texture, wf, format, layer, level, width,
                                 height, 1, converted ?: unswizzled,
                                 converted ? width * decode_size : pitch);
                     src += width * height * f.bytes_per_pixel;
@@ -430,7 +949,7 @@ static void upload_texture_data(PGRAPHState *pg, TextureBinding *binding)
                 g_autofree uint8_t *converted = s3tc_decompress_3d(
                     kelvin_format_to_s3tc_format(s.color_format), src, width,
                     height, depth);
-                write_level(r, texture, wf, format, 0, level, width, height,
+                write_level(pg, texture, wf, format, 0, level, width, height,
                             depth, converted, width * 4);
                 src += physical_width / 4 * physical_height / 4 * depth *
                        block_size;
@@ -443,7 +962,7 @@ static void upload_texture_data(PGRAPHState *pg, TextureBinding *binding)
                 g_autofree uint8_t *converted = pgraph_convert_texture_data(
                     s, unswizzled, palette_data, width, height, depth,
                     row_pitch, slice_pitch, NULL);
-                write_level(r, texture, wf, format, 0, level, width, height,
+                write_level(pg, texture, wf, format, 0, level, width, height,
                             depth, converted ?: unswizzled,
                             converted ? width * decode_size : row_pitch);
                 src += width * height * depth * f.bytes_per_pixel;
@@ -1102,6 +1621,8 @@ void pgraph_wgpu_init_textures(PGRAPHState *pg)
     r->texture_cache.compare_nodes = texture_cache_entry_compare;
     r->texture_cache.pre_node_evict = texture_cache_entry_pre_evict;
     r->texture_cache.post_node_evict = texture_cache_entry_post_evict;
+
+    init_texture_decode(r);
 }
 
 void pgraph_wgpu_finalize_textures(PGRAPHState *pg)
@@ -1133,4 +1654,5 @@ void pgraph_wgpu_finalize_textures(PGRAPHState *pg)
         wgpuSamplerRelease(r->dummy_sampler);
         r->dummy_sampler = NULL;
     }
+    finalize_texture_decode(r);
 }
