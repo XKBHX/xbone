@@ -384,6 +384,9 @@ static void download_surface_list(NV2AState *d, SurfaceBinding **surfaces,
                              surface->fmt.bytes_per_pixel);
                 nv2a_profile_inc_counter(NV2A_PROF_SURF_SWIZZLE);
             }
+            pgraph_wgpu_vertex_ram_invalidate(pg, surface->vram_addr,
+                                              (hwaddr)surface->pitch *
+                                                  surface->height);
         }
         wgpuBufferUnmap(r->readback_buffer);
     }
@@ -1014,6 +1017,9 @@ static void update_surface_part(NV2AState *d, bool upload, bool color)
     bool mem_dirty = !tcg_enabled() && memory_region_test_and_clear_dirty(
                                            d->vram, target.vram_addr,
                                            target.size, DIRTY_MEMORY_NV2A);
+    if (mem_dirty) {
+        pgraph_wgpu_vertex_ram_invalidate(pg, target.vram_addr, target.size);
+    }
 
     SurfaceBinding *current_binding =
         color ? r->color_binding : r->zeta_binding;

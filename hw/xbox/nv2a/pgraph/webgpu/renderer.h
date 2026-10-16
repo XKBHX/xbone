@@ -58,11 +58,15 @@ typedef struct WgpuVertexAttribute {
     uint8_t location;
     uint8_t offset;
     WGPUVertexFormat format;
+    /* Guest stride when this attribute is fetched from the RAM mirror. */
+    uint32_t stride;
 } WgpuVertexAttribute;
 
 typedef struct WgpuVertexLayout {
     uint32_t stride;
     uint32_t num_attributes;
+    /* Each attribute is its own vertex buffer into the guest RAM mirror. */
+    bool from_ram;
     WgpuVertexAttribute attributes[NV2A_VERTEXSHADER_ATTRIBUTES];
 } WgpuVertexLayout;
 
@@ -71,7 +75,23 @@ typedef struct WgpuVertexSource {
     size_t stride;
     unsigned int format;
     unsigned int count;
+    hwaddr ram_addr; // ~(hwaddr)0 when the bytes are not in guest RAM
 } WgpuVertexSource;
+
+#define WGPU_TEXTURE_BIND_CACHE 64
+
+typedef struct WgpuTextureBindKey {
+    const WgpuTextureLayout *layout;
+    WGPUTextureView views[NV2A_MAX_TEXTURES];
+    WGPUSampler samplers[NV2A_MAX_TEXTURES];
+} WgpuTextureBindKey;
+
+typedef struct WgpuTextureBindCacheEntry {
+    WgpuTextureBindKey key;
+    WGPUBindGroup group;
+    uint64_t stamp;
+    bool used;
+} WgpuTextureBindCacheEntry;
 
 typedef struct PipelineKey {
     const ShaderBinding *shader;
@@ -275,6 +295,17 @@ typedef struct PGRAPHWgpuState {
 
     WgpuStreamBuffer stream_buffers[WGPU_STREAM__COUNT];
 
+    /* Guest RAM mirror used as vertex buffers when the formats fit. */
+    WGPUBuffer vertex_ram;
+    uint64_t vertex_ram_bytes;
+    unsigned long *vertex_ram_valid;
+    bool vertex_ram_drawn;
+    bool vertex_ram_eligible;
+    uint32_t max_vertex_buffers;
+    uint32_t max_vertex_buffer_array_stride;
+    uint64_t vertex_ram_offset[NV2A_VERTEXSHADER_ATTRIBUTES];
+    uint64_t vertex_ram_size[NV2A_VERTEXSHADER_ATTRIBUTES];
+
     GHashTable *shader_cache; // ShaderState -> ShaderBinding
     ShaderBinding *shader_binding;
     GArray *texture_layouts; // WgpuTextureLayout *
@@ -295,9 +326,8 @@ typedef struct PGRAPHWgpuState {
     Lru texture_cache;
     TextureBinding *texture_cache_entries;
     TextureBinding *texture_bindings[NV2A_MAX_TEXTURES];
-    bool texture_bindings_changed;
-    WGPUBindGroup texture_bind_group;
-    const WgpuTextureLayout *texture_bind_group_layout;
+    WgpuTextureBindCacheEntry texture_bind_cache[WGPU_TEXTURE_BIND_CACHE];
+    uint64_t texture_bind_stamp;
 
     GHashTable *pipeline_cache; // PipelineKey -> WGPURenderPipeline
     WGPUTexture scratch_zeta;
@@ -341,6 +371,8 @@ bool pgraph_wgpu_stream_reserve(PGRAPHState *pg, int index, size_t size);
 size_t pgraph_wgpu_stream_alloc(PGRAPHWgpuState *r, int index, size_t size,
                                 size_t align, void **ptr);
 void pgraph_wgpu_flush_streams(PGRAPHWgpuState *r);
+void pgraph_wgpu_vertex_ram_invalidate(PGRAPHState *pg, hwaddr addr,
+                                       hwaddr size);
 
 // shaders.c
 void pgraph_wgpu_init_shaders(PGRAPHState *pg);
@@ -353,6 +385,7 @@ void pgraph_wgpu_update_uniforms(PGRAPHState *pg, bool *vsh_changed,
 void pgraph_wgpu_init_textures(PGRAPHState *pg);
 void pgraph_wgpu_finalize_textures(PGRAPHState *pg);
 void pgraph_wgpu_bind_textures(NV2AState *d);
+void pgraph_wgpu_release_texture_bind_groups(PGRAPHWgpuState *r);
 WGPUBindGroup pgraph_wgpu_get_texture_bind_group(PGRAPHWgpuState *r,
                                                  const WgpuTextureLayout *l);
 void pgraph_wgpu_mark_textures_possibly_dirty(NV2AState *d, hwaddr addr,
@@ -367,6 +400,10 @@ bool pgraph_wgpu_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
 void pgraph_wgpu_bind_vertex_attributes_inline(NV2AState *d);
 void pgraph_wgpu_pack_vertices(PGRAPHWgpuState *r, uint8_t *out,
                                unsigned int first, unsigned int count);
+/* Point lists that are rewritten stay packed. Otherwise a fitting layout
+ * fetches from the RAM mirror. */
+bool pgraph_wgpu_vertex_ram_prepare(PGRAPHState *pg, unsigned int first,
+                                    unsigned int count, bool reorder);
 
 // command.c
 WGPUCommandEncoder pgraph_wgpu_ensure_encoder(PGRAPHState *pg);
@@ -398,6 +435,8 @@ void pgraph_wgpu_download_surfaces_in_range_if_dirty(PGRAPHState *pg,
 void pgraph_wgpu_download_surfaces_covering(PGRAPHState *pg,
                                             const WgpuMemoryRange *ranges,
                                             int count);
+void pgraph_wgpu_vertex_ram_upload(PGRAPHState *pg,
+                                   const WgpuMemoryRange *ranges, int count);
 void pgraph_wgpu_upload_surface_data(NV2AState *d, SurfaceBinding *surface,
                                      bool force);
 void pgraph_wgpu_surface_update(NV2AState *d, bool upload, bool color_write,

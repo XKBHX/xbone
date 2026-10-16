@@ -389,21 +389,35 @@ static WGPURenderPipeline create_draw_pipeline(PGRAPHState *pg,
     /* WebGPU points are one pixel, so every point is drawn as an instance
      * of a quad that the vertex shader expands */
     bool point_quads = key->topology == WGPUPrimitiveTopology_PointList;
-
-    WGPUVertexBufferLayout vertex_buffer = WGPU_VERTEX_BUFFER_LAYOUT_INIT;
-    vertex_buffer.stepMode =
+    WGPUVertexStepMode step =
         point_quads ? WGPUVertexStepMode_Instance : WGPUVertexStepMode_Vertex;
-    vertex_buffer.arrayStride = vl->stride;
-    vertex_buffer.attributeCount = vl->num_attributes;
-    vertex_buffer.attributes = attributes;
+
+    WGPUVertexBufferLayout vertex_buffers[NV2A_VERTEXSHADER_ATTRIBUTES];
+    WGPUVertexBufferLayout vertex_buffer = WGPU_VERTEX_BUFFER_LAYOUT_INIT;
+    if (vl->from_ram) {
+        for (uint32_t i = 0; i < vl->num_attributes; i++) {
+            vertex_buffers[i] =
+                (WGPUVertexBufferLayout)WGPU_VERTEX_BUFFER_LAYOUT_INIT;
+            vertex_buffers[i].stepMode = step;
+            vertex_buffers[i].arrayStride = vl->attributes[i].stride;
+            vertex_buffers[i].attributeCount = 1;
+            vertex_buffers[i].attributes = &attributes[i];
+        }
+    } else {
+        vertex_buffer.stepMode = step;
+        vertex_buffer.arrayStride = vl->stride;
+        vertex_buffer.attributeCount = vl->num_attributes;
+        vertex_buffer.attributes = attributes;
+    }
 
     WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
     desc.label = pgraph_wgpu_str("PGRAPH draw");
     desc.layout = b->texture_layout->pipeline_layout;
     desc.vertex.module = b->vsh;
     desc.vertex.entryPoint = pgraph_wgpu_str("vs");
-    desc.vertex.bufferCount = vl->num_attributes ? 1 : 0;
-    desc.vertex.buffers = &vertex_buffer;
+    desc.vertex.bufferCount =
+        vl->num_attributes ? (vl->from_ram ? vl->num_attributes : 1) : 0;
+    desc.vertex.buffers = vl->from_ram ? vertex_buffers : &vertex_buffer;
 
     uint32_t setupraster = pgraph_reg_r(pg, NV_PGRAPH_SETUPRASTER);
     desc.primitive.topology =
@@ -698,7 +712,14 @@ static void set_draw_state(PGRAPHState *pg, WGPURenderPipeline pipeline,
                                       pgraph_wgpu_get_texture_bind_group(
                                           r, r->shader_binding->texture_layout),
                                       0, NULL);
-    if (vertex_size) {
+    if (r->vertex_layout.from_ram) {
+        for (uint32_t i = 0; i < r->vertex_layout.num_attributes; i++) {
+            wgpuRenderPassEncoderSetVertexBuffer(pass, i, r->vertex_ram,
+                                                 r->vertex_ram_offset[i],
+                                                 r->vertex_ram_size[i]);
+        }
+        r->vertex_ram_drawn = true;
+    } else if (vertex_size) {
         wgpuRenderPassEncoderSetVertexBuffer(
             pass, 0, r->stream_buffers[WGPU_STREAM_VERTEX].buffer,
             vertex_offset, vertex_size);
@@ -860,6 +881,13 @@ void pgraph_wgpu_flush_draw(NV2AState *d)
         return;
     }
 
+    /* Indexed point quads are packed, because instance data cannot be
+     * indexed. Other draws fetch from the RAM mirror when every attribute
+     * fits a core vertex format. */
+    bool reorder =
+        topology == WGPUPrimitiveTopology_PointList && (expand || elements);
+    pgraph_wgpu_vertex_ram_prepare(pg, first, num_vertices, reorder);
+
     WGPURenderPipeline pipeline = get_draw_pipeline(pg, topology);
     if (!pipeline) {
         fprintf(stderr, "[WebGPU] Draw pipeline was not created\n");
@@ -906,9 +934,12 @@ void pgraph_wgpu_flush_draw(NV2AState *d)
         max_indices = 0;
     }
 
-    size_t vertex_size = (size_t)(point_list ? num_points : num_vertices) *
-                         r->vertex_layout.stride;
-    pgraph_wgpu_stream_reserve(pg, WGPU_STREAM_VERTEX, vertex_size);
+    size_t vertex_size = 0;
+    if (!r->vertex_layout.from_ram) {
+        vertex_size = (size_t)(point_list ? num_points : num_vertices) *
+                      r->vertex_layout.stride;
+        pgraph_wgpu_stream_reserve(pg, WGPU_STREAM_VERTEX, vertex_size);
+    }
     pgraph_wgpu_stream_reserve(pg, WGPU_STREAM_INDEX,
                                max_indices * sizeof(uint32_t));
     pgraph_wgpu_stream_reserve(pg, WGPU_STREAM_UNIFORM,

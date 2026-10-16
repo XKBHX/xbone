@@ -53,7 +53,10 @@ What exists:
   pipeline. Blend color and the stencil reference are dynamic state, so
   they do not create another pipeline. Surface readbacks are coalesced:
   several dirty surfaces are copied in one submit and mapped once, and
-  only a surface a draw has dirtied is read back.
+  only a surface a draw has dirtied is read back. Texture bind groups are
+  cached by the views and samplers they name. A guest-RAM vertex buffer is
+  uploaded in 64 KiB blocks and used when every attribute fits a core
+  vertex format. Other attributes are still packed on the CPU.
 
 What blocks an xemu WASM build today:
 
