@@ -17,10 +17,11 @@
 #include "renderer.h"
 
 /*
- * WebGPU allows at most 8 vertex buffers, has no 3-component 8/16-bit or
- * scaled-integer formats, and requires 4-byte aligned strides. Active
- * attributes are therefore packed on the CPU into one interleaved vertex
- * buffer per draw, converting where WebGPU has no matching format.
+ * WebGPU has no 3-component 8/16-bit or scaled-integer formats, and a
+ * vertex stride must be a multiple of 4. Attributes that fit a core format
+ * are fetched from a guest RAM mirror. Anything else is packed on the CPU
+ * into one interleaved buffer, which is also how indexed point lists are
+ * drawn: instance data cannot be indexed.
  */
 
 static void add_attribute(PGRAPHWgpuState *r, int location, unsigned int format,
@@ -75,6 +76,7 @@ static void add_attribute(PGRAPHWgpuState *r, int location, unsigned int format,
     src->stride = stride;
     src->format = format;
     src->count = count;
+    src->ram_addr = ~(hwaddr)0;
 }
 
 static void reset_attributes(PGRAPHState *pg)
@@ -84,7 +86,65 @@ static void reset_attributes(PGRAPHState *pg)
     pg->compressed_attrs = 0;
     pg->uniform_attrs = 0;
     pg->swizzle_attrs = 0;
+    r->vertex_ram_eligible = false;
     memset(&r->vertex_layout, 0, sizeof(r->vertex_layout));
+}
+
+static uint32_t vertex_format_bytes(WGPUVertexFormat format)
+{
+    switch (format) {
+    case WGPUVertexFormat_Unorm8:
+        return 1;
+    case WGPUVertexFormat_Unorm8x2:
+        return 2;
+    case WGPUVertexFormat_Unorm8x4:
+        return 4;
+    case WGPUVertexFormat_Snorm16:
+        return 2;
+    case WGPUVertexFormat_Snorm16x2:
+        return 4;
+    case WGPUVertexFormat_Snorm16x4:
+        return 8;
+    case WGPUVertexFormat_Float32:
+    case WGPUVertexFormat_Sint32:
+        return 4;
+    case WGPUVertexFormat_Float32x2:
+        return 8;
+    case WGPUVertexFormat_Float32x3:
+        return 12;
+    case WGPUVertexFormat_Float32x4:
+        return 16;
+    default:
+        return 0;
+    }
+}
+
+static bool attribute_fits_ram(const PGRAPHWgpuState *r,
+                               const WgpuVertexAttribute *attr,
+                               const WgpuVertexSource *src)
+{
+    uint32_t bytes = vertex_format_bytes(attr->format);
+
+    if (src->ram_addr == ~(hwaddr)0 || !bytes || !src->stride) {
+        return false;
+    }
+    if (src->format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S32K) {
+        return false;
+    }
+    if ((src->format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_D3D ||
+         src->format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_UB_OGL ||
+         src->format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_S1) &&
+        src->count == 3) {
+        return false;
+    }
+    if ((src->stride % 4) != 0 || (src->ram_addr % 4) != 0) {
+        return false;
+    }
+    if (src->stride < bytes ||
+        src->stride > r->max_vertex_buffer_array_stride) {
+        return false;
+    }
+    return true;
 }
 
 static int compare_ranges(const void *a, const void *b)
@@ -170,8 +230,9 @@ bool pgraph_wgpu_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
         }
         nranges = merge_vertex_ranges(ranges, nranges);
         /* A draw_dirty surface under these vertices is read back once.
-         * DIRTY_MEMORY_NV2A is a CPU write, and this path already reads
-         * RAM. Semaphore release downloads before the semaphore store. */
+         * DIRTY_MEMORY_NV2A is a CPU write. The RAM mirror uploads those
+         * pages when a draw fetches them. Semaphore release downloads
+         * before the semaphore store. */
         pgraph_wgpu_download_surfaces_covering(pg, ranges, nranges);
     }
 
@@ -200,6 +261,12 @@ bool pgraph_wgpu_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
             stride = attr->stride;
         }
 
+        hwaddr ram_addr = ~(hwaddr)0;
+        if (!inline_data && data >= d->vram_ptr &&
+            (size_t)(data - d->vram_ptr) < memory_region_size(d->vram)) {
+            ram_addr = data - d->vram_ptr;
+        }
+
         if (!stride) {
             /* Stride of 0 indicates that only the first element should be
              * used. */
@@ -211,6 +278,8 @@ bool pgraph_wgpu_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
         pgraph_update_inline_value(attr, data + stride * provoking_element);
 
         add_attribute(r, i, attr->format, attr->count, data, stride);
+        r->vertex_sources[r->vertex_layout.num_attributes - 1].ram_addr =
+            ram_addr;
 
         if (attr->format == NV097_SET_VERTEX_DATA_ARRAY_FORMAT_TYPE_CMP) {
             pg->compressed_attrs |= 1 << i;
@@ -220,7 +289,52 @@ bool pgraph_wgpu_bind_vertex_attributes(NV2AState *d, unsigned int min_element,
         }
     }
 
+    r->vertex_ram_eligible =
+        r->vertex_ram && r->vertex_layout.num_attributes > 0 &&
+        r->vertex_layout.num_attributes <= r->max_vertex_buffers;
+    for (uint32_t i = 0; i < r->vertex_layout.num_attributes; i++) {
+        if (!attribute_fits_ram(r, &r->vertex_layout.attributes[i],
+                                &r->vertex_sources[i])) {
+            r->vertex_ram_eligible = false;
+            break;
+        }
+    }
+
     return r->vertex_layout.num_attributes > 0;
+}
+
+bool pgraph_wgpu_vertex_ram_prepare(PGRAPHState *pg, unsigned int first,
+                                    unsigned int count, bool reorder)
+{
+    PGRAPHWgpuState *r = pg->wgpu_renderer_state;
+    WgpuMemoryRange ranges[NV2A_VERTEXSHADER_ATTRIBUTES];
+    uint32_t n = r->vertex_layout.num_attributes;
+
+    if (reorder || !r->vertex_ram_eligible || !count) {
+        return false;
+    }
+
+    for (uint32_t i = 0; i < n; i++) {
+        uint64_t stride = r->vertex_sources[i].stride;
+        uint64_t off = r->vertex_sources[i].ram_addr + (uint64_t)first * stride;
+        uint64_t bytes = (uint64_t)count * stride;
+
+        if (off > r->vertex_ram_bytes || bytes > r->vertex_ram_bytes - off) {
+            return false;
+        }
+        ranges[i].addr = off;
+        ranges[i].size = bytes;
+    }
+
+    for (uint32_t i = 0; i < n; i++) {
+        r->vertex_layout.attributes[i].offset = 0;
+        r->vertex_layout.attributes[i].stride = r->vertex_sources[i].stride;
+        r->vertex_ram_offset[i] = ranges[i].addr;
+        r->vertex_ram_size[i] = ranges[i].size;
+    }
+    r->vertex_layout.from_ram = true;
+    pgraph_wgpu_vertex_ram_upload(pg, ranges, n);
+    return true;
 }
 
 void pgraph_wgpu_bind_vertex_attributes_inline(NV2AState *d)

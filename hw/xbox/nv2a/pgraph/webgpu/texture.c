@@ -499,10 +499,38 @@ static void create_texture_object(PGRAPHWgpuState *r, TextureBinding *binding)
     binding->view = wgpuTextureCreateView(binding->texture, &view_desc);
 }
 
-static void release_texture_object(TextureBinding *binding)
+static void purge_texture_bind_groups(PGRAPHWgpuState *r, WGPUTextureView view,
+                                      WGPUSampler sampler)
 {
-    /* Only released: unsubmitted commands may still reference the texture */
+    for (int i = 0; i < WGPU_TEXTURE_BIND_CACHE; i++) {
+        WgpuTextureBindCacheEntry *entry = &r->texture_bind_cache[i];
+        bool drop = false;
+
+        if (!entry->used) {
+            continue;
+        }
+        for (int s = 0; s < NV2A_MAX_TEXTURES; s++) {
+            if ((view && entry->key.views[s] == view) ||
+                (sampler && entry->key.samplers[s] == sampler)) {
+                drop = true;
+                break;
+            }
+        }
+        if (!drop) {
+            continue;
+        }
+        wgpuBindGroupRelease(entry->group);
+        entry->group = NULL;
+        entry->used = false;
+    }
+}
+
+static void release_texture_object(PGRAPHWgpuState *r, TextureBinding *binding)
+{
+    /* Only released: unsubmitted commands may still reference the texture.
+     * Bind groups that still name the view have to go first. */
     if (binding->view) {
+        purge_texture_bind_groups(r, binding->view, NULL);
         wgpuTextureViewRelease(binding->view);
         binding->view = NULL;
     }
@@ -853,7 +881,7 @@ static void bind_texture(PGRAPHState *pg, int texture_idx)
             if (hash != binding->hash) {
                 /* Queue writes run before unsubmitted commands, which may
                  * still sample the old contents, so use a new texture */
-                release_texture_object(binding);
+                release_texture_object(r, binding);
                 create_texture_object(r, binding);
                 upload_texture_data(pg, binding);
                 binding->hash = hash;
@@ -884,41 +912,45 @@ static void bind_texture(PGRAPHState *pg, int texture_idx)
 
 /* Guest CPU writes to texture memory don't set texture_dirty, so every enabled
  * texture is looked up again on each draw, which checks its pages. The bind
- * group is only rebuilt when a binding or its texture object changes. */
+ * group for a texture and sampler set is reused from the cache. */
 void pgraph_wgpu_bind_textures(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
 
     for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
-        TextureBinding *old_binding = r->texture_bindings[i];
-        WGPUTextureView old_view = old_binding ? old_binding->view : NULL;
-
         if (pgraph_is_texture_enabled(pg, i)) {
             bind_texture(pg, i);
         } else {
             r->texture_bindings[i] = NULL;
         }
         pg->texture_dirty[i] = false;
+    }
+}
 
+static void texture_bind_key(PGRAPHWgpuState *r, const WgpuTextureLayout *l,
+                             WgpuTextureBindKey *key)
+{
+    memset(key, 0, sizeof(*key));
+    key->layout = l;
+    for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
+        if (l->types[i] == PSH_TEXTURE_TYPE_NONE) {
+            continue;
+        }
         TextureBinding *binding = r->texture_bindings[i];
-        if (binding != old_binding || (binding && binding->view != old_view)) {
-            r->texture_bindings_changed = true;
+        key->views[i] = r->dummy_texture_views[l->types[i]];
+        key->samplers[i] = r->dummy_sampler;
+        if (binding && binding->type == l->types[i]) {
+            key->views[i] = binding->view;
+            key->samplers[i] = binding->sampler;
         }
     }
 }
 
-WGPUBindGroup pgraph_wgpu_get_texture_bind_group(PGRAPHWgpuState *r,
-                                                 const WgpuTextureLayout *l)
+static WGPUBindGroup create_texture_bind_group(PGRAPHWgpuState *r,
+                                               const WgpuTextureLayout *l,
+                                               const WgpuTextureBindKey *key)
 {
-    if (r->texture_bind_group && !r->texture_bindings_changed &&
-        r->texture_bind_group_layout == l) {
-        return r->texture_bind_group;
-    }
-    if (r->texture_bind_group) {
-        wgpuBindGroupRelease(r->texture_bind_group);
-    }
-
     WGPUBindGroupEntry entries[2 * NV2A_MAX_TEXTURES];
     size_t num_entries = 0;
 
@@ -926,26 +958,20 @@ WGPUBindGroup pgraph_wgpu_get_texture_bind_group(PGRAPHWgpuState *r,
         if (l->types[i] == PSH_TEXTURE_TYPE_NONE) {
             continue;
         }
-
-        TextureBinding *binding = r->texture_bindings[i];
-        WGPUTextureView view = r->dummy_texture_views[l->types[i]];
-        WGPUSampler sampler = r->dummy_sampler;
-        if (binding && binding->type == l->types[i]) {
-            view = binding->view;
-            sampler = binding->sampler;
-        } else if (binding) {
+        if (r->texture_bindings[i] &&
+            r->texture_bindings[i]->type != l->types[i]) {
             NV2A_UNIMPLEMENTED("Texture %d type %d, shader expects %d", i,
-                               binding->type, l->types[i]);
+                               r->texture_bindings[i]->type, l->types[i]);
         }
 
         WGPUBindGroupEntry texture = WGPU_BIND_GROUP_ENTRY_INIT;
         texture.binding = 2 * i;
-        texture.textureView = view;
+        texture.textureView = key->views[i];
         entries[num_entries++] = texture;
 
         WGPUBindGroupEntry sampler_entry = WGPU_BIND_GROUP_ENTRY_INIT;
         sampler_entry.binding = 2 * i + 1;
-        sampler_entry.sampler = sampler;
+        sampler_entry.sampler = key->samplers[i];
         entries[num_entries++] = sampler_entry;
     }
 
@@ -954,10 +980,62 @@ WGPUBindGroup pgraph_wgpu_get_texture_bind_group(PGRAPHWgpuState *r,
     desc.layout = l->bind_group_layout;
     desc.entryCount = num_entries;
     desc.entries = entries;
-    r->texture_bind_group = wgpuDeviceCreateBindGroup(r->device, &desc);
-    r->texture_bind_group_layout = l;
-    r->texture_bindings_changed = false;
-    return r->texture_bind_group;
+    return wgpuDeviceCreateBindGroup(r->device, &desc);
+}
+
+void pgraph_wgpu_release_texture_bind_groups(PGRAPHWgpuState *r)
+{
+    for (int i = 0; i < WGPU_TEXTURE_BIND_CACHE; i++) {
+        WgpuTextureBindCacheEntry *entry = &r->texture_bind_cache[i];
+
+        if (!entry->used) {
+            continue;
+        }
+        wgpuBindGroupRelease(entry->group);
+        entry->group = NULL;
+        entry->used = false;
+    }
+}
+
+WGPUBindGroup pgraph_wgpu_get_texture_bind_group(PGRAPHWgpuState *r,
+                                                 const WgpuTextureLayout *l)
+{
+    WgpuTextureBindKey key;
+    WgpuTextureBindCacheEntry *free_slot = NULL;
+    WgpuTextureBindCacheEntry *oldest = NULL;
+
+    texture_bind_key(r, l, &key);
+    for (int i = 0; i < WGPU_TEXTURE_BIND_CACHE; i++) {
+        WgpuTextureBindCacheEntry *entry = &r->texture_bind_cache[i];
+
+        if (!entry->used) {
+            if (!free_slot) {
+                free_slot = entry;
+            }
+            continue;
+        }
+        if (!memcmp(&entry->key, &key, sizeof(key))) {
+            entry->stamp = ++r->texture_bind_stamp;
+            return entry->group;
+        }
+        if (!oldest || entry->stamp < oldest->stamp) {
+            oldest = entry;
+        }
+    }
+
+    WgpuTextureBindCacheEntry *slot = free_slot;
+    if (!slot) {
+        slot = oldest;
+        wgpuBindGroupRelease(slot->group);
+        slot->group = NULL;
+        slot->used = false;
+    }
+
+    slot->key = key;
+    slot->group = create_texture_bind_group(r, l, &key);
+    slot->stamp = ++r->texture_bind_stamp;
+    slot->used = true;
+    return slot->group;
 }
 
 static void texture_cache_entry_init(Lru *lru, LruNode *node, const void *key)
@@ -984,10 +1062,12 @@ static bool texture_cache_entry_pre_evict(Lru *lru, LruNode *node)
 
 static void texture_cache_entry_post_evict(Lru *lru, LruNode *node)
 {
+    PGRAPHWgpuState *r = container_of(lru, PGRAPHWgpuState, texture_cache);
     TextureBinding *binding = container_of(node, TextureBinding, node);
 
-    release_texture_object(binding);
+    release_texture_object(r, binding);
     if (binding->sampler) {
+        purge_texture_bind_groups(r, NULL, binding->sampler);
         wgpuSamplerRelease(binding->sampler);
         binding->sampler = NULL;
     }
@@ -1031,11 +1111,7 @@ void pgraph_wgpu_finalize_textures(PGRAPHState *pg)
     for (int i = 0; i < NV2A_MAX_TEXTURES; i++) {
         r->texture_bindings[i] = NULL;
     }
-    if (r->texture_bind_group) {
-        wgpuBindGroupRelease(r->texture_bind_group);
-        r->texture_bind_group = NULL;
-    }
-    r->texture_bind_group_layout = NULL;
+    pgraph_wgpu_release_texture_bind_groups(r);
 
     if (r->texture_cache_entries) {
         lru_flush(&r->texture_cache);

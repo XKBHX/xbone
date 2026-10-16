@@ -455,6 +455,8 @@ void pgraph_wgpu_finalize_shaders(PGRAPHState *pg)
 {
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
 
+    /* Bind groups hold the texture layouts destroyed below. */
+    pgraph_wgpu_release_texture_bind_groups(r);
     r->shader_binding = NULL;
     if (r->shader_cache) {
         g_hash_table_destroy(r->shader_cache);

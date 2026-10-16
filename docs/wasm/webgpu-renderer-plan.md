@@ -176,7 +176,7 @@ Each phase ends with a demonstrable exit criterion.
 | 1. Native bring-up | All six steps are done, plus the NV09F image blit. On macOS arm64 the dashboard renders fully textured with no WebGPU validation errors, and matches the Vulkan renderer side by side. The exit check against nxdk sample programs and the basic nxdk_pgraph_tests has not been run yet. Step 4 originally needed a Dawn built with the SPIR-V reader. Phase 3 step 3 removed that requirement. |
 | 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite, read back into a GL texture for the existing UI. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
 | 3. WGSL generator | Steps 1–3 are done. Step 1 translates draw shaders from the WebGPU-targeted GLSL. Step 2 did not need new shaders: the pack and unpack kernels and the display composite were already WGSL in phase 2. Step 3 creates every shader module with `WGPUShaderSourceWGSL`. The WebGPU backend no longer links glslang and does not request `ShaderSourceSPIRV`. glslang remains for Vulkan. A translation or Tint failure skips that draw. |
-| 4. Performance | Steps 1–2 are done. Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline. Blend color and the stencil reference stay dynamic. Step 2 coalesces surface readbacks into one submit and one map, and reads a surface back only when a draw has made it dirty and a consumer needs RAM. Steps 3–5 are not started. Frame times have not been compared with Vulkan. |
+| 4. Performance | Steps 1–3 are done. Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline. Blend color and the stencil reference stay dynamic. Step 2 coalesces surface readbacks into one submit and one map, and reads a surface back only when a draw has made it dirty and a consumer needs RAM. Step 3 caches texture bind groups and keeps a guest-RAM vertex buffer, uploaded in 64 KiB blocks. Attributes WebGPU cannot fetch stay on the CPU packer. Steps 4–5 are not started. Frame times have not been compared with Vulkan. |
 | 5. WebGPU UI and browser | Not started. |
 
 Phase 0 notes:
@@ -304,8 +304,9 @@ Phase 1 notes (step 4, draw path):
   - `CMP` stays `sint32` and is decoded in the shader.
 
   Surfaces that overlap the vertex data are downloaded first, in one
-  readback (phase 4 step 2). The VRAM mirror with dirty tracking is phase 4
-  step 3.
+  readback (phase 4 step 2). A guest-RAM mirror feeds draws whose
+  attributes fit a core vertex format (phase 4 step 3). The rest stay on
+  this packer.
 - Phase 2 primitive expansion was pulled forward, because WebGPU has no
   fans, quads or polygons. `prim.c` turns fans, polygons, quads, quad
   strips and line loops into index lists. Triangle and line lists, strips,
@@ -448,8 +449,9 @@ Phase 2 notes (step 2, point size and point sprites):
   - `PolygonMode_Point` didn't run with the release ISO and config used
     here, so polygon point mode hasn't been checked on screen.
 - Odd vertex formats and strides need nothing more for now. The CPU
-  packer from phase 1 already converts every format and stride. Reading
-  vertices straight from a guest RAM mirror is phase 4.
+  packer from phase 1 already converts every format and stride. Phase 4
+  step 3 reads the formats WebGPU supports from a guest RAM mirror and
+  leaves the others on this packer.
 
 Phase 2 notes (step 3, textures):
 
@@ -878,6 +880,25 @@ Phase 4 notes (step 2, fewer readback stalls):
 - Save state, flush, and overlapping eviction use the same batch. The
   display composite still maps its own buffer every present. Removing that
   readback is step 5.
+
+Phase 4 notes (step 3, bind groups and the RAM mirror):
+
+- Texture bind groups are kept in a 64-entry cache keyed by the shader
+  layout and the view and sampler bound on each stage. A stage the shader
+  does not sample is absent from the key. Switching back to a previous set
+  reuses the group. Releasing a texture view or sampler drops every group
+  that still names it, and shutdown releases the groups before the layouts.
+- Guest RAM is mirrored in one vertex buffer. Pages start invalid. A page
+  is invalid again when `DIRTY_MEMORY_NV2A` says the CPU wrote it, when a
+  surface download writes RAM, or when a non-TCG surface upload consumes
+  that dirty bit. Invalid pages inside a draw's vertex ranges are rounded
+  out to 64 KiB and written with one `wgpuQueueWriteBuffer` per block. A
+  draw already recorded against the buffer is submitted before that write.
+- The mirror is used only when every active attribute has a core WebGPU
+  format, a 4-byte-aligned stride and offset, and the draw is not an
+  indexed point list. `S32K` and 3-component 8/16-bit attributes stay on
+  the CPU packer, as do inline vertices. The shader still swizzles
+  `UB_D3D` and decodes `CMP`.
 
 **Exit**: frame times within about 20% of Vulkan on the same machine for the
 curated titles.
