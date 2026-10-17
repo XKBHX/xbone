@@ -22,7 +22,6 @@
 #include "xemu-xbe.h"
 
 #include <SDL3/SDL.h>
-#include <epoxy/gl.h>
 
 #include "block/aio.h"
 #include "block/block_int.h"
@@ -56,7 +55,9 @@ static void xemu_snapshots_load_data(BlockDriverState *bs_ro,
 {
     data->disc_path = NULL;
     data->xbe_title_name = NULL;
-    data->gl_thumbnail = 0;
+    data->thumbnail = 0;
+    data->thumbnail_width = 0;
+    data->thumbnail_height = 0;
 
     int res = bdrv_snapshot_load_tmp(bs_ro, info->id_str, info->name, err);
     if (res < 0) {
@@ -115,15 +116,14 @@ static void xemu_snapshots_load_data(BlockDriverState *bs_ro,
     offset += 4;
 
     if (thumbnail_size) {
-        GLuint thumbnail;
-        glGenTextures(1, &thumbnail);
+        int width = 0;
+        int height = 0;
+
         assert(size >= (offset + thumbnail_size));
-        if (xemu_snapshots_load_png_to_texture(thumbnail, &buf[offset],
-                                               thumbnail_size)) {
-            data->gl_thumbnail = thumbnail;
-        } else {
-            glDeleteTextures(1, &thumbnail);
-        }
+        data->thumbnail = xemu_snapshots_create_thumbnail(
+            &buf[offset], thumbnail_size, &width, &height);
+        data->thumbnail_width = width;
+        data->thumbnail_height = height;
         offset += thumbnail_size;
     }
 
@@ -142,9 +142,7 @@ static void xemu_snapshots_all_load_data(QEMUSnapshotInfo **info,
     if (*data) {
         for (int i = 0; i < xemu_snapshots_len; ++i) {
             g_free((*data)[i].xbe_title_name);
-            if ((*data)[i].gl_thumbnail) {
-                glDeleteTextures(1, &((*data)[i].gl_thumbnail));
-            }
+            xemu_snapshots_destroy_thumbnail((*data)[i].thumbnail);
         }
         g_free(*data);
     }

@@ -19,6 +19,8 @@ WGPUTextureView xemu_wgpu_ui_prepare_target(int width, int height);
 void xemu_wgpu_ui_mark_scene(void);
 void xemu_wgpu_ui_register_texture(uint64_t id);
 void xemu_wgpu_ui_unregister_texture(uint64_t id);
+bool xemu_wgpu_ui_renderer(const char **vendor, const char **adapter,
+                           const char **driver, const char **shader);
 #else
 static inline bool xemu_wgpu_ui_init(SDL_Window *) { return false; }
 static inline void xemu_wgpu_ui_shutdown(void) {}
@@ -26,4 +28,9 @@ static inline bool xemu_wgpu_ui_active(void) { return false; }
 static inline void xemu_wgpu_ui_new_frame(void) {}
 static inline void xemu_wgpu_ui_render(void) {}
 static inline void xemu_wgpu_ui_rebuild_fonts(void) {}
+static inline bool xemu_wgpu_ui_renderer(const char **, const char **,
+                                         const char **, const char **)
+{
+    return false;
+}
 #endif

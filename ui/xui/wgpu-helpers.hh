@@ -39,6 +39,12 @@ bool wgpu_helpers_render_framebuffer(uint32_t tex, int width, int height,
                                      bool flip, const float scale[2]);
 bool wgpu_helpers_framebuffer_png(uint32_t tex, bool flip, int width,
                                   int height, std::vector<uint8_t> &png);
+bool wgpu_helpers_upload_rgba_frame(const uint8_t *rgba, int width,
+                                    int height);
+bool wgpu_helpers_has_guest_frame(void);
+bool wgpu_helpers_guest_size(int *width, int *height);
+uint64_t wgpu_helpers_create_image(const uint8_t *rgba, int width, int height);
+void wgpu_helpers_release_image(uint64_t id);
 uint64_t wgpu_helpers_icon(int *width, int *height);
 #else
 static inline bool wgpu_helpers_active(void)
@@ -97,6 +103,31 @@ static inline bool wgpu_helpers_framebuffer_png(uint32_t, bool, int, int,
                                                 std::vector<uint8_t> &)
 {
     return false;
+}
+static inline bool wgpu_helpers_upload_rgba_frame(const uint8_t *, int, int)
+{
+    return false;
+}
+static inline bool wgpu_helpers_has_guest_frame(void)
+{
+    return false;
+}
+static inline bool wgpu_helpers_guest_size(int *width, int *height)
+{
+    if (width) {
+        *width = 0;
+    }
+    if (height) {
+        *height = 0;
+    }
+    return false;
+}
+static inline uint64_t wgpu_helpers_create_image(const uint8_t *, int, int)
+{
+    return 0;
+}
+static inline void wgpu_helpers_release_image(uint64_t)
+{
 }
 static inline uint64_t wgpu_helpers_icon(int *width, int *height)
 {

@@ -18,9 +18,10 @@ manual under `docs/` (which only builds `.rst`).
 
 The tree inherits upstream QEMU's Emscripten host support and adds a native
 WebAssembly TCG backend. When `display.renderer` is `WEBGPU`, Dear ImGui,
-the logo, controller and memory-unit art, the icon, and the scaled gamma
-blit run on a Dawn device on the UI thread. That image is read back into
-the OpenGL window. Snapshot thumbnails are still OpenGL. A WebGPU NV2A
+the logo, controller and memory-unit art, the icon, the scaled gamma
+blit, snapshot thumbnails, and the VGA fallback run on a Dawn device on
+the UI thread. That image is read back into the OpenGL window. An
+accelerated frame is still copied from its GL texture. A WebGPU NV2A
 renderer runs natively (Dawn); see the status table in
 [webgpu-renderer-plan.md](webgpu-renderer-plan.md#implementation-status).
 
@@ -70,11 +71,11 @@ What blocks an xemu WASM build today:
 
 - `epoxy` (OpenGL loader) is declared `required: true` in `meson.build`. The
   xemu UI (`ui/xemu.c`, `ui/xui/`) is SDL3 + OpenGL. When the NV2A renderer
-  is WebGPU, Dear ImGui and the HUD art draw on a UI-thread Dawn device and
-  the result is read back into the OpenGL window. OpenGL and Vulkan keep
-  the OpenGL3 backend and the GLSL HUD shaders. Snapshot thumbnails, the
-  VGA fallback, and the other direct GL users in `ui/xemu.c` and `ui/xui/`
-  are still OpenGL and are linked unconditionally.
+  is WebGPU, Dear ImGui, the HUD art, snapshot thumbnails, and the VGA
+  fallback draw on a UI-thread Dawn device. The result is read back into
+  the OpenGL window, and an accelerated frame is still copied from its GL
+  texture. OpenGL and Vulkan keep the OpenGL3 backend and the GLSL HUD
+  shaders. Those paths, and the window present, are linked unconditionally.
 - Both GPU renderers (`hw/xbox/nv2a/pgraph/gl`, `.../vk`) need desktop
   OpenGL. The Vulkan renderer still shows its frames through OpenGL by
   importing them with `GL_EXT_memory_object`.

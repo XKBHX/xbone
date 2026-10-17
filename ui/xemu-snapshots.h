@@ -27,7 +27,6 @@ extern "C" {
 #endif
 
 #include "block/snapshot.h"
-#include <epoxy/gl.h>
 
 #define XEMU_SNAPSHOT_DATA_MAGIC 0x78656d75 // 'xemu'
 #define XEMU_SNAPSHOT_DATA_VERSION 1
@@ -40,7 +39,9 @@ extern const char **g_snapshot_shortcut_index_key_map[];
 typedef struct XemuSnapshotData {
     char *disc_path;
     char *xbe_title_name;
-    GLuint gl_thumbnail;
+    uint64_t thumbnail;
+    int thumbnail_width;
+    int thumbnail_height;
 } XemuSnapshotData;
 
 // Implemented in xemu-snapshots.c
@@ -56,8 +57,10 @@ bool xemu_snapshots_offset_extra_data(QEMUFile *f);
 void xemu_snapshots_mark_dirty(void);
 
 // Implemented in xemu-thumbnail.cc
-void xemu_snapshots_set_framebuffer_texture(GLuint tex, bool flip);
-bool xemu_snapshots_load_png_to_texture(GLuint tex, void *buf, size_t size);
+void xemu_snapshots_set_framebuffer_texture(uint32_t tex, bool flip);
+uint64_t xemu_snapshots_create_thumbnail(const void *buf, size_t size,
+                                         int *width, int *height);
+void xemu_snapshots_destroy_thumbnail(uint64_t thumbnail);
 void *xemu_snapshots_create_framebuffer_thumbnail_png(size_t *size);
 
 #ifdef __cplusplus

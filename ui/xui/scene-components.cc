@@ -135,6 +135,10 @@ void NavControlAnnotation::Draw()
 }
 
 #if 0
+#include "stb_image.h"
+#include "wgpu-helpers.hh"
+#include "wgpu-ui.hh"
+
 class BigStateIcon {
 protected:
     EasingAnimation m_animation;
@@ -182,7 +186,7 @@ public:
 class TitleInfo
 {
 protected:
-    GLuint screenshot;
+    uint64_t screenshot;
     ImVec2 size;
     EasingAnimation m_animation;
 
@@ -191,6 +195,21 @@ public:
     : m_animation(0.2, 0.2)
     {
         screenshot = 0;
+    }
+
+    ~TitleInfo()
+    {
+        GLuint name;
+
+        if (!screenshot) {
+            return;
+        }
+        if (xemu_wgpu_ui_active()) {
+            wgpu_helpers_release_image(screenshot);
+            return;
+        }
+        name = (GLuint)screenshot;
+        glDeleteTextures(1, &name);
     }
 
     void Show()
@@ -211,20 +230,26 @@ public:
     void initScreenshot()
     {
         if (screenshot == 0) {
-            glGenTextures(1, &screenshot);
             int w, h, n;
+            GLuint name = 0;
             stbi_set_flip_vertically_on_load(0);
             unsigned char *data = stbi_load("./data/cover_front.jpg", &w, &h, &n, 4);
             assert(data);
             assert(n == 4 || n == 3);
-            glActiveTexture(GL_TEXTURE0);
-            glBindTexture(GL_TEXTURE_2D, screenshot);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL,  0);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,     GL_CLAMP_TO_BORDER);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,     GL_CLAMP_TO_BORDER);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+            if (xemu_wgpu_ui_active()) {
+                screenshot = wgpu_helpers_create_image(data, w, h);
+            } else {
+                glGenTextures(1, &name);
+                glActiveTexture(GL_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, name);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL,  0);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,     GL_CLAMP_TO_BORDER);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,     GL_CLAMP_TO_BORDER);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+                screenshot = name;
+            }
             stbi_image_free(data);
 
             // Fix width
@@ -259,7 +284,7 @@ public:
             ImVec2 p0 = ImGui::GetItemRectMin();
             ImVec2 p1 = ImGui::GetItemRectMax();
             ImDrawList *draw_list = ImGui::GetWindowDrawList();
-            draw_list->AddImageRounded((ImTextureID)screenshot, p0, p1, ImVec2(0, 0), ImVec2(1, 1), ImGui::GetColorU32(ImVec4(1,1,1,m_animation.getSinInterpolatedValue())), 3*g_viewport_mgr.m_scale);
+            draw_list->AddImageRounded((ImTextureID)(uintptr_t)screenshot, p0, p1, ImVec2(0, 0), ImVec2(1, 1), ImGui::GetColorU32(ImVec4(1,1,1,m_animation.getSinInterpolatedValue())), 3*g_viewport_mgr.m_scale);
 
             ImGui::NextColumn();
 

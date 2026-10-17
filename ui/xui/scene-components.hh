@@ -17,6 +17,7 @@
 // along with this program.  If not, see <http://www.gnu.org/licenses/>.
 //
 #pragma once
+#include <stdint.h>
 #include <string>
 #include <vector>
 #include "animation.hh"
@@ -76,12 +77,13 @@ public:
 class TitleInfo
 {
 protected:
-    GLuint screenshot;
+    uint64_t screenshot;
     ImVec2 size;
     EasingAnimation m_animation;
 
 public:
     TitleInfo();
+    ~TitleInfo();
     void Show();
     void Hide();
     bool IsAnimating();

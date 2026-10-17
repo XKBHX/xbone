@@ -1066,13 +1066,19 @@ static float GetDisplayAspectRatio(int width, int height)
 
 void RenderFramebuffer(GLint tex, int width, int height, bool flip)
 {
-    int tw, th;
+    int tw = 0, th = 0;
     float scale[2];
 
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tw);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &th);
+    if (wgpu_helpers_active() && tex == 0) {
+        if (!wgpu_helpers_guest_size(&tw, &th)) {
+            return;
+        }
+    } else {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &tw);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &th);
+    }
 
     // Calculate scaling factors
     if (g_config.display.ui.fit == CONFIG_DISPLAY_UI_FIT_STRETCH) {
@@ -1103,10 +1109,19 @@ bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, in
 {
     int width, height;
 
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+    if (wgpu_helpers_active() && tex == 0) {
+        if (!wgpu_helpers_guest_size(&width, &height)) {
+            return false;
+        }
+    } else {
+        if (!tex) {
+            return false;
+        }
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &height);
+    }
 
     width = height * GetDisplayAspectRatio(width, height);
 
