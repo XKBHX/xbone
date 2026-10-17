@@ -941,11 +941,14 @@ Phase 4 notes (step 5, shared display):
 - The PFIFO thread calls `BeginAccess`, records the display pass, submits,
   calls `EndAccess`, and waits until the queue is idle before waking the UI.
   The next frame cannot begin until that UI present has returned.
-- On macOS the image is an IOSurface in `kCVPixelFormatType_32RGBA`, which
-  Dawn maps to `rgba8unorm`. `CGLTexImageIOSurface2D` accepts
+- On macOS the image is an IOSurface in `kCVPixelFormatType_32BGRA`, which
+  Dawn maps to `bgra8unorm`. `CGLTexImageIOSurface2D` accepts
   `GL_TEXTURE_RECTANGLE` with `GL_BGRA` and `GL_UNSIGNED_INT_8_8_8_8_REV`.
-  On little-endian that is the byte order R, G, B, A. A rectangle texture
-  cannot be sampled with the UI's normalized coordinates, so it is blitted
+  On little-endian that is the byte order B, G, R, A. An `rgba8unorm`
+  surface swaps red and blue under that pair: the boot animation's
+  yellow-green logo reads as teal, and the green dashboard hides it.
+  A rectangle texture cannot be sampled with the UI's normalized
+  coordinates, so it is blitted
   to a `GL_TEXTURE_2D`. The WGSL Y flip is unchanged. One frame of that 2D
   texture matched a `CopySrc` readback of the same image at 640×480, so the
   shared picture is not inverted. The comparison was removed.

@@ -29,8 +29,10 @@
 #include <IOSurface/IOSurface.h>
 #include <OpenGL/CGLCurrent.h>
 #include <OpenGL/CGLIOSurface.h>
-/* kCVPixelFormatType_32RGBA. Dawn maps those bytes to rgba8unorm. */
-#define DISPLAY_IOSURFACE_RGBA 0x52474241u
+/* kCVPixelFormatType_32BGRA. Dawn maps it to bgra8unorm. CGL reads
+ * GL_BGRA + UNSIGNED_INT_8_8_8_8_REV as B, G, R, A, so an rgba8unorm
+ * surface (R, G, B, A) swaps red and blue. */
+#define DISPLAY_IOSURFACE_BGRA 0x42475241u
 #elif defined(__linux__)
 #include <fcntl.h>
 #include <unistd.h>
@@ -381,6 +383,9 @@ static void finalize_shared_os(WgpuDisplayState *disp)
     (void)disp;
 }
 
+static void ensure_display_pipeline(PGRAPHWgpuState *r,
+                                    WGPUTextureFormat format);
+
 static bool adopt_shared_texture(PGRAPHWgpuState *r,
                                  WGPUSharedTextureMemory memory,
                                  unsigned int width, unsigned int height)
@@ -397,7 +402,8 @@ static bool adopt_shared_texture(PGRAPHWgpuState *r,
     if (!memory ||
         wgpuSharedTextureMemoryGetProperties(memory, &props) !=
             WGPUStatus_Success ||
-        props.format != WGPUTextureFormat_RGBA8Unorm ||
+        (props.format != WGPUTextureFormat_RGBA8Unorm &&
+         props.format != WGPUTextureFormat_BGRA8Unorm) ||
         props.size.width != width || props.size.height != height ||
         (props.usage & need) != need) {
         return false;
@@ -427,6 +433,7 @@ static bool adopt_shared_texture(PGRAPHWgpuState *r,
     disp->shared = true;
     disp->shared_initialized = false;
     disp->shared_serial++;
+    ensure_display_pipeline(r, props.format);
     return true;
 }
 
@@ -461,7 +468,7 @@ static bool create_shared_display(PGRAPHWgpuState *r, unsigned int width,
     iosurface_dict_set_int(props, kIOSurfaceBytesPerElement, 4);
     iosurface_dict_set_int(props, kIOSurfaceBytesPerRow, row_bytes);
     iosurface_dict_set_int(props, kIOSurfacePixelFormat,
-                           (int)DISPLAY_IOSURFACE_RGBA);
+                           (int)DISPLAY_IOSURFACE_BGRA);
     surface = IOSurfaceCreate(props);
     CFRelease(props);
     if (!surface) {
@@ -856,6 +863,7 @@ static void ensure_display_target(PGRAPHWgpuState *r, unsigned int width,
                    &disp->height, width, height,
                    WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc,
                    "Display");
+    ensure_display_pipeline(r, WGPUTextureFormat_RGBA8Unorm);
 }
 
 static void upload_pvideo_image(PGRAPHState *pg, const PvideoState *state)
@@ -1061,6 +1069,47 @@ static WGPUBindGroupLayoutEntry sampler_entry(uint32_t binding)
     return entry;
 }
 
+static void ensure_display_pipeline(PGRAPHWgpuState *r, WGPUTextureFormat format)
+{
+    WgpuDisplayState *disp = &r->display;
+    WGPUPipelineLayoutDescriptor layout_desc =
+        WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    WGPUColorTargetState color_target = WGPU_COLOR_TARGET_STATE_INIT;
+    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+    WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    WGPUPipelineLayout layout;
+
+    if (disp->pipeline && disp->format == format) {
+        return;
+    }
+    if (disp->pipeline) {
+        wgpuRenderPipelineRelease(disp->pipeline);
+        disp->pipeline = NULL;
+    }
+
+    layout_desc.bindGroupLayoutCount = 1;
+    layout_desc.bindGroupLayouts = &disp->bind_group_layout;
+    layout = wgpuDeviceCreatePipelineLayout(r->device, &layout_desc);
+
+    color_target.format = format;
+    color_target.writeMask = WGPUColorWriteMask_Red | WGPUColorWriteMask_Green |
+                             WGPUColorWriteMask_Blue | WGPUColorWriteMask_Alpha;
+
+    fragment.module = disp->module;
+    fragment.entryPoint = pgraph_wgpu_str("fs");
+    fragment.targetCount = 1;
+    fragment.targets = &color_target;
+
+    desc.label = pgraph_wgpu_str("Display");
+    desc.layout = layout;
+    desc.vertex.module = disp->module;
+    desc.vertex.entryPoint = pgraph_wgpu_str("vs");
+    desc.fragment = &fragment;
+    disp->pipeline = wgpuDeviceCreateRenderPipeline(r->device, &desc);
+    disp->format = format;
+    wgpuPipelineLayoutRelease(layout);
+}
+
 void pgraph_wgpu_init_display(PGRAPHState *pg)
 {
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
@@ -1092,32 +1141,7 @@ void pgraph_wgpu_init_display(PGRAPHState *pg)
     disp->bind_group_layout =
         wgpuDeviceCreateBindGroupLayout(r->device, &bgl_desc);
 
-    WGPUPipelineLayoutDescriptor layout_desc =
-        WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
-    layout_desc.bindGroupLayoutCount = 1;
-    layout_desc.bindGroupLayouts = &disp->bind_group_layout;
-    WGPUPipelineLayout layout =
-        wgpuDeviceCreatePipelineLayout(r->device, &layout_desc);
-
-    WGPUColorTargetState color_target = WGPU_COLOR_TARGET_STATE_INIT;
-    color_target.format = WGPUTextureFormat_RGBA8Unorm;
-    color_target.writeMask = WGPUColorWriteMask_Red | WGPUColorWriteMask_Green |
-                             WGPUColorWriteMask_Blue | WGPUColorWriteMask_Alpha;
-
-    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
-    fragment.module = disp->module;
-    fragment.entryPoint = pgraph_wgpu_str("fs");
-    fragment.targetCount = 1;
-    fragment.targets = &color_target;
-
-    WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
-    desc.label = pgraph_wgpu_str("Display");
-    desc.layout = layout;
-    desc.vertex.module = disp->module;
-    desc.vertex.entryPoint = pgraph_wgpu_str("vs");
-    desc.fragment = &fragment;
-    disp->pipeline = wgpuDeviceCreateRenderPipeline(r->device, &desc);
-    wgpuPipelineLayoutRelease(layout);
+    ensure_display_pipeline(r, WGPUTextureFormat_RGBA8Unorm);
 
     disp->frame_sampler = create_sampler(
         r, "Display frame", WGPUFilterMode_Nearest, WGPUFilterMode_Nearest);
@@ -1285,6 +1309,7 @@ void pgraph_wgpu_render_display(PGRAPHState *pg)
                            WGPUTextureUsage_RenderAttachment |
                                WGPUTextureUsage_CopySrc,
                            "Display");
+            ensure_display_pipeline(r, WGPUTextureFormat_RGBA8Unorm);
         } else {
             record_display_pass(pg);
             pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_PRESENTING, false);
@@ -1348,10 +1373,10 @@ static bool bind_shared_display(WgpuDisplayState *disp)
     }
 
     /*
-     * GL_BGRA + UNSIGNED_INT_8_8_8_8_REV is the 8-bit color pair CGL
-     * accepts, and on little-endian it is the byte order R, G, B, A.
-     * That matches the rgba8unorm IOSurface. The target has to be a
-     * rectangle texture, which the UI cannot sample, so blit it to 2D.
+     * GL_BGRA + UNSIGNED_INT_8_8_8_8_REV is the 8-bit pair CGL accepts.
+     * On little-endian the first byte is blue, which matches the
+     * bgra8unorm IOSurface. The target has to be a rectangle texture,
+     * which the UI cannot sample, so blit it to 2D.
      */
     glBindTexture(GL_TEXTURE_RECTANGLE, iosurface_rect);
     if (disp->gl_serial != disp->shared_serial) {
