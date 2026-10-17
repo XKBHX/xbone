@@ -655,6 +655,7 @@ static void mouse_define(DisplayChangeListener *dcl,
     }
 }
 
+#ifdef CONFIG_OPENGL
 static void xb_surface_gl_create_texture(DisplaySurface *surface)
 {
     assert(QEMU_IS_ALIGNED(surface_stride(surface), surface_bytes_per_pixel(surface)));
@@ -703,6 +704,7 @@ static void xb_surface_gl_destroy_texture(DisplaySurface *surface)
     glDeleteTextures(1, &surface->texture);
     surface->texture = 0;
 }
+#endif
 
 static bool xb_console_gl_check_format(DisplayChangeListener *dcl,
                                        pixman_format_code_t format)
@@ -900,10 +902,45 @@ static uint8_t *surface_to_rgba(DisplaySurface *surface)
  * Renders the main interface. Usually called from the main thread,
  * but may sometimes be called from another thread.
  */
+static void render_canvas_frame(struct xemu_console *scon)
+{
+    int display_w = 0;
+    int display_h = 0;
+
+    if (nv2a_wgpu_display_size(&display_w, &display_h)) {
+        xemu_hud_set_device_frame(display_w, display_h);
+        xemu_hud_set_framebuffer_texture(0, false);
+    } else {
+        uint8_t *rgba;
+
+        xemu_hud_clear_device_frame();
+        xemu_hud_set_framebuffer_texture(0, true);
+        xemu_main_loop_lock();
+        rgba = surface_to_rgba(scon->surface);
+        if (rgba) {
+            xemu_hud_upload_rgba_frame(rgba, surface_width(scon->surface),
+                                       surface_height(scon->surface));
+            g_free(rgba);
+        }
+        xemu_main_loop_unlock();
+    }
+
+    xemu_main_loop_lock();
+    xemu_hud_update();
+    xemu_main_loop_unlock();
+    xemu_hud_render();
+}
+
 static void gl_render_frame(struct xemu_console *scon)
 {
     static bool rendering;
     if (qatomic_xchg(&rendering, true) || qatomic_read(&qemu_exiting)) {
+        return;
+    }
+
+    if (!scon->winctx) {
+        render_canvas_frame(scon);
+        qatomic_set(&rendering, false);
         return;
     }
 
@@ -953,11 +990,15 @@ static void gl_render_frame(struct xemu_console *scon)
             xemu_hud_upload_rgba_frame(rgba, surface_width(scon->surface),
                                        surface_height(scon->surface));
         g_free(rgba);
+#ifdef CONFIG_OPENGL
         if (!uploaded) {
             xb_surface_gl_create_texture(scon->surface);
             tex = scon->surface->texture;
             release_surface_texture = true;
         }
+#else
+        (void)uploaded;
+#endif
         flip_required = true;
         xemu_main_loop_unlock();
     }
@@ -985,11 +1026,15 @@ static void gl_render_frame(struct xemu_console *scon)
     xemu_hud_render();
     glFinish();
 
+#ifdef CONFIG_OPENGL
     if (release_surface_texture) {
         xemu_main_loop_lock();
         xb_surface_gl_destroy_texture(scon->surface);
         xemu_main_loop_unlock();
     }
+#else
+    (void)release_surface_texture;
+#endif
 
     if (hold_surface) {
         nv2a_release_framebuffer_surface();
@@ -1131,7 +1176,16 @@ static void display_very_early_init(DisplayOptions *o)
 #endif
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
 
+    bool webgpu_canvas = false;
+#ifdef __EMSCRIPTEN__
+    webgpu_canvas =
+        g_config.display.renderer == CONFIG_DISPLAY_RENDERER_WEBGPU;
+#endif
+
     // Initialize rendering context
+    if (webgpu_canvas) {
+        fprintf(stderr, "[WebGPU] Window presents to the canvas\n");
+    } else {
     SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
     SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
     SDL_GL_SetAttribute(SDL_GL_BLUE_SIZE, 8);
@@ -1144,6 +1198,7 @@ static void display_very_early_init(DisplayOptions *o)
         SDL_GL_CONTEXT_PROFILE_MASK,
         SDL_GL_CONTEXT_PROFILE_CORE);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    }
 
     char *title = g_strdup_printf("xemu | v%s"
 #ifdef XEMU_DEBUG_BUILD
@@ -1185,7 +1240,10 @@ static void display_very_early_init(DisplayOptions *o)
         window_height = min_window_height;
     }
 
-    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    if (!webgpu_canvas) {
+        window_flags |= SDL_WINDOW_OPENGL;
+    }
 
     // Create main window
     m_window = SDL_CreateWindow(
@@ -1205,32 +1263,47 @@ static void display_very_early_init(DisplayOptions *o)
         SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     }
 
-    m_context = SDL_GL_CreateContext(m_window);
-
-    if (m_context != NULL && epoxy_gl_version() < 40) {
-        SDL_GL_MakeCurrent(NULL, NULL);
-        SDL_GL_DestroyContext(m_context);
+    if (webgpu_canvas) {
         m_context = NULL;
-    }
+        nv2a_context_init();
+    } else {
+        m_context = SDL_GL_CreateContext(m_window);
 
-    if (m_context == NULL) {
-        SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
-            "Unable to create OpenGL context",
-            "Unable to create OpenGL context. This usually means the\r\n"
-            "graphics device on this system does not support OpenGL 4.0.\r\n"
-            "\r\n"
-            "xemu cannot continue and will now exit.",
-            m_window);
-        SDL_DestroyWindow(m_window);
-        SDL_Quit();
-        exit(1);
+        if (m_context != NULL && epoxy_gl_version() < 40) {
+            SDL_GL_MakeCurrent(NULL, NULL);
+            SDL_GL_DestroyContext(m_context);
+            m_context = NULL;
+        }
+
+        if (m_context == NULL) {
+            SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
+                "Unable to create OpenGL context",
+                "Unable to create OpenGL context. This usually means the\r\n"
+                "graphics device on this system does not support OpenGL 4.0.\r\n"
+                "\r\n"
+                "xemu cannot continue and will now exit.",
+                m_window);
+            SDL_DestroyWindow(m_window);
+            SDL_Quit();
+            exit(1);
+        }
+
+        fprintf(stderr, "GL_VENDOR: %s\n", glGetString(GL_VENDOR));
+        fprintf(stderr, "GL_RENDERER: %s\n", glGetString(GL_RENDERER));
+        fprintf(stderr, "GL_VERSION: %s\n", glGetString(GL_VERSION));
+        fprintf(stderr, "GL_SHADING_LANGUAGE_VERSION: %s\n",
+                glGetString(GL_SHADING_LANGUAGE_VERSION));
+        nv2a_context_init();
+        SDL_GL_MakeCurrent(NULL, NULL);
     }
 
     int width, height, channels = 0;
     stbi_set_flip_vertically_on_load(0);
-    unsigned char *icon_data = stbi_load_from_memory(xemu_64x64_data, xemu_64x64_size, &width, &height, &channels, 4);
+    unsigned char *icon_data = stbi_load_from_memory(
+        xemu_64x64_data, xemu_64x64_size, &width, &height, &channels, 4);
     if (icon_data) {
-        SDL_Surface *icon = SDL_CreateSurfaceFrom(width, height, SDL_PIXELFORMAT_RGBA32, icon_data, width*4);
+        SDL_Surface *icon = SDL_CreateSurfaceFrom(
+            width, height, SDL_PIXELFORMAT_RGBA32, icon_data, width * 4);
         if (icon) {
             SDL_SetWindowIcon(m_window, icon);
         }
@@ -1240,14 +1313,6 @@ static void display_very_early_init(DisplayOptions *o)
 
     fprintf(stderr, "CPU: %s\n", xemu_get_cpu_info());
     fprintf(stderr, "OS_Version: %s\n", xemu_get_os_info());
-    fprintf(stderr, "GL_VENDOR: %s\n", glGetString(GL_VENDOR));
-    fprintf(stderr, "GL_RENDERER: %s\n", glGetString(GL_RENDERER));
-    fprintf(stderr, "GL_VERSION: %s\n", glGetString(GL_VERSION));
-    fprintf(stderr, "GL_SHADING_LANGUAGE_VERSION: %s\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
-
-    // Initialize offscreen rendering context now
-    nv2a_context_init();
-    SDL_GL_MakeCurrent(NULL, NULL);
 }
 
 static void display_early_init(DisplayOptions *o)
@@ -1255,8 +1320,10 @@ static void display_early_init(DisplayOptions *o)
     assert(o->type == DISPLAY_TYPE_XEMU);
     display_opengl = 1;
 
-    SDL_GL_MakeCurrent(m_window, m_context);
-    SDL_GL_SetSwapInterval(g_config.display.window.vsync ? 1 : 0);
+    if (m_context) {
+        SDL_GL_MakeCurrent(m_window, m_context);
+        SDL_GL_SetSwapInterval(g_config.display.window.vsync ? 1 : 0);
+    }
 #ifdef _WIN32
     win32_dxgi_present_init(m_window);
 #endif
@@ -1277,7 +1344,9 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     int i;
 
     assert(o->type == DISPLAY_TYPE_XEMU);
-    SDL_GL_MakeCurrent(m_window, m_context);
+    if (m_context) {
+        SDL_GL_MakeCurrent(m_window, m_context);
+    }
 
     gui_fullscreen = o->has_full_screen && o->full_screen;
     gui_fullscreen |= g_config.display.window.fullscreen_on_startup;
@@ -1333,7 +1402,9 @@ static void display_init(DisplayState *ds, DisplayOptions *o)
     }
 
     /* Tell main thread to go ahead and create the app and enter the run loop */
-    SDL_GL_MakeCurrent(NULL, NULL);
+    if (m_context) {
+        SDL_GL_MakeCurrent(NULL, NULL);
+    }
     qemu_sem_post(&display_init_sem);
 }
 
@@ -1347,8 +1418,10 @@ static void display_finalize(void)
 #ifdef _WIN32
     win32_dxgi_present_cleanup();
 #endif
-    SDL_GL_MakeCurrent(NULL, NULL);
-    SDL_GL_DestroyContext(m_context);
+    if (m_context) {
+        SDL_GL_MakeCurrent(NULL, NULL);
+        SDL_GL_DestroyContext(m_context);
+    }
     SDL_DestroyWindow(m_window);
     SDL_Quit();
 }

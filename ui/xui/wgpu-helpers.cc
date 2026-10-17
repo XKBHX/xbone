@@ -144,6 +144,8 @@ static WGPUPipelineLayout g_pipeline_layout;
 static WGPURenderPipeline g_mask_pipe[3];
 static WGPURenderPipeline g_logo_pipe;
 static WGPURenderPipeline g_gamma_pipe;
+static WGPURenderPipeline g_gamma_window;
+static WGPUTextureFormat g_window_format = WGPUTextureFormat_RGBA8Unorm;
 static WGPUSampler g_sampler_linear;
 static WGPUSampler g_sampler_nearest;
 static WGPUBuffer g_uniform_buffer;
@@ -460,7 +462,8 @@ static void set_blend(WGPUBlendState *blend, int mode)
     blend->alpha.dstFactor = blend->color.dstFactor;
 }
 
-static WGPURenderPipeline make_pipeline(const char *entry, int blend)
+static WGPURenderPipeline make_pipeline(const char *entry, int blend,
+                                        WGPUTextureFormat format)
 {
     WGPUBlendState blend_state = WGPU_BLEND_STATE_INIT;
     WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
@@ -470,7 +473,7 @@ static WGPURenderPipeline make_pipeline(const char *entry, int blend)
     WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
 
     set_blend(&blend_state, blend);
-    target.format = WGPUTextureFormat_RGBA8Unorm;
+    target.format = format;
     target.blend = &blend_state;
     target.writeMask = WGPUColorWriteMask_All;
 
@@ -594,14 +597,16 @@ static bool create_pipelines(void)
     layout_desc.bindGroupLayouts = layouts;
     g_pipeline_layout = wgpuDeviceCreatePipelineLayout(device, &layout_desc);
 
-    g_mask_pipe[DECAL_BLEND_REPLACE] =
-        make_pipeline("fs_mask", DECAL_BLEND_REPLACE);
-    g_mask_pipe[DECAL_BLEND_UNDER] =
-        make_pipeline("fs_mask", DECAL_BLEND_UNDER);
-    g_mask_pipe[DECAL_BLEND_ALPHA] =
-        make_pipeline("fs_mask", DECAL_BLEND_ALPHA);
-    g_logo_pipe = make_pipeline("fs_logo", DECAL_BLEND_REPLACE);
-    g_gamma_pipe = make_pipeline("fs_gamma", DECAL_BLEND_REPLACE);
+    g_mask_pipe[DECAL_BLEND_REPLACE] = make_pipeline(
+        "fs_mask", DECAL_BLEND_REPLACE, WGPUTextureFormat_RGBA8Unorm);
+    g_mask_pipe[DECAL_BLEND_UNDER] = make_pipeline(
+        "fs_mask", DECAL_BLEND_UNDER, WGPUTextureFormat_RGBA8Unorm);
+    g_mask_pipe[DECAL_BLEND_ALPHA] = make_pipeline(
+        "fs_mask", DECAL_BLEND_ALPHA, WGPUTextureFormat_RGBA8Unorm);
+    g_logo_pipe = make_pipeline("fs_logo", DECAL_BLEND_REPLACE,
+                                WGPUTextureFormat_RGBA8Unorm);
+    g_gamma_pipe = make_pipeline("fs_gamma", DECAL_BLEND_REPLACE,
+                                 WGPUTextureFormat_RGBA8Unorm);
     ok = pop_errors("widget shaders");
     return ok && g_module && g_uniform_layout && g_texture_layout &&
            g_pipeline_layout && g_mask_pipe[0] && g_mask_pipe[1] &&
@@ -1085,6 +1090,11 @@ void wgpu_helpers_shutdown(void)
         wgpuRenderPipelineRelease(g_gamma_pipe);
         g_gamma_pipe = NULL;
     }
+    if (g_gamma_window) {
+        wgpuRenderPipelineRelease(g_gamma_window);
+        g_gamma_window = NULL;
+    }
+    g_window_format = WGPUTextureFormat_RGBA8Unorm;
     if (g_uniform_group) {
         wgpuBindGroupRelease(g_uniform_group);
         g_uniform_group = NULL;
@@ -1248,7 +1258,41 @@ void wgpu_helpers_draw(const float scale_offset[4],
     g_cmds.push_back(cmd);
 }
 
-static void draw_gamma(WGPUBindGroup source, const float scale[2], bool flip)
+static void rebuild_window_gamma(void)
+{
+    if (g_gamma_window) {
+        wgpuRenderPipelineRelease(g_gamma_window);
+        g_gamma_window = NULL;
+    }
+    if (!g_gpu || g_window_format == WGPUTextureFormat_Undefined ||
+        g_window_format == WGPUTextureFormat_RGBA8Unorm) {
+        return;
+    }
+    g_gamma_window = make_pipeline("fs_gamma", DECAL_BLEND_REPLACE,
+                                   g_window_format);
+}
+
+void wgpu_helpers_set_window_format(WGPUTextureFormat format)
+{
+    if (format == WGPUTextureFormat_Undefined) {
+        format = WGPUTextureFormat_RGBA8Unorm;
+    }
+    if (format == g_window_format &&
+        (format == WGPUTextureFormat_RGBA8Unorm || g_gamma_window || !g_gpu)) {
+        g_window_format = format;
+        return;
+    }
+    g_window_format = format;
+    rebuild_window_gamma();
+}
+
+static WGPURenderPipeline window_gamma_pipeline(void)
+{
+    return g_gamma_window ? g_gamma_window : g_gamma_pipe;
+}
+
+static void draw_gamma(WGPUBindGroup source, const float scale[2], bool flip,
+                       WGPURenderPipeline pipeline)
 {
     WidgetUniform uniform = {};
 
@@ -1258,7 +1302,7 @@ static void draw_gamma(WGPUBindGroup source, const float scale[2], bool flip)
     uniform.tex_scale_offset[1] = 1.0f;
     uniform.params[2] = flip ? 1.0f : 0.0f;
     fill_palette(&uniform);
-    draw_quad(g_gamma_pipe, source, uniform);
+    draw_quad(pipeline, source, uniform);
 }
 
 bool wgpu_helpers_render_framebuffer(uint32_t tex, int width, int height,
@@ -1468,7 +1512,7 @@ static bool replay_frame(const UiCmd &cmd, WGPUTextureView display)
         return false;
     }
     if (source) {
-        draw_gamma(source, scale, cmd.flip);
+        draw_gamma(source, scale, cmd.flip, window_gamma_pipeline());
     }
     end_render_pass();
     submit_encoder();
@@ -1648,7 +1692,7 @@ void wgpu_helpers_run_png(WGPUTextureView display)
         }
         return;
     }
-    draw_gamma(source, scale, g_png_flip);
+    draw_gamma(source, scale, g_png_flip, g_gamma_pipe);
     end_render_pass();
     stride = row_stride(g_png_req_w);
     bytes = (size_t)stride * (size_t)g_png_req_h;

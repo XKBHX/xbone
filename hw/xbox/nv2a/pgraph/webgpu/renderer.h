@@ -223,8 +223,8 @@ typedef struct WgpuDisplayState {
 
     /*
      * Native builds can render the composite into memory that GL samples
-     * directly. The readback above is the fallback when that import fails,
-     * and the only path in the browser.
+     * directly. The readback above is the fallback when that import fails.
+     * The browser presents the composite and the UI into the canvas.
      */
 #ifndef __EMSCRIPTEN__
     WGPUSharedTextureMemory shared_memory;
@@ -560,6 +560,16 @@ void pgraph_wgpu_image_blit(NV2AState *d);
 void pgraph_wgpu_init_display(PGRAPHState *pg);
 void pgraph_wgpu_finalize_display(PGRAPHState *pg);
 void pgraph_wgpu_render_display(PGRAPHState *pg);
+#ifdef __EMSCRIPTEN__
+/* Binds #canvas on the PFIFO thread. The view is owned by the display
+ * until pgraph_wgpu_display_canvas_release. wgpuSurfacePresent is not
+ * called. */
+bool pgraph_wgpu_display_canvas_acquire(PGRAPHWgpuState *r,
+                                        WGPUTextureView *view,
+                                        WGPUTextureFormat *format, int *width,
+                                        int *height);
+void pgraph_wgpu_display_canvas_release(PGRAPHWgpuState *r);
+#endif
 void pgraph_wgpu_copy_adapter_text(char *vendor, size_t vendor_size,
                                    char *device, size_t device_size,
                                    char *description, size_t description_size);
