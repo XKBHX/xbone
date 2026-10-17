@@ -23,9 +23,11 @@ icon, the scaled gamma blit, snapshot thumbnails, and the VGA fallback.
 The PFIFO thread plays that recording on the NV2A Dawn device and samples
 the display composite directly. Natively the combined image is read back
 into the OpenGL window. In the browser the same passes are recorded into
-the page canvas. That page has to be cross-origin isolated, or the build's
-pthreads never start. `wasm/serve.py` sends the headers; see the phase 5
-browser step 5 notes in
+the page canvas. A Chromium boot of the bundled disc draws an nxdk pgraph
+test frame on that canvas. Later UI submits can fail because the canvas
+texture has already been destroyed. That page has to be cross-origin
+isolated, or the build's pthreads never start. `wasm/serve.py` sends the
+headers; see the phase 5 browser step 5 notes in
 [webgpu-renderer-plan.md](webgpu-renderer-plan.md#implementation-status).
 A WebGPU NV2A renderer runs natively (Dawn); see the status
 table in
