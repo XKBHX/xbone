@@ -177,7 +177,7 @@ Each phase ends with a demonstrable exit criterion.
 | 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite. Phase 4 step 5 shares that image with GL; the readback remains the fallback. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
 | 3. WGSL generator | Steps 1–3 are done. Step 1 translates draw shaders from the WebGPU-targeted GLSL. Step 2 did not need new shaders: the pack and unpack kernels and the display composite were already WGSL in phase 2. Step 3 creates every shader module with `WGPUShaderSourceWGSL`. The WebGPU backend no longer links glslang and does not request `ShaderSourceSPIRV`. glslang remains for Vulkan. A translation or Tint failure skips that draw. |
 | 4. Performance | Steps 1–5 are done. Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline. Blend color and the stencil reference stay dynamic. Step 2 coalesces surface readbacks into one submit and one map, and reads a surface back only when a draw has made it dirty and a consumer needs RAM. Step 3 caches texture bind groups and keeps a guest-RAM vertex buffer, uploaded in 64 KiB blocks. Attributes WebGPU cannot fetch stay on the CPU packer. Step 4 expands packed texture texels in a compute shader. Step 5 imports the display composite into the GL texture the UI already samples. Frame times have not been compared with Vulkan. |
-| 5. WebGPU UI and browser | Steps 1–4 are done. When `display.renderer` is `WEBGPU`, the UI thread records ImGui and the HUD and posts that work to the PFIFO thread. The PFIFO thread samples the display composite and records the UI pass on the NV2A device. The window present is still a readback of that combined image into OpenGL. The browser work is not started. |
+| 5. WebGPU UI and browser | Steps 1–4 are done. When `display.renderer` is `WEBGPU`, the UI thread records ImGui and the HUD and posts that work to the PFIFO thread. The PFIFO thread samples the display composite and records the UI pass on the NV2A device. The window present is still a readback of that combined image into OpenGL. Browser step 1 is done: `tests/wasm/webgpu-offscreen-spike` creates an emdawnwebgpu device on a pthread and clears a transferred `OffscreenCanvas`. In Chromium on macOS arm64 the canvas was green and the readback matched the clear. Browser steps 2–5 are not started. |
 
 Phase 0 notes:
 
@@ -1146,6 +1146,51 @@ Phase 5 notes (step 4, one device):
   a GL texture. The fit scale uses that size.
 - `qemu-system-i386-unsigned` links in `build/webgpu-native-check` on macOS
   arm64. The dashboard, menus, and a screenshot were not compared on screen.
+
+Phase 5 notes (browser step 1, OffscreenCanvas spike):
+
+- The xemu WASM configure still stops at `subprojects/dsp56300`. This step
+  is a standalone program, `tests/wasm/webgpu-offscreen-spike`, and it is
+  not linked into xemu. It was built with the local emsdk 6.0.12
+  (`emcc` reports `6.0.12`) and `--use-port=emdawnwebgpu`. The docker image
+  is still emsdk 3.1.50.
+- emdawnwebgpu ships `webgpu.cpp`, so `emcc` refuses the link. The spike
+  links with `em++`. A later xemu WASM link has to do the same, or pass
+  `-sDEFAULT_TO_CXX`.
+- The flags follow the browser threading model: `-pthread`,
+  `-sPROXY_TO_PTHREAD=1`, `-sOFFSCREENCANVAS_SUPPORT=1`, `-sASYNCIFY=1`,
+  and `-sPTHREAD_POOL_SIZE=2`. `OFFSCREENCANVAS_SUPPORT` requires the `GL`
+  library to be linked, so the link forces `$GL` in. Nothing draws with
+  WebGL. The page was served with `COOP: same-origin` and
+  `COEP: require-corp` (`emrun`). `crossOriginIsolated` was true.
+- `main` runs on a worker because of `PROXY_TO_PTHREAD`, which is where
+  xemu's main thread runs in the browser. It creates one pthread with
+  `emscripten_pthread_attr_settransferredcanvases("#canvas")`. Emscripten
+  proxies that create to the page thread. The page thread calls
+  `transferControlToOffscreen` and posts the canvas to the new worker.
+  That worker is the stand-in for the PFIFO thread. The spike's report
+  line `worker=1` means `document` was missing there.
+- On that worker the instance is created with `TimedWaitAny`. The adapter
+  and device are requested with `WGPUCallbackMode_WaitAnyOnly` and
+  `wgpuInstanceWaitAny`, the same calls as `webgpu/instance.c`. Asyncify
+  is what lets `WaitAny` return. The surface chain is
+  `WGPUEmscriptenSurfaceSourceCanvasHTMLSelector` with selector `#canvas`.
+  emdawnwebgpu resolves the selector with `findCanvasEventTarget` and,
+  when `OFFSCREENCANVAS_SUPPORT` is set, calls `getContext('webgpu')` on
+  `canvas.offscreenCanvas`.
+- `wgpuSurfacePresent` aborts in this emdawnwebgpu. The clear shows up
+  because the canvas context is configured and a render pass is submitted
+  on `getCurrentTexture()`. The canvas usage includes `CopySrc`. A
+  one-pixel `copyTextureToBuffer` matched the clear. The next browser
+  step should present the same way and leave `wgpuSurfacePresent` uncalled.
+- Checked in the Cursor Chromium tab on macOS arm64 (Apple M1 Pro). The
+  adapter info was vendor `apple`, architecture `metal-3`. The device and
+  description strings were empty. The canvas format was `bgra8unorm`.
+  The device was created with `depth32float-stencil8`. Also present, and
+  only queried: `texture-compression-bc`, `clip-distances`,
+  `depth-clip-control`, and `float32-filterable`. The clear
+  `(0.15, 0.75, 0.30)` read back as bytes `(38, 191, 77, 255)`, and the
+  canvas on the page was that green. There was no page exception.
 
 **Exit**: natively, the xemu UI runs entirely on WebGPU with no OpenGL. In
 the browser, an nxdk test XBE renders in Chrome with the game and UI on one
