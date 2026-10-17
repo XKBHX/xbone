@@ -172,8 +172,8 @@ static bool create_overlay_gl(void)
 {
     static const char *vs_src =
         "#version 150\n"
-        "layout(location = 0) in vec2 a_pos;\n"
-        "layout(location = 1) in vec2 a_uv;\n"
+        "in vec2 a_pos;\n"
+        "in vec2 a_uv;\n"
         "out vec2 v_uv;\n"
         "void main() {\n"
         "    v_uv = a_uv;\n"
@@ -195,12 +195,15 @@ static bool create_overlay_gl(void)
     GLuint vs = glCreateShader(GL_VERTEX_SHADER);
     GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
     GLint ok = 0;
+    char log[512];
+    GLsizei len = 0;
 
     glShaderSource(vs, 1, &vs_src, NULL);
     glCompileShader(vs);
     glGetShaderiv(vs, GL_COMPILE_STATUS, &ok);
     if (!ok) {
-        fprintf(stderr, "[WebGPU] UI overlay vertex shader failed\n");
+        glGetShaderInfoLog(vs, sizeof(log), &len, log);
+        fprintf(stderr, "[WebGPU] UI overlay vertex shader failed: %s\n", log);
         glDeleteShader(vs);
         glDeleteShader(fs);
         return false;
@@ -209,7 +212,9 @@ static bool create_overlay_gl(void)
     glCompileShader(fs);
     glGetShaderiv(fs, GL_COMPILE_STATUS, &ok);
     if (!ok) {
-        fprintf(stderr, "[WebGPU] UI overlay fragment shader failed\n");
+        glGetShaderInfoLog(fs, sizeof(log), &len, log);
+        fprintf(stderr, "[WebGPU] UI overlay fragment shader failed: %s\n",
+                log);
         glDeleteShader(vs);
         glDeleteShader(fs);
         return false;
@@ -218,6 +223,9 @@ static bool create_overlay_gl(void)
     g_overlay_program = glCreateProgram();
     glAttachShader(g_overlay_program, vs);
     glAttachShader(g_overlay_program, fs);
+    /* GLSL 150 has no layout(location) on inputs. */
+    glBindAttribLocation(g_overlay_program, 0, "a_pos");
+    glBindAttribLocation(g_overlay_program, 1, "a_uv");
     glLinkProgram(g_overlay_program);
     glDeleteShader(vs);
     glDeleteShader(fs);
