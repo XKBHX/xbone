@@ -101,6 +101,9 @@ typedef struct GenPshGlslOptions {
     PgraphGlslTarget target;
     int ubo_binding;
     int tex_binding;
+    /* WebGPU only: also write frag depth to a color target. depth24plus
+     * cannot be sampled, so this is the readable copy. */
+    bool depth_color_copy;
 } GenPshGlslOptions;
 
 MString *pgraph_glsl_gen_psh(const PshState *state, GenPshGlslOptions opts);

@@ -178,7 +178,7 @@ Each phase ends with a demonstrable exit criterion.
 | 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite. Phase 4 step 5 shares that image with GL; the readback remains the fallback. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
 | 3. WGSL generator | Steps 1–3 are done. Step 1 translates draw shaders from the WebGPU-targeted GLSL. Step 2 did not need new shaders: the pack and unpack kernels and the display composite were already WGSL in phase 2. Step 3 creates every shader module with `WGPUShaderSourceWGSL`. The WebGPU backend no longer links glslang and does not request `ShaderSourceSPIRV`. glslang remains for Vulkan. A translation or Tint failure skips that draw. |
 | 4. Performance | Steps 1–5 are done. Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline. Blend color and the stencil reference stay dynamic. Step 2 coalesces surface readbacks into one submit and one map, and reads a surface back only when a draw has made it dirty and a consumer needs RAM. Step 3 caches texture bind groups and keeps a guest-RAM vertex buffer, uploaded in 64 KiB blocks. Attributes WebGPU cannot fetch stay on the CPU packer. Step 4 expands packed texture texels in a compute shader. Step 5 imports the display composite into the GL texture the UI already samples. Frame times have not been compared with Vulkan. |
-| 5. WebGPU UI and browser | Steps 1–4 are done. When `display.renderer` is `WEBGPU`, the UI thread records ImGui and the HUD and posts that work to the PFIFO thread. The PFIFO thread samples the display composite and records the UI pass on the NV2A device. Natively the window present is still a readback of that combined image into OpenGL. Browser steps 1 and 2 are done. Step 1 (`tests/wasm/webgpu-offscreen-spike`) creates an emdawnwebgpu device on a pthread and clears a transferred `OffscreenCanvas`. Step 2 presents on that canvas: `canvas.c` binds `#canvas` on the PFIFO thread, the UI gamma blit writes the PCRTC composite into the current texture, and ImGui follows in the next pass. `get_framebuffer_surface` returns 0. `wgpuSurfacePresent` is not called. In Chromium on macOS arm64 the step 2 page was green with a red corner, and the readback matched. The xemu WASM binary links and, in Chromium, draws the menu bar onto the canvas. It then aborts because a store hits the Emscripten heap canary at address zero. Browser step 3 is done. A pending `wgpuInstanceWaitAny` suspends through Asyncify. JSPI works in the standalone present test and is not the xemu link, because coroutine fibers still use Asyncify stacks. A finished future is polled and does not suspend. The browser does not map the display image. Browser steps 4 and 5 are not started. |
+| 5. WebGPU UI and browser | Steps 1–4 are done. When `display.renderer` is `WEBGPU`, the UI thread records ImGui and the HUD and posts that work to the PFIFO thread. The PFIFO thread samples the display composite and records the UI pass on the NV2A device. Natively the window present is still a readback of that combined image into OpenGL. Browser steps 1 and 2 are done. Step 1 (`tests/wasm/webgpu-offscreen-spike`) creates an emdawnwebgpu device on a pthread and clears a transferred `OffscreenCanvas`. Step 2 presents on that canvas: `canvas.c` binds `#canvas` on the PFIFO thread, the UI gamma blit writes the PCRTC composite into the current texture, and ImGui follows in the next pass. `get_framebuffer_surface` returns 0. `wgpuSurfacePresent` is not called. In Chromium on macOS arm64 the step 2 page was green with a red corner, and the readback matched. The xemu WASM binary links and, in Chromium, draws the menu bar onto the canvas. It then aborts because a store hits the Emscripten heap canary at address zero. Browser step 3 is done. A pending `wgpuInstanceWaitAny` suspends through Asyncify. JSPI works in the standalone present test and is not the xemu link, because coroutine fibers still use Asyncify stacks. A finished future is polled and does not suspend. The browser does not map the display image. Browser step 4 is done. Optional features are requested when the adapter has them. `depth32float-stencil8` is no longer required: Z16 falls back to `depth32float`, and Z24S8 falls back to `depth24plus-stencil8` plus an `r32float` depth copy. Stencil readback on that fallback is 0. DXT uses `texture-compression-bc` for 2D and cube textures whose base size is a multiple of 4, and `s3tc_decompress` otherwise. `clip-distances` is detected and left off; clip planes stay a fragment discard. Without `depth-clip-control` the vertex shader clamps clip Z. `XEMU_WEBGPU_DISABLE_FEATURES` forces a fallback. The host test `test-nv2a-webgpu-features` passes. The fallbacks were not booted. Browser step 5 is not started. |
 
 Phase 0 notes:
 
@@ -229,9 +229,9 @@ Phase 1 notes (steps 1, 2, 3 and 6):
   before any commands that haven't been submitted yet, so every upload
   submits the open encoder first. Surface textures are only released, never
   destroyed, because an unsubmitted encoder may still reference them.
-- The device now requires `depth32float-stencil8` (the adapter's feature
-  list is checked first). Uncaptured errors and device loss are logged with
-  the `[WebGPU]` prefix.
+- The device requests `depth32float-stencil8` when the adapter lists it.
+  Phase 5 browser step 4 makes that feature optional. Uncaptured errors
+  and device loss are logged with the `[WebGPU]` prefix.
 - `webgpu/surface.c` is a port of `vk/surface.c`: the same binding,
   eviction, expiry and CPU-access-callback logic. Format conversion runs on
   the CPU for now:
@@ -1274,6 +1274,65 @@ Phase 5 notes (browser step 3, blocking waits):
   and 11 ms for all 12 waits). On these short waits the two mechanisms
   overlap. The full xemu wasm binary was not run again. The changed
   files compile in `build/wasm/xemu` and in `build/webgpu-native-check`.
+
+Phase 5 notes (browser step 4, feature fallbacks):
+
+- Device creation no longer fails when an optional feature is missing.
+  `instance.c` logs each one as `[WebGPU] name: on`, `present (fallback)`,
+  `absent (fallback)`, or `off (XEMU_WEBGPU_DISABLE_FEATURES)`. Requested
+  when the adapter has them: `depth32float-stencil8`,
+  `texture-compression-bc`, `depth-clip-control`, and
+  `float32-filterable` (the last one falls back to `rgba16float` for
+  16-bit texels). `clip-distances` is logged and not requested. The
+  generator does not emit `gl_ClipDistance`. Window clip and the clip-plane
+  texture mode already `discard`, and a hardware clip distance would fight
+  the reconstructed `gl_FragDepth`.
+- `pgraph_wgpu_zeta_backing` picks the zeta image. With
+  `depth32float-stencil8`, Z16 and Z24S8 stay on that format. Without it,
+  Z16 is `depth32float`. That format has no stencil aspect, so stencil
+  load, store, and masks stay off. Z24S8 is `depth24plus-stencil8`, which
+  can only be a render attachment. That surface also keeps an `r32float`
+  `depth_copy` with `RenderAttachment`, `TextureBinding`, `CopySrc`, and
+  `CopyDst`.
+- On a device without `depth32float-stencil8`, every draw fragment shader
+  writes `@location(1) depthCopy` with the same expression as
+  `gl_FragDepth`. Draw pipelines and draw render passes then have two
+  color targets. Target 1 is written only for `depth24plus-stencil8` when
+  the depth test and the depth write are both on. A dummy `rgba8unorm` or
+  `r32float` target fills a missing color target, or a zeta that is not
+  that Z24 fallback. Clears stay a single target. A Z clear of a surface
+  that has `depth_copy` is a second pass: the fragment shader returns
+  `@builtin(position).z`, and the viewport depth range is the clear depth,
+  so several clears in one submit do not share a uniform.
+- A download of that depth samples `depth_copy` as `texture_2d<f32>` and
+  packs Z24 with stencil 0. The stencil of `depth24plus-stencil8` cannot
+  be copied out. An upload still draws `@builtin(frag_depth)` from an
+  `r32float` staging texture, then copies that image onto `depth_copy`.
+  Stencil upload copies the unpacked bytes to `r8uint` and draws one
+  fullscreen pass per distinct value. The fragment discards unless
+  `textureLoad` matches the reference, and the stencil op is `Replace`.
+  The references sit in one uniform buffer at 256-byte dynamic offsets.
+- DXT is `bc1-rgba-unorm`, `bc2-rgba-unorm`, or `bc3-rgba-unorm` when
+  `texture-compression-bc` is on, the texture is 2D or a cube, and the
+  base width and height are multiples of 4. Each block row is padded to
+  256 bytes. The copy extent is the physical block size, so a 2×2 mip is
+  one 4×4 block. 3D DXT, and any base size that is not a multiple of 4,
+  stay on `s3tc_decompress` into `rgba8unorm`.
+  `texture-compression-bc-sliced-3d` is not requested.
+- Without `depth-clip-control`, the WebGPU vertex shader clamps `oPos.z`
+  to `[0, oPos.w]` when `oPos.w > 0`, before the y-flip into
+  `gl_Position`. `vtxPos` was stored earlier, so the fragment shader still
+  reconstructs depth from it. With the feature, `draw.c` keeps
+  `unclippedDepth`.
+- `XEMU_WEBGPU_DISABLE_FEATURES` is a comma-separated list of those names,
+  including `float32-filterable`. Spaces around commas are ignored.
+  `tests/xbox/features/test-nv2a-webgpu-features` checks the parser and
+  the zeta choice. It does not need a GPU.
+- `qemu-system-i386-unsigned` links in `build/webgpu-native-check` on
+  macOS arm64, and that host test passes. The fallbacks were not booted.
+  The browser binary was not rebuilt. An M1 Pro has every feature, so a
+  default device still takes the `depth32float-stencil8` path. Set the
+  environment variable to exercise a fallback.
 
 **Exit**: natively, the xemu UI runs entirely on WebGPU with no OpenGL. In
 the browser, an nxdk test XBE renders in Chrome with the game and UI on one

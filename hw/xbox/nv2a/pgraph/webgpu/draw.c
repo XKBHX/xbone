@@ -27,6 +27,56 @@ static const char clear_wgsl[] =
     "    return vec4f(1.0);\n"
     "}\n";
 
+/* Viewport minDepth == maxDepth, so position.z is the clear depth. */
+static const char depth_copy_clear_wgsl[] =
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4f "
+    "{\n"
+    "    let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));\n"
+    "    return vec4f(uv * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n"
+    "@fragment fn fs(@builtin(position) pos: vec4f) -> @location(0) f32 {\n"
+    "    return pos.z;\n"
+    "}\n";
+
+static bool format_has_stencil(WGPUTextureFormat format)
+{
+    return format == WGPUTextureFormat_Depth32FloatStencil8 ||
+           format == WGPUTextureFormat_Depth24PlusStencil8;
+}
+
+static WGPUTextureView fallback_target(PGRAPHWgpuState *r, bool depth,
+                                       uint32_t width, uint32_t height)
+{
+    WGPUTexture *texture = depth ? &r->fallback_depth : &r->fallback_color;
+    WGPUTextureView *view =
+        depth ? &r->fallback_depth_view : &r->fallback_color_view;
+    uint32_t *stored_w =
+        depth ? &r->fallback_depth_width : &r->fallback_color_width;
+    uint32_t *stored_h =
+        depth ? &r->fallback_depth_height : &r->fallback_color_height;
+    WGPUTextureFormat format =
+        depth ? WGPUTextureFormat_R32Float : WGPUTextureFormat_RGBA8Unorm;
+
+    if (*texture && *stored_w == width && *stored_h == height) {
+        return *view;
+    }
+    if (*view) {
+        wgpuTextureViewRelease(*view);
+        wgpuTextureRelease(*texture);
+    }
+    WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+    desc.label =
+        pgraph_wgpu_str(depth ? "Fallback depth copy" : "Fallback color");
+    desc.usage = WGPUTextureUsage_RenderAttachment;
+    desc.size = (WGPUExtent3D){ width ? width : 1, height ? height : 1, 1 };
+    desc.format = format;
+    *texture = wgpuDeviceCreateTexture(r->device, &desc);
+    *view = wgpuTextureCreateView(*texture, NULL);
+    *stored_w = desc.size.width;
+    *stored_h = desc.size.height;
+    return *view;
+}
+
 static guint pipeline_key_hash(gconstpointer key)
 {
     return fast_hash(key, sizeof(PipelineKey));
@@ -47,6 +97,27 @@ void pgraph_wgpu_init_pipelines(PGRAPHState *pg)
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
 
     r->clear_module = pgraph_wgpu_create_wgsl_module(r, "Clear", clear_wgsl);
+    r->depth_copy_clear_module = pgraph_wgpu_create_wgsl_module(
+        r, "Depth copy clear", depth_copy_clear_wgsl);
+    if (r->depth_copy_clear_module) {
+        WGPUColorTargetState target = WGPU_COLOR_TARGET_STATE_INIT;
+        WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+        WGPURenderPipelineDescriptor desc =
+            WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+
+        target.format = WGPUTextureFormat_R32Float;
+        target.writeMask = WGPUColorWriteMask_All;
+        fragment.module = r->depth_copy_clear_module;
+        fragment.entryPoint = pgraph_wgpu_str("fs");
+        fragment.targetCount = 1;
+        fragment.targets = &target;
+        desc.label = pgraph_wgpu_str("Depth copy clear");
+        desc.vertex.module = r->depth_copy_clear_module;
+        desc.vertex.entryPoint = pgraph_wgpu_str("vs");
+        desc.fragment = &fragment;
+        r->depth_copy_clear_pipeline =
+            wgpuDeviceCreateRenderPipeline(r->device, &desc);
+    }
     r->clear_pipelines = g_array_new(false, true, sizeof(ClearPipeline));
     r->pipeline_cache = g_hash_table_new_full(
         pipeline_key_hash, pipeline_key_equal, g_free, release_pipeline);
@@ -65,6 +136,26 @@ void pgraph_wgpu_finalize_pipelines(PGRAPHState *pg)
         wgpuTextureRelease(r->scratch_zeta);
         r->scratch_zeta_view = NULL;
         r->scratch_zeta = NULL;
+    }
+    if (r->fallback_color_view) {
+        wgpuTextureViewRelease(r->fallback_color_view);
+        wgpuTextureRelease(r->fallback_color);
+        r->fallback_color_view = NULL;
+        r->fallback_color = NULL;
+    }
+    if (r->fallback_depth_view) {
+        wgpuTextureViewRelease(r->fallback_depth_view);
+        wgpuTextureRelease(r->fallback_depth);
+        r->fallback_depth_view = NULL;
+        r->fallback_depth = NULL;
+    }
+    if (r->depth_copy_clear_pipeline) {
+        wgpuRenderPipelineRelease(r->depth_copy_clear_pipeline);
+        r->depth_copy_clear_pipeline = NULL;
+    }
+    if (r->depth_copy_clear_module) {
+        wgpuShaderModuleRelease(r->depth_copy_clear_module);
+        r->depth_copy_clear_module = NULL;
     }
     if (r->clear_pipelines) {
         for (guint i = 0; i < r->clear_pipelines->len; i++) {
@@ -117,6 +208,15 @@ static WGPURenderPipeline create_clear_pipeline(PGRAPHWgpuState *r,
     depth_stencil.stencilBack = stencil_face;
     depth_stencil.stencilReadMask = 0xff;
     depth_stencil.stencilWriteMask = key->stencil_write ? 0xff : 0;
+    if (!format_has_stencil(key->zeta_format)) {
+        stencil_face.failOp = WGPUStencilOperation_Keep;
+        stencil_face.depthFailOp = WGPUStencilOperation_Keep;
+        stencil_face.passOp = WGPUStencilOperation_Keep;
+        depth_stencil.stencilFront = stencil_face;
+        depth_stencil.stencilBack = stencil_face;
+        depth_stencil.stencilReadMask = 0;
+        depth_stencil.stencilWriteMask = 0;
+    }
 
     WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
     desc.label = pgraph_wgpu_str("Clear");
@@ -225,7 +325,8 @@ void pgraph_wgpu_clear_surface(NV2AState *d, uint32_t parameter)
     if (zeta) {
         key.zeta_format = zeta->host_fmt.format;
         key.depth_write = parameter & NV097_CLEAR_SURFACE_Z;
-        key.stencil_write = parameter & NV097_CLEAR_SURFACE_STENCIL;
+        key.stencil_write = format_has_stencil(zeta->host_fmt.format) &&
+                            (parameter & NV097_CLEAR_SURFACE_STENCIL);
     }
     WGPURenderPipeline pipeline = get_clear_pipeline(r, &key);
 
@@ -246,8 +347,10 @@ void pgraph_wgpu_clear_surface(NV2AState *d, uint32_t parameter)
         ds_attachment.view = zeta->view;
         ds_attachment.depthLoadOp = WGPULoadOp_Load;
         ds_attachment.depthStoreOp = WGPUStoreOp_Store;
-        ds_attachment.stencilLoadOp = WGPULoadOp_Load;
-        ds_attachment.stencilStoreOp = WGPUStoreOp_Store;
+        if (format_has_stencil(zeta->host_fmt.format)) {
+            ds_attachment.stencilLoadOp = WGPULoadOp_Load;
+            ds_attachment.stencilStoreOp = WGPUStoreOp_Store;
+        }
         pass_desc.depthStencilAttachment = &ds_attachment;
     }
 
@@ -276,6 +379,28 @@ void pgraph_wgpu_clear_surface(NV2AState *d, uint32_t parameter)
     wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
     wgpuRenderPassEncoderEnd(pass);
     wgpuRenderPassEncoderRelease(pass);
+
+    if (zeta && zeta->depth_copy && r->depth_copy_clear_pipeline &&
+        (parameter & NV097_CLEAR_SURFACE_Z)) {
+        WGPURenderPassColorAttachment copy_attachment =
+            WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+        WGPURenderPassDescriptor copy_desc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+        copy_attachment.view = zeta->depth_copy_view;
+        copy_attachment.loadOp = WGPULoadOp_Load;
+        copy_attachment.storeOp = WGPUStoreOp_Store;
+        copy_desc.label = pgraph_wgpu_str("Depth copy clear");
+        copy_desc.colorAttachmentCount = 1;
+        copy_desc.colorAttachments = &copy_attachment;
+        pass = wgpuCommandEncoderBeginRenderPass(encoder, &copy_desc);
+        wgpuRenderPassEncoderSetPipeline(pass, r->depth_copy_clear_pipeline);
+        wgpuRenderPassEncoderSetViewport(pass, 0, 0, surface_width,
+                                         surface_height, depth, depth);
+        wgpuRenderPassEncoderSetScissorRect(pass, xmin, ymin, scissor_width,
+                                            scissor_height);
+        wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+        wgpuRenderPassEncoderEnd(pass);
+        wgpuRenderPassEncoderRelease(pass);
+    }
     pg->clearing = false;
 
     pgraph_wgpu_set_surface_dirty(pg, write_color, write_zeta);
@@ -459,9 +584,9 @@ static WGPURenderPipeline create_draw_pipeline(PGRAPHState *pg,
     stencil_face.failOp = WGPUStencilOperation_Keep;
     stencil_face.depthFailOp = WGPUStencilOperation_Keep;
     stencil_face.passOp = WGPUStencilOperation_Keep;
-    depth_stencil.stencilReadMask = 0xff;
+    depth_stencil.stencilReadMask = 0;
     depth_stencil.stencilWriteMask = 0;
-    if (stencil_test) {
+    if (format_has_stencil(key->zeta_format) && stencil_test) {
         uint32_t stencil_func =
             GET_MASK(control_1, NV_PGRAPH_CONTROL_1_STENCIL_FUNC);
         uint32_t op_fail =
@@ -544,10 +669,28 @@ static WGPURenderPipeline create_draw_pipeline(PGRAPHState *pg,
         color_target.blend = &blend;
     }
 
+    WGPUColorTargetState targets[2];
     WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
     fragment.module = b->psh;
     fragment.entryPoint = pgraph_wgpu_str("fs");
-    if (key->color_format != WGPUTextureFormat_Undefined) {
+    if (!r->depth32float_stencil8) {
+        /* Every fallback fragment shader writes @location(1). */
+        targets[0] = color_target;
+        if (key->color_format == WGPUTextureFormat_Undefined) {
+            targets[0] = (WGPUColorTargetState)WGPU_COLOR_TARGET_STATE_INIT;
+            targets[0].format = WGPUTextureFormat_RGBA8Unorm;
+            targets[0].writeMask = WGPUColorWriteMask_None;
+        }
+        targets[1] = (WGPUColorTargetState)WGPU_COLOR_TARGET_STATE_INIT;
+        targets[1].format = WGPUTextureFormat_R32Float;
+        targets[1].writeMask = WGPUColorWriteMask_None;
+        if (key->zeta_format == WGPUTextureFormat_Depth24PlusStencil8 &&
+            depth_test && depth_write) {
+            targets[1].writeMask = WGPUColorWriteMask_All;
+        }
+        fragment.targetCount = 2;
+        fragment.targets = targets;
+    } else if (key->color_format != WGPUTextureFormat_Undefined) {
         fragment.targetCount = 1;
         fragment.targets = &color_target;
     }
@@ -609,25 +752,55 @@ static void ensure_draw_render_pass(PGRAPHState *pg)
     }
     pgraph_wgpu_end_render_pass(r);
 
-    WGPURenderPassColorAttachment color_attachment =
-        WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
+    WGPURenderPassColorAttachment colors[2] = {
+        WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT,
+        WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT,
+    };
     WGPURenderPassDepthStencilAttachment ds_attachment =
         WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
     WGPURenderPassDescriptor desc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+    bool fallback = !r->depth32float_stencil8;
+    uint32_t fb_width = 1;
+    uint32_t fb_height = 1;
     desc.label = pgraph_wgpu_str("PGRAPH draw");
     if (r->color_binding) {
-        color_attachment.view = r->color_binding->view;
-        color_attachment.loadOp = WGPULoadOp_Load;
-        color_attachment.storeOp = WGPUStoreOp_Store;
+        fb_width = wgpuTextureGetWidth(r->color_binding->texture);
+        fb_height = wgpuTextureGetHeight(r->color_binding->texture);
+        colors[0].view = r->color_binding->view;
+        colors[0].loadOp = WGPULoadOp_Load;
+        colors[0].storeOp = WGPUStoreOp_Store;
         desc.colorAttachmentCount = 1;
-        desc.colorAttachments = &color_attachment;
+    } else if (fallback && r->zeta_binding) {
+        fb_width = wgpuTextureGetWidth(r->zeta_binding->texture);
+        fb_height = wgpuTextureGetHeight(r->zeta_binding->texture);
+        colors[0].view = fallback_target(r, false, fb_width, fb_height);
+        colors[0].loadOp = WGPULoadOp_Clear;
+        colors[0].storeOp = WGPUStoreOp_Discard;
+        desc.colorAttachmentCount = 1;
+    }
+    if (fallback && desc.colorAttachmentCount) {
+        if (r->zeta_binding && r->zeta_binding->depth_copy) {
+            colors[1].view = r->zeta_binding->depth_copy_view;
+            colors[1].loadOp = WGPULoadOp_Load;
+            colors[1].storeOp = WGPUStoreOp_Store;
+        } else {
+            colors[1].view = fallback_target(r, true, fb_width, fb_height);
+            colors[1].loadOp = WGPULoadOp_Clear;
+            colors[1].storeOp = WGPUStoreOp_Discard;
+        }
+        desc.colorAttachmentCount = 2;
+    }
+    if (desc.colorAttachmentCount) {
+        desc.colorAttachments = colors;
     }
     if (r->zeta_binding) {
         ds_attachment.view = r->zeta_binding->view;
         ds_attachment.depthLoadOp = WGPULoadOp_Load;
         ds_attachment.depthStoreOp = WGPUStoreOp_Store;
-        ds_attachment.stencilLoadOp = WGPULoadOp_Load;
-        ds_attachment.stencilStoreOp = WGPUStoreOp_Store;
+        if (format_has_stencil(r->zeta_binding->host_fmt.format)) {
+            ds_attachment.stencilLoadOp = WGPULoadOp_Load;
+            ds_attachment.stencilStoreOp = WGPUStoreOp_Store;
+        }
         desc.depthStencilAttachment = &ds_attachment;
     } else {
         WGPUTexture color = r->color_binding->texture;
