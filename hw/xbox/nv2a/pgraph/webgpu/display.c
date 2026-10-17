@@ -320,6 +320,7 @@ static void destroy_shared_display(PGRAPHWgpuState *r)
         end_shared_access(r);
     }
     destroy_texture(&disp->image, &disp->image_view);
+    disp->image_sampleable = false;
     if (disp->shared_memory) {
         wgpuSharedTextureMemoryRelease(disp->shared_memory);
         disp->shared_memory = NULL;
@@ -383,8 +384,7 @@ static void finalize_shared_os(WgpuDisplayState *disp)
     (void)disp;
 }
 
-static void ensure_display_pipeline(PGRAPHWgpuState *r,
-                                    WGPUTextureFormat format);
+static void ensure_display_pipeline(PGRAPHWgpuState *r, WGPUTextureFormat format);
 
 static bool adopt_shared_texture(PGRAPHWgpuState *r,
                                  WGPUSharedTextureMemory memory,
@@ -431,6 +431,7 @@ static bool adopt_shared_texture(PGRAPHWgpuState *r,
     disp->width = width;
     disp->height = height;
     disp->shared = true;
+    disp->image_sampleable = false;
     disp->shared_initialized = false;
     disp->shared_serial++;
     ensure_display_pipeline(r, props.format);
@@ -844,6 +845,33 @@ static void ensure_display_target(PGRAPHWgpuState *r, unsigned int width,
 {
     WgpuDisplayState *disp = &r->display;
 
+    /*
+     * The UI pass samples this image on the same device. A shared IOSurface
+     * is bgra8unorm and is not sampled here. Drop it and render rgba8unorm
+     * that the gamma blit can bind.
+     */
+    if (disp->sampleable) {
+#ifndef __EMSCRIPTEN__
+        if (disp->shared) {
+            destroy_shared_display(r);
+        }
+#endif
+        if (disp->image && !disp->image_sampleable) {
+            destroy_texture(&disp->image, &disp->image_view);
+            disp->width = 0;
+            disp->height = 0;
+        }
+        ensure_texture(r, &disp->image, &disp->image_view, &disp->width,
+                       &disp->height, width, height,
+                       WGPUTextureUsage_RenderAttachment |
+                           WGPUTextureUsage_CopySrc |
+                           WGPUTextureUsage_TextureBinding,
+                       "Display");
+        disp->image_sampleable = true;
+        ensure_display_pipeline(r, WGPUTextureFormat_RGBA8Unorm);
+        return;
+    }
+
 #ifndef __EMSCRIPTEN__
     if (r->shared_display && !qatomic_read(&disp->shared_gl_failed)) {
         if (disp->shared && disp->image && disp->width == width &&
@@ -863,6 +891,7 @@ static void ensure_display_target(PGRAPHWgpuState *r, unsigned int width,
                    &disp->height, width, height,
                    WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_CopySrc,
                    "Display");
+    disp->image_sampleable = false;
     ensure_display_pipeline(r, WGPUTextureFormat_RGBA8Unorm);
 }
 
@@ -1225,6 +1254,7 @@ void pgraph_wgpu_render_display(PGRAPHState *pg)
     WgpuDisplayState *disp = &r->display;
 
     disp->pixels_valid = false;
+    disp->presented = false;
     if (!disp->pipeline) {
         return;
     }
@@ -1323,6 +1353,13 @@ void pgraph_wgpu_render_display(PGRAPHState *pg)
     }
 #endif
     record_display_pass(pg);
+    disp->presented = true;
+    if (disp->sampleable) {
+        /* The UI pass samples this image in a later submit. Skip the
+         * CPU readback. Queue order makes the sample see this pass. */
+        pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_PRESENTING, false);
+        return;
+    }
     disp->pixels_valid = readback_display(pg);
 }
 

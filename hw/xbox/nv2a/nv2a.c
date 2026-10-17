@@ -200,6 +200,39 @@ int nv2a_get_screen_off(void)
     return g_nv2a->vga.sr[VGA_SEQ_CLOCK_MODE] & VGA_SR01_SCREEN_OFF;
 }
 
+#ifndef CONFIG_WEBGPU
+int nv2a_wgpu_display_size(int *width, int *height)
+{
+    if (width) {
+        *width = 0;
+    }
+    if (height) {
+        *height = 0;
+    }
+    return 0;
+}
+
+bool nv2a_wgpu_submit_ui(void)
+{
+    return false;
+}
+
+void nv2a_wgpu_copy_adapter(char *vendor, size_t vendor_size, char *name,
+                            size_t name_size, char *description,
+                            size_t description_size)
+{
+    if (vendor && vendor_size) {
+        vendor[0] = '\0';
+    }
+    if (name && name_size) {
+        name[0] = '\0';
+    }
+    if (description && description_size) {
+        description[0] = '\0';
+    }
+}
+#endif
+
 static void nv2a_vga_gfx_update(void *opaque)
 {
     VGACommonState *vga = opaque;

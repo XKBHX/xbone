@@ -1,10 +1,9 @@
 /*
  * WebGPU logo, controller art, and framebuffer blit.
  *
- * These draw on the UI-thread device from wgpu-ui.cc. ImGui samples the
- * resulting views directly. An accelerated game image is still a GL texture,
- * so that blit copies it with glGetTexImage until the UI pass moves to the
- * PFIFO device. The VGA fallback and snapshot thumbnails are uploaded here.
+ * The UI thread records these draws. The PFIFO thread plays them on the
+ * NV2A device, sampling the display composite directly. Texture ids are
+ * handles. VGA pixels and snapshot thumbnails are uploaded on that thread.
  *
  * Copyright (c) 2026 xemu Project
  *
@@ -56,6 +55,7 @@ struct ArtImage {
     int width;
     int height;
     uint64_t id;
+    std::vector<uint8_t> pixels;
 };
 
 struct FboImage {
@@ -81,9 +81,62 @@ struct OwnedImage {
     uint64_t id;
     int width;
     int height;
+    std::vector<uint8_t> pixels;
+    bool dirty;
 };
 
+enum class UiOp {
+    Begin,
+    Draw,
+    End,
+    Frame,
+};
+
+struct UiCmd {
+    UiOp op;
+    uint64_t target;
+    float clear_alpha;
+    int art;
+    int blend;
+    bool logo;
+    bool clip_flip;
+    float time;
+    float scale_offset[4];
+    float tex_scale_offset[4];
+    uint32_t primary;
+    uint32_t secondary;
+    uint32_t fill;
+    int width;
+    int height;
+    bool flip;
+    bool linear;
+    bool screen_off;
+    bool device;
+    float scale[2];
+};
+
+static const uint64_t kHandleBase = 0x100000000ull;
+
 static bool g_ready;
+static bool g_gpu;
+static uint64_t g_next_handle = kHandleBase;
+static std::vector<UiCmd> g_cmds;
+static std::vector<OwnedImage> g_dead;
+static bool g_device_frame;
+static int g_device_w;
+static int g_device_h;
+static std::vector<uint8_t> g_guest_pixels;
+static int g_guest_w;
+static int g_guest_h;
+static bool g_guest_dirty;
+static bool g_png_pending;
+static int g_png_req_w;
+static int g_png_req_h;
+static bool g_png_flip;
+static bool g_png_device;
+static bool g_png_linear;
+static bool g_png_off;
+static std::vector<uint8_t> g_png_rgb;
 static WGPUShaderModule g_module;
 static WGPUBindGroupLayout g_uniform_layout;
 static WGPUBindGroupLayout g_texture_layout;
@@ -261,6 +314,7 @@ static void release_art(ArtImage *art)
     }
     art->width = 0;
     art->height = 0;
+    art->pixels.clear();
 }
 
 static WGPUTexture make_texture(const char *label, WGPUTextureUsage usage,
@@ -334,6 +388,11 @@ static void upload_rgba(WGPUTexture texture, const uint8_t *tight, int width,
                           pixels.size(), &layout, &size);
 }
 
+static uint64_t alloc_handle(void)
+{
+    return g_next_handle++;
+}
+
 static bool load_art(ArtImage *art, const unsigned char *buf, unsigned size,
                      bool flip, bool publish)
 {
@@ -349,24 +408,36 @@ static bool load_art(ArtImage *art, const unsigned char *buf, unsigned size,
     }
     art->width = width;
     art->height = height;
+    art->pixels.assign(data, data + (size_t)width * (size_t)height * 4u);
+    stbi_image_free(data);
+    if (publish) {
+        art->id = alloc_handle();
+        xemu_wgpu_ui_register_texture(art->id);
+    }
+    return true;
+}
+
+static bool upload_art(ArtImage *art)
+{
+    if (art->group) {
+        return true;
+    }
+    if (art->pixels.empty()) {
+        return false;
+    }
     art->texture = make_texture(
         "UI art", WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst,
-        width, height);
+        art->width, art->height);
     if (art->texture) {
         art->view = make_view(art->texture);
     }
     if (art->view) {
         art->group = make_texture_group(art->view, g_sampler_linear);
-        upload_rgba(art->texture, data, width, height);
+        upload_rgba(art->texture, art->pixels.data(), art->width, art->height);
     }
-    stbi_image_free(data);
     if (!art->group) {
         release_art(art);
         return false;
-    }
-    if (publish) {
-        art->id = (uint64_t)(uintptr_t)art->view;
-        xemu_wgpu_ui_register_texture(art->id);
     }
     return true;
 }
@@ -675,41 +746,6 @@ static void draw_quad(WGPURenderPipeline pipeline, WGPUBindGroup textures,
     wgpuRenderPassEncoderDrawIndexed(g_pass, 6, 1, 0, 0, 0);
 }
 
-static bool read_gl_rgba(uint32_t name, std::vector<uint8_t> *pixels,
-                         int *width, int *height)
-{
-    GLint w = 0;
-    GLint h = 0;
-    GLint pack_align = 4;
-    GLint pack_row = 0;
-    GLenum error;
-
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, name);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &w);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &h);
-    if (w <= 0 || h <= 0) {
-        return false;
-    }
-    pixels->resize((size_t)w * (size_t)h * 4u);
-    glGetIntegerv(GL_PACK_ALIGNMENT, &pack_align);
-    glGetIntegerv(GL_PACK_ROW_LENGTH, &pack_row);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glPixelStorei(GL_PACK_ROW_LENGTH, 0);
-    while (glGetError() != GL_NO_ERROR) {
-    }
-    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels->data());
-    error = glGetError();
-    glPixelStorei(GL_PACK_ALIGNMENT, pack_align);
-    glPixelStorei(GL_PACK_ROW_LENGTH, pack_row);
-    if (error != GL_NO_ERROR) {
-        return false;
-    }
-    *width = w;
-    *height = h;
-    return true;
-}
-
 static void release_source(void)
 {
     if (g_source.linear) {
@@ -750,8 +786,7 @@ static bool ensure_source_texture(int width, int height)
     g_source.view = make_view(g_source.texture);
     if (g_source.view) {
         g_source.linear = make_texture_group(g_source.view, g_sampler_linear);
-        g_source.nearest =
-            make_texture_group(g_source.view, g_sampler_nearest);
+        g_source.nearest = make_texture_group(g_source.view, g_sampler_nearest);
     }
     if (!g_source.linear || !g_source.nearest) {
         release_source();
@@ -762,42 +797,23 @@ static bool ensure_source_texture(int width, int height)
     return true;
 }
 
-static WGPUBindGroup ensure_source(uint32_t name, bool linear)
-{
-    std::vector<uint8_t> pixels;
-    int width = 0;
-    int height = 0;
-
-    if (name == 0) {
-        if (!g_source.guest || !g_source.linear || !g_source.nearest) {
-            return NULL;
-        }
-        return linear ? g_source.linear : g_source.nearest;
-    }
-    g_source.guest = false;
-    if (!read_gl_rgba(name, &pixels, &width, &height) ||
-        !ensure_source_texture(width, height)) {
-        return NULL;
-    }
-    upload_rgba(g_source.texture, pixels.data(), width, height);
-    return linear ? g_source.linear : g_source.nearest;
-}
-
 bool wgpu_helpers_upload_rgba_frame(const uint8_t *rgba, int width, int height)
 {
-    if (!g_ready || !rgba || width <= 0 || height <= 0 ||
-        !ensure_source_texture(width, height)) {
+    if (!g_ready || !rgba || width <= 0 || height <= 0) {
         return false;
     }
-    upload_rgba(g_source.texture, rgba, width, height);
+    g_guest_pixels.assign(rgba, rgba + (size_t)width * (size_t)height * 4u);
+    g_guest_w = width;
+    g_guest_h = height;
+    g_guest_dirty = true;
     g_source.guest = true;
+    g_device_frame = false;
     return true;
 }
 
 bool wgpu_helpers_has_guest_frame(void)
 {
-    return g_ready && g_source.guest && g_source.width > 0 &&
-           g_source.height > 0;
+    return g_ready && !g_device_frame && g_guest_w > 0 && g_guest_h > 0;
 }
 
 bool wgpu_helpers_guest_size(int *width, int *height)
@@ -806,10 +822,10 @@ bool wgpu_helpers_guest_size(int *width, int *height)
         return false;
     }
     if (width) {
-        *width = g_source.width;
+        *width = g_guest_w;
     }
     if (height) {
-        *height = g_source.height;
+        *height = g_guest_h;
     }
     return true;
 }
@@ -833,28 +849,40 @@ static void release_owned(OwnedImage *image)
 uint64_t wgpu_helpers_create_image(const uint8_t *rgba, int width, int height)
 {
     OwnedImage image = {};
+    uint64_t id;
 
-    if (!xemu_wgpu_ui_device() || !rgba || width <= 0 || height <= 0) {
+    if (!g_ready || !rgba || width <= 0 || height <= 0) {
         return 0;
     }
-    image.texture = make_texture(
-        "UI image", WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst,
-        width, height);
-    if (!image.texture) {
-        return 0;
-    }
-    image.view = make_view(image.texture);
-    if (!image.view) {
-        wgpuTextureRelease(image.texture);
-        return 0;
-    }
-    upload_rgba(image.texture, rgba, width, height);
+    id = alloc_handle();
+    image.id = id;
     image.width = width;
     image.height = height;
-    image.id = (uint64_t)(uintptr_t)image.view;
-    xemu_wgpu_ui_register_texture(image.id);
-    g_owned.push_back(image);
-    return image.id;
+    image.pixels.assign(rgba, rgba + (size_t)width * (size_t)height * 4u);
+    image.dirty = true;
+    xemu_wgpu_ui_register_texture(id);
+    g_owned.push_back(std::move(image));
+    return id;
+}
+
+bool wgpu_helpers_update_image(uint64_t id, const uint8_t *rgba, int width,
+                               int height)
+{
+    if (!id || !rgba || width <= 0 || height <= 0) {
+        return false;
+    }
+    for (OwnedImage &image : g_owned) {
+        if (image.id != id) {
+            continue;
+        }
+        if (image.width != width || image.height != height) {
+            return false;
+        }
+        image.pixels.assign(rgba, rgba + (size_t)width * (size_t)height * 4u);
+        image.dirty = true;
+        return true;
+    }
+    return false;
 }
 
 void wgpu_helpers_release_image(uint64_t id)
@@ -863,7 +891,9 @@ void wgpu_helpers_release_image(uint64_t id)
         if (g_owned[i].id != id) {
             continue;
         }
-        release_owned(&g_owned[i]);
+        xemu_wgpu_ui_unregister_texture(g_owned[i].id);
+        g_owned[i].id = 0;
+        g_dead.push_back(std::move(g_owned[i]));
         g_owned.erase(g_owned.begin() + i);
         return;
     }
@@ -886,11 +916,35 @@ bool wgpu_helpers_active(void)
 
 bool wgpu_helpers_init(void)
 {
+    if (g_ready) {
+        return true;
+    }
+    if (!xemu_wgpu_ui_active()) {
+        return false;
+    }
+    if (!load_art(&g_art[WGPU_ART_DUKE], controller_mask_data,
+                  controller_mask_size, true, false) ||
+        !load_art(&g_art[WGPU_ART_S], controller_mask_s_data,
+                  controller_mask_s_size, true, false) ||
+        !load_art(&g_art[WGPU_ART_XMU], xmu_mask_data, xmu_mask_size, true,
+                  false) ||
+        !load_art(&g_art[WGPU_ART_LOGO], logo_sdf_data, logo_sdf_size, true,
+                  false) ||
+        !load_art(&g_icon, xemu_64x64_data, xemu_64x64_size, false, true)) {
+        wgpu_helpers_shutdown();
+        return false;
+    }
+    g_ready = true;
+    return true;
+}
+
+bool wgpu_helpers_gpu_init(void)
+{
     WGPUBindGroupEntry uniform_entry = WGPU_BIND_GROUP_ENTRY_INIT;
     WGPUBindGroupDescriptor uniform_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
     WGPUDevice device = xemu_wgpu_ui_device();
 
-    if (g_ready) {
+    if (g_gpu) {
         return true;
     }
     if (!device || !create_pipelines()) {
@@ -918,27 +972,66 @@ bool wgpu_helpers_init(void)
     uniform_desc.entryCount = 1;
     uniform_desc.entries = &uniform_entry;
     g_uniform_group = wgpuDeviceCreateBindGroup(device, &uniform_desc);
-    if (!g_uniform_group ||
-        !load_art(&g_art[WGPU_ART_DUKE], controller_mask_data,
-                  controller_mask_size, true, false) ||
-        !load_art(&g_art[WGPU_ART_S], controller_mask_s_data,
-                  controller_mask_s_size, true, false) ||
-        !load_art(&g_art[WGPU_ART_XMU], xmu_mask_data, xmu_mask_size, true,
-                  false) ||
-        !load_art(&g_art[WGPU_ART_LOGO], logo_sdf_data, logo_sdf_size, true,
-                  false) ||
-        !load_art(&g_icon, xemu_64x64_data, xemu_64x64_size, false, true)) {
+    if (!g_uniform_group || !upload_art(&g_art[WGPU_ART_DUKE]) ||
+        !upload_art(&g_art[WGPU_ART_S]) || !upload_art(&g_art[WGPU_ART_XMU]) ||
+        !upload_art(&g_art[WGPU_ART_LOGO]) || !upload_art(&g_icon)) {
         wgpu_helpers_shutdown();
         return false;
     }
-    g_ready = true;
+    g_gpu = true;
     fprintf(stderr, "[WebGPU] UI shaders: WGSL\n");
     return true;
+}
+
+void wgpu_helpers_gpu_shutdown(void)
+{
+    wgpu_helpers_shutdown();
 }
 
 void wgpu_helpers_shutdown(void)
 {
     g_ready = false;
+    g_cmds.clear();
+    g_guest_pixels.clear();
+    g_guest_w = 0;
+    g_guest_h = 0;
+    g_guest_dirty = false;
+    g_device_frame = false;
+    /* GPU objects belong to the PFIFO thread. A UI-thread shutdown leaves
+     * them for wgpu_helpers_gpu_shutdown. */
+    if (!xemu_wgpu_ui_device()) {
+        if (g_gpu) {
+            return;
+        }
+        for (FboImage &image : g_fbos) {
+            if (image.id) {
+                xemu_wgpu_ui_unregister_texture(image.id);
+            }
+        }
+        g_fbos.clear();
+        for (OwnedImage &image : g_owned) {
+            if (image.id) {
+                xemu_wgpu_ui_unregister_texture(image.id);
+            }
+        }
+        g_owned.clear();
+        g_dead.clear();
+        for (int i = 0; i < WGPU_ART_COUNT; i++) {
+            if (g_art[i].id) {
+                xemu_wgpu_ui_unregister_texture(g_art[i].id);
+                g_art[i].id = 0;
+            }
+            g_art[i].pixels.clear();
+        }
+        if (g_icon.id) {
+            xemu_wgpu_ui_unregister_texture(g_icon.id);
+            g_icon.id = 0;
+        }
+        g_icon.pixels.clear();
+        return;
+    }
+    wgpu_helpers_retire();
+    g_gpu = false;
     if (g_pass || g_encoder) {
         end_render_pass();
         submit_encoder();
@@ -1044,19 +1137,7 @@ void wgpu_helpers_fbo_create(Fbo *fbo)
         return;
     }
     image.owner = fbo;
-    image.texture = make_texture("UI fbo",
-                                 WGPUTextureUsage_TextureBinding |
-                                     WGPUTextureUsage_RenderAttachment,
-                                 fbo->w, fbo->h);
-    if (!image.texture) {
-        return;
-    }
-    image.view = make_view(image.texture);
-    if (!image.view) {
-        wgpuTextureRelease(image.texture);
-        return;
-    }
-    image.id = (uint64_t)(uintptr_t)image.view;
+    image.id = alloc_handle();
     xemu_wgpu_ui_register_texture(image.id);
     g_fbos.push_back(image);
 }
@@ -1070,12 +1151,10 @@ void wgpu_helpers_fbo_destroy(Fbo *fbo)
         if (g_fbos[i].id) {
             xemu_wgpu_ui_unregister_texture(g_fbos[i].id);
         }
-        if (g_fbos[i].view) {
-            wgpuTextureViewRelease(g_fbos[i].view);
-        }
-        if (g_fbos[i].texture) {
-            wgpuTextureRelease(g_fbos[i].texture);
-        }
+        g_fbos[i].owner = NULL;
+        g_dead.push_back(OwnedImage{});
+        g_dead.back().texture = g_fbos[i].texture;
+        g_dead.back().view = g_fbos[i].view;
         g_fbos.erase(g_fbos.begin() + i);
         return;
     }
@@ -1084,24 +1163,27 @@ void wgpu_helpers_fbo_destroy(Fbo *fbo)
 void wgpu_helpers_fbo_target(Fbo *fbo)
 {
     FboImage *image = find_fbo(fbo);
+    UiCmd cmd = {};
 
-    if (!image || !image->view) {
+    if (!image) {
         return;
     }
     g_target_w = fbo->w;
     g_target_h = fbo->h;
     g_clip_flip = true;
-    begin_pass(image->view, 0);
+    cmd.op = UiOp::Begin;
+    cmd.target = image->id;
+    cmd.clear_alpha = 0;
+    g_cmds.push_back(cmd);
 }
 
 void wgpu_helpers_fbo_restore(Fbo *fbo)
 {
+    UiCmd cmd = {};
+
     (void)fbo;
-    if (!g_pass) {
-        return;
-    }
-    end_render_pass();
-    submit_encoder();
+    cmd.op = UiOp::End;
+    g_cmds.push_back(cmd);
 }
 
 uint64_t wgpu_helpers_fbo_texture(Fbo *fbo)
@@ -1146,27 +1228,24 @@ void wgpu_helpers_draw(const float scale_offset[4],
                        const float tex_scale_offset[4], uint32_t primary,
                        uint32_t secondary, uint32_t fill)
 {
-    WidgetUniform uniform = {};
-    WGPURenderPipeline pipeline;
-    WGPUBindGroup textures;
+    UiCmd cmd = {};
 
     if (g_art_index < 0 || g_art_index >= WGPU_ART_COUNT) {
         return;
     }
-    memcpy(uniform.scale_offset, scale_offset, sizeof(uniform.scale_offset));
-    memcpy(uniform.tex_scale_offset, tex_scale_offset,
-           sizeof(uniform.tex_scale_offset));
-    unpack_color(primary, uniform.color_primary);
-    unpack_color(secondary, uniform.color_secondary);
-    unpack_color(fill, uniform.color_fill);
-    uniform.params[0] = g_time;
-    uniform.params[3] = g_clip_flip ? 1.0f : 0.0f;
-    if (g_blend < 0 || g_blend > DECAL_BLEND_ALPHA) {
-        g_blend = DECAL_BLEND_REPLACE;
-    }
-    pipeline = g_logo ? g_logo_pipe : g_mask_pipe[g_blend];
-    textures = g_art[g_art_index].group;
-    draw_quad(pipeline, textures, uniform);
+    cmd.op = UiOp::Draw;
+    cmd.art = g_art_index;
+    cmd.blend = g_blend;
+    cmd.logo = g_logo;
+    cmd.clip_flip = g_clip_flip;
+    cmd.time = g_time;
+    memcpy(cmd.scale_offset, scale_offset, sizeof(cmd.scale_offset));
+    memcpy(cmd.tex_scale_offset, tex_scale_offset,
+           sizeof(cmd.tex_scale_offset));
+    cmd.primary = primary;
+    cmd.secondary = secondary;
+    cmd.fill = fill;
+    g_cmds.push_back(cmd);
 }
 
 static void draw_gamma(WGPUBindGroup source, const float scale[2], bool flip)
@@ -1185,35 +1264,27 @@ static void draw_gamma(WGPUBindGroup source, const float scale[2], bool flip)
 bool wgpu_helpers_render_framebuffer(uint32_t tex, int width, int height,
                                      bool flip, const float scale[2])
 {
-    WGPUTextureView target;
-    bool linear;
+    UiCmd cmd = {};
     bool screen_off;
-    WGPUBindGroup source = NULL;
 
+    (void)tex;
     if (!g_ready || width <= 0 || height <= 0) {
         return false;
     }
-    target = xemu_wgpu_ui_prepare_target(width, height);
-    if (!target) {
-        return false;
-    }
     screen_off = nv2a_get_screen_off();
-    linear = g_config.display.filtering != CONFIG_DISPLAY_FILTERING_NEAREST;
-    if (!screen_off) {
-        source = ensure_source(tex, linear);
-        if (!source) {
-            return false;
-        }
-    }
-    g_clip_flip = false;
-    if (!begin_pass(target, 1)) {
+    if (!screen_off && !g_device_frame && g_guest_w <= 0) {
         return false;
     }
-    if (source) {
-        draw_gamma(source, scale, flip);
-    }
-    end_render_pass();
-    submit_encoder();
+    cmd.op = UiOp::Frame;
+    cmd.width = width;
+    cmd.height = height;
+    cmd.flip = flip;
+    cmd.linear = g_config.display.filtering != CONFIG_DISPLAY_FILTERING_NEAREST;
+    cmd.screen_off = screen_off;
+    cmd.device = g_device_frame;
+    cmd.scale[0] = scale[0];
+    cmd.scale[1] = scale[1];
+    g_cmds.push_back(cmd);
     xemu_wgpu_ui_mark_scene();
     return true;
 }
@@ -1276,12 +1347,277 @@ static bool ensure_png_target(int width, int height)
     return true;
 }
 
-bool wgpu_helpers_framebuffer_png(uint32_t tex, bool flip, int width,
-                                  int height, std::vector<uint8_t> &png)
+static bool ensure_fbo_gpu(FboImage *image)
 {
-    bool linear;
-    WGPUBindGroup source;
+    if (!image || !image->owner) {
+        return false;
+    }
+    if (image->view) {
+        return true;
+    }
+    image->texture = make_texture("UI fbo",
+                                  WGPUTextureUsage_TextureBinding |
+                                      WGPUTextureUsage_RenderAttachment,
+                                  image->owner->w, image->owner->h);
+    if (!image->texture) {
+        return false;
+    }
+    image->view = make_view(image->texture);
+    return image->view != NULL;
+}
+
+static void realize_guest(void)
+{
+    if (!g_guest_dirty || g_guest_pixels.empty()) {
+        return;
+    }
+    if (!ensure_source_texture(g_guest_w, g_guest_h)) {
+        return;
+    }
+    upload_rgba(g_source.texture, g_guest_pixels.data(), g_guest_w, g_guest_h);
+    g_source.guest = true;
+    g_guest_dirty = false;
+}
+
+static void realize_images(void)
+{
+    for (OwnedImage &image : g_owned) {
+        if (!image.dirty || image.pixels.empty()) {
+            continue;
+        }
+        if (!image.texture) {
+            image.texture = make_texture("UI image",
+                                         WGPUTextureUsage_TextureBinding |
+                                             WGPUTextureUsage_CopyDst,
+                                         image.width, image.height);
+            if (image.texture) {
+                image.view = make_view(image.texture);
+            }
+        }
+        if (image.texture && image.view) {
+            upload_rgba(image.texture, image.pixels.data(), image.width,
+                        image.height);
+            image.dirty = false;
+        }
+    }
+    for (FboImage &image : g_fbos) {
+        ensure_fbo_gpu(&image);
+    }
+    realize_guest();
+}
+
+static FboImage *find_fbo_id(uint64_t id)
+{
+    for (FboImage &image : g_fbos) {
+        if (image.id == id) {
+            return &image;
+        }
+    }
+    return NULL;
+}
+
+static void replay_draw(const UiCmd &cmd)
+{
+    WidgetUniform uniform = {};
+    WGPURenderPipeline pipeline;
+    int blend = cmd.blend;
+
+    if (cmd.art < 0 || cmd.art >= WGPU_ART_COUNT) {
+        return;
+    }
+    memcpy(uniform.scale_offset, cmd.scale_offset,
+           sizeof(uniform.scale_offset));
+    memcpy(uniform.tex_scale_offset, cmd.tex_scale_offset,
+           sizeof(uniform.tex_scale_offset));
+    unpack_color(cmd.primary, uniform.color_primary);
+    unpack_color(cmd.secondary, uniform.color_secondary);
+    unpack_color(cmd.fill, uniform.color_fill);
+    uniform.params[0] = cmd.time;
+    uniform.params[3] = cmd.clip_flip ? 1.0f : 0.0f;
+    if (blend < 0 || blend > DECAL_BLEND_ALPHA) {
+        blend = DECAL_BLEND_REPLACE;
+    }
+    pipeline = cmd.logo ? g_logo_pipe : g_mask_pipe[blend];
+    draw_quad(pipeline, g_art[cmd.art].group, uniform);
+}
+
+static bool replay_frame(const UiCmd &cmd, WGPUTextureView display)
+{
+    WGPUTextureView target = xemu_wgpu_ui_prepare_target(cmd.width, cmd.height);
+    WGPUBindGroup source = NULL;
+    WGPUBindGroup external = NULL;
+    float scale[2] = { cmd.scale[0], cmd.scale[1] };
+
+    if (!target) {
+        return false;
+    }
+    if (!cmd.screen_off) {
+        if (cmd.device && display) {
+            external = make_texture_group(
+                display, cmd.linear ? g_sampler_linear : g_sampler_nearest);
+            source = external;
+        } else if (!cmd.device && g_guest_w > 0) {
+            realize_guest();
+            source = cmd.linear ? g_source.linear : g_source.nearest;
+        }
+    }
+    if (!begin_pass(target, 1)) {
+        if (external) {
+            wgpuBindGroupRelease(external);
+        }
+        return false;
+    }
+    if (source) {
+        draw_gamma(source, scale, cmd.flip);
+    }
+    end_render_pass();
+    submit_encoder();
+    if (external) {
+        wgpuBindGroupRelease(external);
+    }
+    return true;
+}
+
+bool wgpu_helpers_replay(WGPUTextureView display, int display_width,
+                         int display_height)
+{
+    bool scene = false;
+
+    (void)display_width;
+    (void)display_height;
+    if (!g_gpu) {
+        return false;
+    }
+    realize_images();
+    for (const UiCmd &cmd : g_cmds) {
+        if (cmd.op == UiOp::Begin) {
+            FboImage *image = find_fbo_id(cmd.target);
+
+            if (image && ensure_fbo_gpu(image)) {
+                g_target_w = image->owner->w;
+                g_target_h = image->owner->h;
+                begin_pass(image->view, cmd.clear_alpha);
+            }
+        } else if (cmd.op == UiOp::Draw) {
+            replay_draw(cmd);
+        } else if (cmd.op == UiOp::End) {
+            end_render_pass();
+            submit_encoder();
+        } else if (cmd.op == UiOp::Frame) {
+            if (replay_frame(cmd, display)) {
+                scene = true;
+            }
+        }
+    }
+    g_cmds.clear();
+    return scene;
+}
+
+void wgpu_helpers_retire(void)
+{
+    for (OwnedImage &image : g_dead) {
+        if (image.view) {
+            wgpuTextureViewRelease(image.view);
+            image.view = NULL;
+        }
+        if (image.texture) {
+            wgpuTextureRelease(image.texture);
+            image.texture = NULL;
+        }
+    }
+    g_dead.clear();
+}
+
+WGPUTextureView wgpu_helpers_resolve(uint64_t id)
+{
+    if (!id) {
+        return NULL;
+    }
+    for (int i = 0; i < WGPU_ART_COUNT; i++) {
+        if (g_art[i].id == id) {
+            return g_art[i].view;
+        }
+    }
+    if (g_icon.id == id) {
+        return g_icon.view;
+    }
+    for (const FboImage &image : g_fbos) {
+        if (image.id == id) {
+            return image.view;
+        }
+    }
+    for (const OwnedImage &image : g_owned) {
+        if (image.id == id) {
+            return image.view;
+        }
+    }
+    for (const OwnedImage &image : g_dead) {
+        if (image.id == id) {
+            return image.view;
+        }
+    }
+    return NULL;
+}
+
+void wgpu_helpers_begin_frame(void)
+{
+    g_cmds.clear();
+}
+
+void wgpu_helpers_set_device_frame(int width, int height)
+{
+    g_device_frame = width > 0 && height > 0;
+    g_device_w = width;
+    g_device_h = height;
+    if (g_device_frame) {
+        g_source.guest = false;
+    }
+}
+
+void wgpu_helpers_clear_device_frame(void)
+{
+    g_device_frame = false;
+    g_device_w = 0;
+    g_device_h = 0;
+}
+
+bool wgpu_helpers_device_frame(void)
+{
+    return g_device_frame;
+}
+
+bool wgpu_helpers_frame_size(int *width, int *height)
+{
+    if (g_device_frame) {
+        if (width) {
+            *width = g_device_w;
+        }
+        if (height) {
+            *height = g_device_h;
+        }
+        return true;
+    }
+    return wgpu_helpers_guest_size(width, height);
+}
+
+bool wgpu_helpers_needs_display(void)
+{
+    if (g_png_pending && g_png_device) {
+        return true;
+    }
+    for (const UiCmd &cmd : g_cmds) {
+        if (cmd.op == UiOp::Frame && cmd.device) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void wgpu_helpers_run_png(WGPUTextureView display)
+{
     float scale[2] = { 1.0f, 1.0f };
+    WGPUBindGroup source = NULL;
+    WGPUBindGroup external = NULL;
     WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
     WGPUTexelCopyBufferInfo dst = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
     WGPUExtent3D extent;
@@ -1289,31 +1625,44 @@ bool wgpu_helpers_framebuffer_png(uint32_t tex, bool flip, int width,
     WGPUBufferMapCallbackInfo map_callback = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
     uint32_t stride;
     size_t bytes;
-    std::vector<uint8_t> rgb;
 
-    if (!g_ready || width <= 0 || height <= 0 ||
-        !ensure_png_target(width, height)) {
-        return false;
+    g_png_rgb.clear();
+    if (!g_gpu || g_png_req_w <= 0 || g_png_req_h <= 0 ||
+        !ensure_png_target(g_png_req_w, g_png_req_h)) {
+        return;
     }
-    linear = g_config.display.filtering != CONFIG_DISPLAY_FILTERING_NEAREST;
-    source = ensure_source(tex, linear);
+    realize_images();
+    if (!g_png_off) {
+        if (g_png_device && display) {
+            external = make_texture_group(
+                display, g_png_linear ? g_sampler_linear : g_sampler_nearest);
+            source = external;
+        } else if (!g_png_device && g_guest_w > 0) {
+            realize_guest();
+            source = g_png_linear ? g_source.linear : g_source.nearest;
+        }
+    }
     if (!source || !begin_pass(g_png_view, 1)) {
-        return false;
+        if (external) {
+            wgpuBindGroupRelease(external);
+        }
+        return;
     }
-    if (!nv2a_get_screen_off()) {
-        draw_gamma(source, scale, flip);
-    }
+    draw_gamma(source, scale, g_png_flip);
     end_render_pass();
-    stride = row_stride(width);
-    bytes = (size_t)stride * (size_t)height;
+    stride = row_stride(g_png_req_w);
+    bytes = (size_t)stride * (size_t)g_png_req_h;
     src.texture = g_png_texture;
     src.aspect = WGPUTextureAspect_All;
     dst.buffer = g_png_readback;
     dst.layout.bytesPerRow = stride;
-    dst.layout.rowsPerImage = height;
-    extent = { (uint32_t)width, (uint32_t)height, 1 };
+    dst.layout.rowsPerImage = g_png_req_h;
+    extent = { (uint32_t)g_png_req_w, (uint32_t)g_png_req_h, 1 };
     wgpuCommandEncoderCopyTextureToBuffer(g_encoder, &src, &dst, &extent);
     submit_encoder();
+    if (external) {
+        wgpuBindGroupRelease(external);
+    }
 
     map_callback.mode = WGPUCallbackMode_WaitAnyOnly;
     map_callback.callback = buffer_map_callback;
@@ -1321,26 +1670,57 @@ bool wgpu_helpers_framebuffer_png(uint32_t tex, bool flip, int width,
     if (!wait_future(wgpuBufferMapAsync(g_png_readback, WGPUMapMode_Read, 0,
                                         bytes, map_callback)) ||
         map_state.status != WGPUMapAsyncStatus_Success) {
-        return false;
+        return;
     }
     const void *mapped =
         wgpuBufferGetConstMappedRange(g_png_readback, 0, bytes);
     if (!mapped) {
         wgpuBufferUnmap(g_png_readback);
-        return false;
+        return;
     }
-    rgb.resize((size_t)width * (size_t)height * 3u);
-    for (int y = 0; y < height; y++) {
+    g_png_rgb.resize((size_t)g_png_req_w * (size_t)g_png_req_h * 3u);
+    for (int y = 0; y < g_png_req_h; y++) {
         const uint8_t *row = (const uint8_t *)mapped + (size_t)y * stride;
-        uint8_t *out = rgb.data() + (size_t)y * (size_t)width * 3u;
-        for (int x = 0; x < width; x++) {
+        uint8_t *out = g_png_rgb.data() + (size_t)y * (size_t)g_png_req_w * 3u;
+
+        for (int x = 0; x < g_png_req_w; x++) {
             out[x * 3 + 0] = row[x * 4 + 0];
             out[x * 3 + 1] = row[x * 4 + 1];
             out[x * 3 + 2] = row[x * 4 + 2];
         }
     }
     wgpuBufferUnmap(g_png_readback);
-    return fpng::fpng_encode_image_to_memory(rgb.data(), width, height, 3, png);
+}
+
+bool wgpu_helpers_framebuffer_png(uint32_t tex, bool flip, int width,
+                                  int height, std::vector<uint8_t> &png)
+{
+    (void)tex;
+    if (!g_ready || width <= 0 || height <= 0) {
+        return false;
+    }
+    if (!g_device_frame && g_guest_w <= 0) {
+        return false;
+    }
+    g_png_req_w = width;
+    g_png_req_h = height;
+    g_png_flip = flip;
+    g_png_device = g_device_frame;
+    g_png_linear =
+        g_config.display.filtering != CONFIG_DISPLAY_FILTERING_NEAREST;
+    g_png_off = nv2a_get_screen_off();
+    g_png_rgb.clear();
+    g_png_pending = true;
+    if (!xemu_wgpu_ui_submit(XEMU_WGPU_UI_JOB_PNG)) {
+        g_png_pending = false;
+        return false;
+    }
+    g_png_pending = false;
+    if (g_png_rgb.empty()) {
+        return false;
+    }
+    return fpng::fpng_encode_image_to_memory(g_png_rgb.data(), width, height, 3,
+                                             png);
 }
 
 uint64_t wgpu_helpers_icon(int *width, int *height)

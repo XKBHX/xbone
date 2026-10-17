@@ -922,11 +922,25 @@ static void gl_render_frame(struct xemu_console *scon)
      * the guest code isn't using HW accelerated rendering, but just blitting
      * to the framebuffer, fall back to the VGA path.
      */
-    GLuint tex = nv2a_get_framebuffer_surface();
+    GLuint tex = 0;
+    bool hold_surface = false;
+    int display_w = 0;
+    int display_h = 0;
+
+    if (nv2a_wgpu_display_size(&display_w, &display_h)) {
+        /* The PFIFO device already has this frame. Sampling it there avoids
+         * copying the accelerated image through GL. */
+        xemu_hud_set_device_frame(display_w, display_h);
+        flip_required = false;
+    } else {
+        xemu_hud_clear_device_frame();
+        tex = nv2a_get_framebuffer_surface();
+        hold_surface = true;
+    }
 
     assert(glGetError() == GL_NO_ERROR);
 
-    if (tex == 0) {
+    if (hold_surface && tex == 0) {
         uint8_t *rgba;
         bool uploaded;
 
@@ -977,7 +991,9 @@ static void gl_render_frame(struct xemu_console *scon)
         xemu_main_loop_unlock();
     }
 
-    nv2a_release_framebuffer_surface();
+    if (hold_surface) {
+        nv2a_release_framebuffer_surface();
+    }
 
 #ifdef _WIN32
     if (win32_dxgi_present_is_active()) {

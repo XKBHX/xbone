@@ -49,6 +49,8 @@ void xemu_hud_process_sdl_events(SDL_Event *event);
 void xemu_hud_should_capture_kbd_mouse(int *kbd, int *mouse);
 void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip);
 bool xemu_hud_upload_rgba_frame(const uint8_t *rgba, int width, int height);
+void xemu_hud_set_device_frame(int width, int height);
+void xemu_hud_clear_device_frame(void);
 
 #ifdef __cplusplus
 }
