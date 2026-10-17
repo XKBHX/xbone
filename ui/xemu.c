@@ -822,6 +822,80 @@ static void report_stats(void)
 }
 #endif
 
+static uint8_t expand5(uint32_t value)
+{
+    return (uint8_t)((value << 3) | (value >> 2));
+}
+
+static uint8_t expand6(uint32_t value)
+{
+    return (uint8_t)((value << 2) | (value >> 4));
+}
+
+/*
+ * Guest VGA pixels in the order glGetTexImage(GL_RGBA) would return after
+ * xb_surface_gl_create_texture. The GL upload uses an RGB internal format,
+ * so alpha is 255. Returns a tightly packed buffer the caller frees.
+ */
+static uint8_t *surface_to_rgba(DisplaySurface *surface)
+{
+    int width, height, stride, bpp;
+    pixman_format_code_t format;
+    const uint8_t *src;
+    uint8_t *dst;
+    bool bgra;
+
+    if (!surface) {
+        return NULL;
+    }
+    width = surface_width(surface);
+    height = surface_height(surface);
+    stride = surface_stride(surface);
+    bpp = surface_bytes_per_pixel(surface);
+    format = surface_format(surface);
+    src = (const uint8_t *)surface_data(surface);
+    if (width <= 0 || height <= 0 || stride < width * bpp || !src) {
+        return NULL;
+    }
+
+    if (format == PIXMAN_BE_b8g8r8x8 || format == PIXMAN_BE_b8g8r8a8) {
+        bgra = true;
+    } else if (format == PIXMAN_BE_x8r8g8b8 || format == PIXMAN_BE_a8r8g8b8) {
+        bgra = false;
+    } else if (format != PIXMAN_r5g6b5) {
+        return NULL;
+    } else {
+        bgra = false;
+    }
+
+    dst = (uint8_t *)g_malloc((size_t)width * (size_t)height * 4u);
+    for (int y = 0; y < height; y++) {
+        const uint8_t *row = src + (size_t)y * (size_t)stride;
+        uint8_t *out = dst + (size_t)y * (size_t)width * 4u;
+
+        if (format == PIXMAN_r5g6b5) {
+            for (int x = 0; x < width; x++) {
+                uint16_t pixel = lduw_he_p(row + (size_t)x * 2u);
+
+                out[x * 4 + 0] = expand5((pixel >> 11) & 31);
+                out[x * 4 + 1] = expand6((pixel >> 5) & 63);
+                out[x * 4 + 2] = expand5(pixel & 31);
+                out[x * 4 + 3] = 255;
+            }
+            continue;
+        }
+        for (int x = 0; x < width; x++) {
+            const uint8_t *pixel = row + (size_t)x * 4u;
+
+            out[x * 4 + 0] = bgra ? pixel[2] : pixel[0];
+            out[x * 4 + 1] = pixel[1];
+            out[x * 4 + 2] = bgra ? pixel[0] : pixel[2];
+            out[x * 4 + 3] = 255;
+        }
+    }
+    return dst;
+}
+
 /**
  * Renders the main interface. Usually called from the main thread,
  * but may sometimes be called from another thread.
@@ -853,12 +927,24 @@ static void gl_render_frame(struct xemu_console *scon)
     assert(glGetError() == GL_NO_ERROR);
 
     if (tex == 0) {
+        uint8_t *rgba;
+        bool uploaded;
+
         xemu_main_loop_lock();
-        // FIXME: Don't upload if notdirty
-        xb_surface_gl_create_texture(scon->surface);
-        tex = scon->surface->texture;
+        /* FIXME: Don't upload if notdirty. The WebGPU UI samples these
+         * pixels directly. The GL texture remains the fallback when that
+         * upload is not available. */
+        rgba = surface_to_rgba(scon->surface);
+        uploaded = rgba &&
+            xemu_hud_upload_rgba_frame(rgba, surface_width(scon->surface),
+                                       surface_height(scon->surface));
+        g_free(rgba);
+        if (!uploaded) {
+            xb_surface_gl_create_texture(scon->surface);
+            tex = scon->surface->texture;
+            release_surface_texture = true;
+        }
         flip_required = true;
-        release_surface_texture = true;
         xemu_main_loop_unlock();
     }
 

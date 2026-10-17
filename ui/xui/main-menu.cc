@@ -27,6 +27,7 @@
 #include "xemu-hud.h"
 #include "misc.hh"
 #include "gl-helpers.hh"
+#include "wgpu-ui.hh"
 #include "reporting.hh"
 #include "qapi/error.h"
 #include "actions.hh"
@@ -1198,19 +1199,13 @@ bool MainMenuSnapshotsView::BigSnapshotButton(QEMUSnapshotInfo *snapshot,
     const ImVec2 p1 = ImGui::GetItemRectMax();
     draw_list->PushClipRect(p0, p1, true);
 
-    // Snapshot thumbnail. The fallback icon is a WebGPU view when that UI
-    // is active. Snapshot images themselves stay GL until the thumbnail
-    // readback moves.
+    // Snapshot thumbnail. WebGPU keeps a UI-device view. OpenGL keeps a
+    // texture name. The icon is the fallback when the snapshot has none.
     ImTextureID thumbnail_id;
-    int thumbnail_width, thumbnail_height;
-    if (data->gl_thumbnail) {
-        glActiveTexture(GL_TEXTURE0);
-        glBindTexture(GL_TEXTURE_2D, data->gl_thumbnail);
-        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
-                                 &thumbnail_width);
-        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
-                                 &thumbnail_height);
-        thumbnail_id = (ImTextureID)(uintptr_t)data->gl_thumbnail;
+    int thumbnail_width = data->thumbnail_width;
+    int thumbnail_height = data->thumbnail_height;
+    if (data->thumbnail && thumbnail_width > 0 && thumbnail_height > 0) {
+        thumbnail_id = (ImTextureID)(uintptr_t)data->thumbnail;
     } else {
         thumbnail_id = xemu_ui_icon_texture(&thumbnail_width, &thumbnail_height);
     }
@@ -1633,11 +1628,18 @@ void MainMenuAboutView::Draw()
 
     static const char *sys_info_text = NULL;
     if (sys_info_text == NULL) {
-        const char *gl_shader_version =
-            (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
-        const char *gl_version = (const char *)glGetString(GL_VERSION);
-        const char *gl_renderer = (const char *)glGetString(GL_RENDERER);
-        const char *gl_vendor = (const char *)glGetString(GL_VENDOR);
+        const char *gl_shader_version = NULL;
+        const char *gl_version = NULL;
+        const char *gl_renderer = NULL;
+        const char *gl_vendor = NULL;
+        if (!xemu_wgpu_ui_renderer(&gl_vendor, &gl_renderer, &gl_version,
+                                   &gl_shader_version)) {
+            gl_shader_version =
+                (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
+            gl_version = (const char *)glGetString(GL_VERSION);
+            gl_renderer = (const char *)glGetString(GL_RENDERER);
+            gl_vendor = (const char *)glGetString(GL_VENDOR);
+        }
         sys_info_text = g_strdup_printf(
             "CPU:          %s\nOS Platform:  %s\nOS Version:   "
             "%s\nManufacturer: %s\n"

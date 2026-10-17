@@ -38,6 +38,9 @@ static WGPUInstance g_instance;
 static WGPUAdapter g_adapter;
 static WGPUDevice g_device;
 static WGPUQueue g_queue;
+static char g_vendor_text[256];
+static char g_adapter_text[256];
+static char g_driver_text[512];
 static WGPUTexture g_target;
 static WGPUTextureView g_target_view;
 static WGPUBuffer g_readback;
@@ -157,6 +160,61 @@ static bool wait_future(WGPUFuture future)
 static uint32_t align_row(uint32_t row_bytes)
 {
     return (row_bytes + 255u) & ~255u;
+}
+
+static const char *backend_name(WGPUBackendType type)
+{
+    switch (type) {
+    case WGPUBackendType_D3D11:
+        return "D3D11";
+    case WGPUBackendType_D3D12:
+        return "D3D12";
+    case WGPUBackendType_Metal:
+        return "Metal";
+    case WGPUBackendType_Vulkan:
+        return "Vulkan";
+    case WGPUBackendType_OpenGL:
+        return "OpenGL";
+    case WGPUBackendType_OpenGLES:
+        return "OpenGL ES";
+    case WGPUBackendType_Null:
+        return "Null";
+    case WGPUBackendType_WebGPU:
+        return "WebGPU";
+    default:
+        return "WebGPU";
+    }
+}
+
+static void store_renderer(WGPUAdapter adapter)
+{
+    WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
+
+    g_vendor_text[0] = '\0';
+    g_adapter_text[0] = '\0';
+    g_driver_text[0] = '\0';
+    if (wgpuAdapterGetInfo(adapter, &info) != WGPUStatus_Success) {
+        snprintf(g_vendor_text, sizeof(g_vendor_text), "Dawn");
+        snprintf(g_adapter_text, sizeof(g_adapter_text), "WebGPU");
+        snprintf(g_driver_text, sizeof(g_driver_text), "WebGPU");
+        return;
+    }
+    copy_message(g_vendor_text, sizeof(g_vendor_text), info.vendor);
+    copy_message(g_adapter_text, sizeof(g_adapter_text), info.device);
+    copy_message(g_driver_text, sizeof(g_driver_text), info.description);
+    if (!g_vendor_text[0]) {
+        snprintf(g_vendor_text, sizeof(g_vendor_text), "%s",
+                 backend_name(info.backendType));
+    }
+    if (!g_adapter_text[0]) {
+        snprintf(g_adapter_text, sizeof(g_adapter_text), "%s",
+                 g_driver_text[0] ? g_driver_text : "WebGPU");
+    }
+    if (!g_driver_text[0]) {
+        snprintf(g_driver_text, sizeof(g_driver_text), "%s",
+                 backend_name(info.backendType));
+    }
+    wgpuAdapterInfoFreeMembers(info);
 }
 
 static void release_gl_images(void)
@@ -716,13 +774,9 @@ bool xemu_wgpu_ui_init(SDL_Window *window)
         return false;
     }
 
-    WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
-    if (wgpuAdapterGetInfo(g_adapter, &info) == WGPUStatus_Success) {
-        fprintf(stderr, "[WebGPU] UI device: %.*s (%.*s)\n",
-                (int)info.device.length, info.device.data,
-                (int)info.description.length, info.description.data);
-        wgpuAdapterInfoFreeMembers(info);
-    }
+    store_renderer(g_adapter);
+    fprintf(stderr, "[WebGPU] UI device: %s (%s)\n", g_adapter_text,
+            g_driver_text);
     g_active = true;
     return true;
 }
@@ -812,6 +866,27 @@ void xemu_wgpu_ui_register_texture(uint64_t id)
     if (id) {
         g_ui_textures.push_back(id);
     }
+}
+
+bool xemu_wgpu_ui_renderer(const char **vendor, const char **adapter,
+                           const char **driver, const char **shader)
+{
+    if (!g_active) {
+        return false;
+    }
+    if (vendor) {
+        *vendor = g_vendor_text;
+    }
+    if (adapter) {
+        *adapter = g_adapter_text;
+    }
+    if (driver) {
+        *driver = g_driver_text;
+    }
+    if (shader) {
+        *shader = "WGSL";
+    }
+    return true;
 }
 
 void xemu_wgpu_ui_unregister_texture(uint64_t id)

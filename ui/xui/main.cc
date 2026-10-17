@@ -50,6 +50,7 @@
 #include "welcome.hh"
 #include "menubar.hh"
 #include "compat.hh"
+#include "wgpu-helpers.hh"
 #include "wgpu-ui.hh"
 #if defined(_WIN32)
 #include "update.hh"
@@ -202,6 +203,11 @@ void xemu_hud_set_framebuffer_texture(GLuint tex, bool flip)
 {
     g_tex = tex;
     g_flip_req = flip;
+}
+
+bool xemu_hud_upload_rgba_frame(const uint8_t *rgba, int width, int height)
+{
+    return wgpu_helpers_upload_rgba_frame(rgba, width, height);
 }
 
 void xemu_hud_update(void)

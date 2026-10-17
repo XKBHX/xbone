@@ -24,6 +24,7 @@
 #include "font-manager.hh"
 #include "xemu-version.h"
 #include "reporting.hh"
+#include "wgpu-ui.hh"
 #include "../xemu-settings.h"
 #include "../xemu-os-utils.h"
 
@@ -74,10 +75,22 @@ void CompatibilityReporter::Draw()
     }
 
     if (ImGui::IsWindowAppearing()) {
-        report.gl_vendor = (const char *)glGetString(GL_VENDOR);
-        report.gl_renderer = (const char *)glGetString(GL_RENDERER);
-        report.gl_version = (const char *)glGetString(GL_VERSION);
-        report.gl_shading_language_version = (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
+        const char *vendor = NULL;
+        const char *adapter = NULL;
+        const char *driver = NULL;
+        const char *shader = NULL;
+        if (xemu_wgpu_ui_renderer(&vendor, &adapter, &driver, &shader)) {
+            report.gl_vendor = vendor;
+            report.gl_renderer = adapter;
+            report.gl_version = driver;
+            report.gl_shading_language_version = shader;
+        } else {
+            report.gl_vendor = (const char *)glGetString(GL_VENDOR);
+            report.gl_renderer = (const char *)glGetString(GL_RENDERER);
+            report.gl_version = (const char *)glGetString(GL_VERSION);
+            report.gl_shading_language_version =
+                (const char *)glGetString(GL_SHADING_LANGUAGE_VERSION);
+        }
         struct xbe *xbe = xemu_get_xbe_info();
         is_xbe_identified = xbe != NULL;
         if (is_xbe_identified) {

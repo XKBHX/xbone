@@ -2,9 +2,9 @@
  * WebGPU logo, controller art, and framebuffer blit.
  *
  * These draw on the UI-thread device from wgpu-ui.cc. ImGui samples the
- * resulting views directly. The game image is still a GL texture, so the
- * framebuffer blit copies it with glGetTexImage until the UI pass moves to
- * the PFIFO device.
+ * resulting views directly. An accelerated game image is still a GL texture,
+ * so that blit copies it with glGetTexImage until the UI pass moves to the
+ * PFIFO device. The VGA fallback and snapshot thumbnails are uploaded here.
  *
  * Copyright (c) 2026 xemu Project
  *
@@ -72,6 +72,15 @@ struct SourceImage {
     WGPUBindGroup nearest;
     int width;
     int height;
+    bool guest;
+};
+
+struct OwnedImage {
+    WGPUTexture texture;
+    WGPUTextureView view;
+    uint64_t id;
+    int width;
+    int height;
 };
 
 static bool g_ready;
@@ -95,6 +104,7 @@ static uint32_t g_uniform_cursor;
 static ArtImage g_art[WGPU_ART_COUNT];
 static ArtImage g_icon;
 static SourceImage g_source;
+static std::vector<OwnedImage> g_owned;
 static std::vector<FboImage> g_fbos;
 
 static WGPUCommandEncoder g_encoder;
@@ -720,6 +730,36 @@ static void release_source(void)
     }
     g_source.width = 0;
     g_source.height = 0;
+    g_source.guest = false;
+}
+
+static bool ensure_source_texture(int width, int height)
+{
+    if (g_source.texture && g_source.width == width &&
+        g_source.height == height && g_source.linear && g_source.nearest) {
+        return true;
+    }
+    release_source();
+    g_source.texture =
+        make_texture("UI framebuffer",
+                     WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst,
+                     width, height);
+    if (!g_source.texture) {
+        return false;
+    }
+    g_source.view = make_view(g_source.texture);
+    if (g_source.view) {
+        g_source.linear = make_texture_group(g_source.view, g_sampler_linear);
+        g_source.nearest =
+            make_texture_group(g_source.view, g_sampler_nearest);
+    }
+    if (!g_source.linear || !g_source.nearest) {
+        release_source();
+        return false;
+    }
+    g_source.width = width;
+    g_source.height = height;
+    return true;
 }
 
 static WGPUBindGroup ensure_source(uint32_t name, bool linear)
@@ -728,30 +768,105 @@ static WGPUBindGroup ensure_source(uint32_t name, bool linear)
     int width = 0;
     int height = 0;
 
-    if (!read_gl_rgba(name, &pixels, &width, &height)) {
-        return NULL;
-    }
-    if (!g_source.texture || g_source.width != width ||
-        g_source.height != height) {
-        release_source();
-        g_source.texture = make_texture("UI framebuffer",
-                                        WGPUTextureUsage_TextureBinding |
-                                            WGPUTextureUsage_CopyDst,
-                                        width, height);
-        if (!g_source.texture) {
+    if (name == 0) {
+        if (!g_source.guest || !g_source.linear || !g_source.nearest) {
             return NULL;
         }
-        g_source.view = make_view(g_source.texture);
-        g_source.linear = make_texture_group(g_source.view, g_sampler_linear);
-        g_source.nearest = make_texture_group(g_source.view, g_sampler_nearest);
-        g_source.width = width;
-        g_source.height = height;
+        return linear ? g_source.linear : g_source.nearest;
     }
-    if (!g_source.linear || !g_source.nearest) {
+    g_source.guest = false;
+    if (!read_gl_rgba(name, &pixels, &width, &height) ||
+        !ensure_source_texture(width, height)) {
         return NULL;
     }
     upload_rgba(g_source.texture, pixels.data(), width, height);
     return linear ? g_source.linear : g_source.nearest;
+}
+
+bool wgpu_helpers_upload_rgba_frame(const uint8_t *rgba, int width, int height)
+{
+    if (!g_ready || !rgba || width <= 0 || height <= 0 ||
+        !ensure_source_texture(width, height)) {
+        return false;
+    }
+    upload_rgba(g_source.texture, rgba, width, height);
+    g_source.guest = true;
+    return true;
+}
+
+bool wgpu_helpers_has_guest_frame(void)
+{
+    return g_ready && g_source.guest && g_source.width > 0 &&
+           g_source.height > 0;
+}
+
+bool wgpu_helpers_guest_size(int *width, int *height)
+{
+    if (!wgpu_helpers_has_guest_frame()) {
+        return false;
+    }
+    if (width) {
+        *width = g_source.width;
+    }
+    if (height) {
+        *height = g_source.height;
+    }
+    return true;
+}
+
+static void release_owned(OwnedImage *image)
+{
+    if (image->id) {
+        xemu_wgpu_ui_unregister_texture(image->id);
+        image->id = 0;
+    }
+    if (image->view) {
+        wgpuTextureViewRelease(image->view);
+        image->view = NULL;
+    }
+    if (image->texture) {
+        wgpuTextureRelease(image->texture);
+        image->texture = NULL;
+    }
+}
+
+uint64_t wgpu_helpers_create_image(const uint8_t *rgba, int width, int height)
+{
+    OwnedImage image = {};
+
+    if (!xemu_wgpu_ui_device() || !rgba || width <= 0 || height <= 0) {
+        return 0;
+    }
+    image.texture = make_texture(
+        "UI image", WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst,
+        width, height);
+    if (!image.texture) {
+        return 0;
+    }
+    image.view = make_view(image.texture);
+    if (!image.view) {
+        wgpuTextureRelease(image.texture);
+        return 0;
+    }
+    upload_rgba(image.texture, rgba, width, height);
+    image.width = width;
+    image.height = height;
+    image.id = (uint64_t)(uintptr_t)image.view;
+    xemu_wgpu_ui_register_texture(image.id);
+    g_owned.push_back(image);
+    return image.id;
+}
+
+void wgpu_helpers_release_image(uint64_t id)
+{
+    for (size_t i = 0; i < g_owned.size(); i++) {
+        if (g_owned[i].id != id) {
+            continue;
+        }
+        release_owned(&g_owned[i]);
+        g_owned.erase(g_owned.begin() + i);
+        return;
+    }
 }
 
 static FboImage *find_fbo(Fbo *fbo)
@@ -840,6 +955,10 @@ void wgpu_helpers_shutdown(void)
         }
     }
     g_fbos.clear();
+    for (OwnedImage &image : g_owned) {
+        release_owned(&image);
+    }
+    g_owned.clear();
     for (int i = 0; i < WGPU_ART_COUNT; i++) {
         release_art(&g_art[i]);
     }
