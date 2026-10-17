@@ -324,16 +324,96 @@ static WGPUDevice request_device(PGRAPHWgpuState *r, Error **errp)
     return state.device;
 }
 
+static char g_adapter_vendor[256];
+static char g_adapter_device[256];
+static char g_adapter_description[512];
+
+static void copy_adapter_string(char *dst, size_t dst_size, WGPUStringView src)
+{
+    size_t length = 0;
+
+    if (!dst || dst_size == 0) {
+        return;
+    }
+    if (src.data) {
+        length = src.length == WGPU_STRLEN ? strlen(src.data) : src.length;
+    }
+    if (length >= dst_size) {
+        length = dst_size - 1;
+    }
+    if (length) {
+        memcpy(dst, src.data, length);
+    }
+    dst[length] = '\0';
+}
+
+static const char *adapter_backend_name(WGPUBackendType type)
+{
+    switch (type) {
+    case WGPUBackendType_D3D11:
+        return "D3D11";
+    case WGPUBackendType_D3D12:
+        return "D3D12";
+    case WGPUBackendType_Metal:
+        return "Metal";
+    case WGPUBackendType_Vulkan:
+        return "Vulkan";
+    case WGPUBackendType_OpenGL:
+        return "OpenGL";
+    case WGPUBackendType_OpenGLES:
+        return "OpenGL ES";
+    default:
+        return "WebGPU";
+    }
+}
+
+void pgraph_wgpu_copy_adapter_text(char *vendor, size_t vendor_size,
+                                   char *device, size_t device_size,
+                                   char *description, size_t description_size)
+{
+    if (vendor && vendor_size) {
+        snprintf(vendor, vendor_size, "%s", g_adapter_vendor);
+    }
+    if (device && device_size) {
+        snprintf(device, device_size, "%s", g_adapter_device);
+    }
+    if (description && description_size) {
+        snprintf(description, description_size, "%s", g_adapter_description);
+    }
+}
+
 static void log_adapter(WGPUAdapter adapter)
 {
     WGPUAdapterInfo info = WGPU_ADAPTER_INFO_INIT;
     WGPUSupportedFeatures features = WGPU_SUPPORTED_FEATURES_INIT;
 
+    g_adapter_vendor[0] = '\0';
+    g_adapter_device[0] = '\0';
+    g_adapter_description[0] = '\0';
     if (wgpuAdapterGetInfo(adapter, &info) == WGPUStatus_Success) {
         fprintf(stderr, "[WebGPU] Adapter: %.*s (%.*s), backend %d\n",
                 (int)info.device.length, info.device.data,
                 (int)info.description.length, info.description.data,
                 info.backendType);
+        copy_adapter_string(g_adapter_vendor, sizeof(g_adapter_vendor),
+                            info.vendor);
+        copy_adapter_string(g_adapter_device, sizeof(g_adapter_device),
+                            info.device);
+        copy_adapter_string(g_adapter_description,
+                            sizeof(g_adapter_description), info.description);
+        if (!g_adapter_vendor[0]) {
+            snprintf(g_adapter_vendor, sizeof(g_adapter_vendor), "%s",
+                     adapter_backend_name(info.backendType));
+        }
+        if (!g_adapter_device[0]) {
+            snprintf(g_adapter_device, sizeof(g_adapter_device), "%s",
+                     g_adapter_description[0] ? g_adapter_description :
+                                                "WebGPU");
+        }
+        if (!g_adapter_description[0]) {
+            snprintf(g_adapter_description, sizeof(g_adapter_description), "%s",
+                     adapter_backend_name(info.backendType));
+        }
         wgpuAdapterInfoFreeMembers(info);
     }
 

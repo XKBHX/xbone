@@ -21,6 +21,9 @@
 #ifndef HW_NV2A_H
 #define HW_NV2A_H
 
+#include <stdbool.h>
+#include <stddef.h>
+
 void nv2a_init(PCIBus *bus, int devfn, MemoryRegion *ram);
 void nv2a_context_init(void);
 int nv2a_get_framebuffer_surface(void);
@@ -29,5 +32,13 @@ void nv2a_set_surface_scale_factor(unsigned int scale);
 unsigned int nv2a_get_surface_scale_factor(void);
 const uint8_t *nv2a_get_dac_palette(void);
 int nv2a_get_screen_off(void);
+/* WebGPU UI. display_size is the composited guest image. Returns 0 when
+ * there is no color surface. submit_ui blocks until the PFIFO thread has
+ * run the posted UI job. */
+int nv2a_wgpu_display_size(int *width, int *height);
+bool nv2a_wgpu_submit_ui(void);
+void nv2a_wgpu_copy_adapter(char *vendor, size_t vendor_size, char *name,
+                            size_t name_size, char *description,
+                            size_t description_size);
 
 #endif

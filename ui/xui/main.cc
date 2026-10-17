@@ -172,10 +172,12 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
 
 void xemu_hud_cleanup(void)
 {
-    ShutdownCustomRendering();
-    if (xemu_wgpu_ui_active()) {
+    bool wgpu_ui = xemu_wgpu_ui_active();
+    if (wgpu_ui) {
         xemu_wgpu_ui_shutdown();
-    } else {
+    }
+    ShutdownCustomRendering();
+    if (!wgpu_ui) {
         ImGui_ImplOpenGL3_Shutdown();
     }
     ImGui_ImplSDL3_Shutdown();
@@ -210,11 +212,24 @@ bool xemu_hud_upload_rgba_frame(const uint8_t *rgba, int width, int height)
     return wgpu_helpers_upload_rgba_frame(rgba, width, height);
 }
 
+void xemu_hud_set_device_frame(int width, int height)
+{
+    wgpu_helpers_set_device_frame(width, height);
+}
+
+void xemu_hud_clear_device_frame(void)
+{
+    wgpu_helpers_clear_device_frame();
+}
+
 void xemu_hud_update(void)
 {
     ImGuiIO& io = ImGui::GetIO();
     uint32_t now = SDL_GetTicks();
 
+    if (xemu_wgpu_ui_active()) {
+        wgpu_helpers_begin_frame();
+    }
     g_viewport_mgr.Update();
     g_font_mgr.Update();
     if (g_last_scale != g_viewport_mgr.m_scale) {

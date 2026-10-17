@@ -10,8 +10,10 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "renderer.h"
+#include "ui/xui/wgpu-ui-pfifo.h"
 
 static GPUProperties gpu_properties;
 
@@ -44,7 +46,8 @@ static void pgraph_wgpu_process_pending(NV2AState *d)
 
     if (qatomic_read(&r->downloads_pending) ||
         qatomic_read(&r->download_dirty_surfaces_pending) ||
-        qatomic_read(&pg->sync_pending) || qatomic_read(&pg->flush_pending)) {
+        qatomic_read(&pg->sync_pending) || qatomic_read(&pg->flush_pending) ||
+        qatomic_read(&r->ui_pending)) {
         qemu_mutex_unlock(&d->pfifo.lock);
         qemu_mutex_lock(&pg->lock);
         if (qatomic_read(&r->downloads_pending)) {
@@ -59,6 +62,26 @@ static void pgraph_wgpu_process_pending(NV2AState *d)
         if (qatomic_read(&pg->flush_pending)) {
             pgraph_wgpu_flush(d);
         }
+        if (qatomic_read(&r->ui_pending)) {
+            WGPUTextureView display = NULL;
+            int display_width = 0;
+            int display_height = 0;
+
+            if (xemu_wgpu_ui_needs_display()) {
+                r->display.sampleable = true;
+                pgraph_wgpu_render_display(pg);
+                if (r->display.presented && r->display.image_view) {
+                    display = r->display.image_view;
+                    display_width = r->display.width;
+                    display_height = r->display.height;
+                }
+                r->display.sampleable = false;
+            }
+            xemu_wgpu_ui_execute(r->instance, r->device, r->queue, display,
+                                 display_width, display_height);
+            qatomic_set(&r->ui_pending, false);
+            qemu_event_set(&r->ui_complete);
+        }
         qemu_mutex_unlock(&pg->lock);
         qemu_mutex_lock(&d->pfifo.lock);
     }
@@ -69,7 +92,9 @@ static void pgraph_wgpu_init(NV2AState *d, Error **errp)
     PGRAPHState *pg = &d->pgraph;
 
     pg->wgpu_renderer_state = g_new0(PGRAPHWgpuState, 1);
+    qemu_event_init(&pg->wgpu_renderer_state->ui_complete, false);
     if (!pgraph_wgpu_init_instance(pg, errp)) {
+        qemu_event_destroy(&pg->wgpu_renderer_state->ui_complete);
         pgraph_wgpu_finalize_instance(pg);
         g_clear_pointer(&pg->wgpu_renderer_state, g_free);
         return;
@@ -100,6 +125,7 @@ static void pgraph_wgpu_finalize(NV2AState *d)
     pgraph_wgpu_finalize_reports(pg);
     pgraph_wgpu_finalize_buffers(pg);
     pgraph_wgpu_finalize_instance(pg);
+    qemu_event_destroy(&pg->wgpu_renderer_state->ui_complete);
     g_clear_pointer(&pg->wgpu_renderer_state, g_free);
 }
 
@@ -212,4 +238,95 @@ static PGRAPHRenderer pgraph_wgpu_renderer = {
 static void __attribute__((constructor)) register_renderer(void)
 {
     pgraph_renderer_register(&pgraph_wgpu_renderer);
+}
+
+int nv2a_wgpu_display_size(int *width, int *height)
+{
+    NV2AState *d = g_nv2a;
+    PGRAPHState *pg;
+    VGADisplayParams params;
+    SurfaceBinding *surface;
+    unsigned int w = 0;
+    unsigned int h = 0;
+
+    if (!d || !d->pgraph.wgpu_renderer_state) {
+        return 0;
+    }
+    pg = &d->pgraph;
+    qemu_mutex_lock(&d->pfifo.lock);
+    d->vga.get_params(&d->vga, &params);
+    surface =
+        pgraph_wgpu_surface_get_within(d, d->pcrtc.start + params.line_offset);
+    if (!surface || !surface->color || !surface->width || !surface->height) {
+        qemu_mutex_unlock(&d->pfifo.lock);
+        return 0;
+    }
+    d->vga.get_resolution(&d->vga, (int *)&w, (int *)&h);
+    if (d->vga.cr[NV_PRMCIO_INTERLACE_MODE] !=
+        NV_PRMCIO_INTERLACE_MODE_DISABLED) {
+        h *= 2;
+    }
+    pgraph_apply_scaling_factor(pg, &w, &h);
+    qemu_mutex_unlock(&d->pfifo.lock);
+    if (!w || !h) {
+        return 0;
+    }
+    if (width) {
+        *width = (int)w;
+    }
+    if (height) {
+        *height = (int)h;
+    }
+    return 1;
+}
+
+bool nv2a_wgpu_submit_ui(void)
+{
+    NV2AState *d = g_nv2a;
+    PGRAPHWgpuState *r;
+    bool locked;
+
+    if (!d || !d->pgraph.wgpu_renderer_state) {
+        return false;
+    }
+    r = d->pgraph.wgpu_renderer_state;
+    /*
+     * Font rebuild and thumbnail readback run while the UI holds the BQL.
+     * The PFIFO thread can need that lock inside the pusher, so drop it
+     * for the wait. The frame present itself is already outside the BQL.
+     */
+    locked = bql_locked();
+    if (locked) {
+        bql_unlock();
+    }
+    qemu_mutex_lock(&d->pfifo.lock);
+    qemu_event_reset(&r->ui_complete);
+    qatomic_set(&r->ui_pending, true);
+    pfifo_kick(d);
+    qemu_mutex_unlock(&d->pfifo.lock);
+    qemu_event_wait(&r->ui_complete);
+    if (locked) {
+        bql_lock();
+    }
+    return true;
+}
+
+void nv2a_wgpu_copy_adapter(char *vendor, size_t vendor_size, char *name,
+                            size_t name_size, char *description,
+                            size_t description_size)
+{
+    if (!g_nv2a || !g_nv2a->pgraph.wgpu_renderer_state) {
+        if (vendor && vendor_size) {
+            vendor[0] = '\0';
+        }
+        if (name && name_size) {
+            name[0] = '\0';
+        }
+        if (description && description_size) {
+            description[0] = '\0';
+        }
+        return;
+    }
+    pgraph_wgpu_copy_adapter_text(vendor, vendor_size, name, name_size,
+                                  description, description_size);
 }

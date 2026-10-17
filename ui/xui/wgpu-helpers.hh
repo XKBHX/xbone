@@ -20,7 +20,23 @@ enum DecalBlend {
 };
 
 #ifdef CONFIG_WEBGPU
+#include <webgpu/webgpu.h>
 bool wgpu_helpers_active(void);
+void wgpu_helpers_begin_frame(void);
+bool wgpu_helpers_gpu_init(void);
+void wgpu_helpers_gpu_shutdown(void);
+/* Records HUD passes, then the gamma blit of `display` or the guest
+ * upload. Returns true when the window target was drawn. */
+bool wgpu_helpers_replay(WGPUTextureView display, int display_width,
+                         int display_height);
+void wgpu_helpers_retire(void);
+void wgpu_helpers_run_png(WGPUTextureView display);
+bool wgpu_helpers_needs_display(void);
+WGPUTextureView wgpu_helpers_resolve(uint64_t id);
+void wgpu_helpers_set_device_frame(int width, int height);
+void wgpu_helpers_clear_device_frame(void);
+bool wgpu_helpers_device_frame(void);
+bool wgpu_helpers_frame_size(int *width, int *height);
 bool wgpu_helpers_init(void);
 void wgpu_helpers_shutdown(void);
 void wgpu_helpers_fbo_create(Fbo *fbo);
@@ -39,16 +55,40 @@ bool wgpu_helpers_render_framebuffer(uint32_t tex, int width, int height,
                                      bool flip, const float scale[2]);
 bool wgpu_helpers_framebuffer_png(uint32_t tex, bool flip, int width,
                                   int height, std::vector<uint8_t> &png);
-bool wgpu_helpers_upload_rgba_frame(const uint8_t *rgba, int width,
-                                    int height);
+bool wgpu_helpers_upload_rgba_frame(const uint8_t *rgba, int width, int height);
 bool wgpu_helpers_has_guest_frame(void);
 bool wgpu_helpers_guest_size(int *width, int *height);
 uint64_t wgpu_helpers_create_image(const uint8_t *rgba, int width, int height);
+bool wgpu_helpers_update_image(uint64_t id, const uint8_t *rgba, int width,
+                               int height);
 void wgpu_helpers_release_image(uint64_t id);
 uint64_t wgpu_helpers_icon(int *width, int *height);
 #else
 static inline bool wgpu_helpers_active(void)
 {
+    return false;
+}
+static inline void wgpu_helpers_begin_frame(void)
+{
+}
+static inline void wgpu_helpers_set_device_frame(int, int)
+{
+}
+static inline void wgpu_helpers_clear_device_frame(void)
+{
+}
+static inline bool wgpu_helpers_device_frame(void)
+{
+    return false;
+}
+static inline bool wgpu_helpers_frame_size(int *width, int *height)
+{
+    if (width) {
+        *width = 0;
+    }
+    if (height) {
+        *height = 0;
+    }
     return false;
 }
 static inline bool wgpu_helpers_init(void)

@@ -202,6 +202,11 @@ typedef struct WgpuDisplayState {
     WGPUTextureView image_view;
     unsigned int width;
     unsigned int height;
+    /* The UI pass samples this image, so it is rgba8unorm with
+     * TextureBinding and is not the GL-shared IOSurface. */
+    bool sampleable;
+    bool image_sampleable;
+    bool presented;
 
     WGPUTexture pvideo_image;
     WGPUTextureView pvideo_view;
@@ -346,6 +351,10 @@ typedef struct PGRAPHWgpuState {
     unsigned long *vertex_ram_valid;
     bool vertex_ram_drawn;
     bool vertex_ram_eligible;
+
+    /* The UI thread posts a frame. The PFIFO thread records it. */
+    bool ui_pending;
+    QemuEvent ui_complete;
     uint32_t max_vertex_buffers;
     uint32_t max_vertex_buffer_array_stride;
     uint64_t vertex_ram_offset[NV2A_VERTEXSHADER_ATTRIBUTES];
@@ -551,6 +560,9 @@ void pgraph_wgpu_image_blit(NV2AState *d);
 void pgraph_wgpu_init_display(PGRAPHState *pg);
 void pgraph_wgpu_finalize_display(PGRAPHState *pg);
 void pgraph_wgpu_render_display(PGRAPHState *pg);
+void pgraph_wgpu_copy_adapter_text(char *vendor, size_t vendor_size,
+                                   char *device, size_t device_size,
+                                   char *description, size_t description_size);
 #ifdef CONFIG_OPENGL
 GLuint pgraph_wgpu_present_display(PGRAPHWgpuState *r);
 #endif

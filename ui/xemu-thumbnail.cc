@@ -141,15 +141,13 @@ void *xemu_snapshots_create_framebuffer_thumbnail_png(size_t *size)
      * FIXME: Allow for dispatching a thumbnail request to the UI thread to
      * remove this altogether.
      *
-     * A WebGPU VGA frame has no GL texture. Its pixels are already on the UI
-     * device, so the PNG readback does not need a GL context. An accelerated
-     * frame is still copied from the GL texture until the UI pass moves.
+     * A WebGPU frame is sampled on the PFIFO device. VGA pixels are already
+     * uploaded, and an accelerated frame is the display composite. Neither
+     * needs a GL texture or a GL context.
      */
     if (wgpu_helpers_active()) {
-        if (!display_tex && !wgpu_helpers_has_guest_frame()) {
-            return NULL;
-        }
-        if (display_tex && !SDL_GL_GetCurrentContext()) {
+        if (!wgpu_helpers_device_frame() && !wgpu_helpers_has_guest_frame() &&
+            (!display_tex || !SDL_GL_GetCurrentContext())) {
             return NULL;
         }
     } else if (!SDL_GL_GetCurrentContext() || display_tex == 0) {

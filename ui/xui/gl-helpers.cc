@@ -1069,10 +1069,8 @@ void RenderFramebuffer(GLint tex, int width, int height, bool flip)
     int tw = 0, th = 0;
     float scale[2];
 
-    if (wgpu_helpers_active() && tex == 0) {
-        if (!wgpu_helpers_guest_size(&tw, &th)) {
-            return;
-        }
+    if (wgpu_helpers_active() && wgpu_helpers_frame_size(&tw, &th)) {
+        /* Device and guest frames have no GL texture. */
     } else {
         glActiveTexture(GL_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, tex);
@@ -1109,10 +1107,8 @@ bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, in
 {
     int width, height;
 
-    if (wgpu_helpers_active() && tex == 0) {
-        if (!wgpu_helpers_guest_size(&width, &height)) {
-            return false;
-        }
+    if (wgpu_helpers_active() && wgpu_helpers_frame_size(&width, &height)) {
+        /* Device and guest frames have no GL texture. */
     } else {
         if (!tex) {
             return false;

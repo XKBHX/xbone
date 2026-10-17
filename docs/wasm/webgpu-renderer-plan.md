@@ -158,9 +158,9 @@ How the `PGRAPHRenderer` ops map to the Vulkan implementation they model:
 | `image_blit` | `blit.c` (`vk/blit.c`) |
 | `clear_report_value` / `get_report` / `process_pending_reports` | `reports.c` |
 | `flip_stall` | `command.c` finish + submit |
-| `process_pending` | deferred downloads, display sync and flush (`pgraph_vk_process_pending`) |
+| `process_pending` | deferred downloads, display sync and flush, and the WebGPU UI job (`pgraph_vk_process_pending`) |
 | `pre_savevm_*` / `pre_shutdown_*` | download every dirty surface and signal the `QemuEvent` |
-| `get_framebuffer_surface` | native: composite into a GL texture, shared when the platform allows it, otherwise read back. No color surface, or no OpenGL: download and return `0`. Browser canvas present is phase 5 |
+| `get_framebuffer_surface` | native: composite into a GL texture, shared when the platform allows it, otherwise read back. The WebGPU UI does not call this for an accelerated frame. It samples a separate `rgba8unorm` target on the PFIFO device and still reads the combined image back into the window. No color surface, or no OpenGL: download and return `0`. Browser canvas present is later in phase 5 |
 | `set/get_surface_scale_factor` | `surface.c` |
 | `get_gpu_properties` | `instance.c` (constant winding, since there is no geometry shader) |
 
@@ -177,7 +177,7 @@ Each phase ends with a demonstrable exit criterion.
 | 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite. Phase 4 step 5 shares that image with GL; the readback remains the fallback. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
 | 3. WGSL generator | Steps 1–3 are done. Step 1 translates draw shaders from the WebGPU-targeted GLSL. Step 2 did not need new shaders: the pack and unpack kernels and the display composite were already WGSL in phase 2. Step 3 creates every shader module with `WGPUShaderSourceWGSL`. The WebGPU backend no longer links glslang and does not request `ShaderSourceSPIRV`. glslang remains for Vulkan. A translation or Tint failure skips that draw. |
 | 4. Performance | Steps 1–5 are done. Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline. Blend color and the stencil reference stay dynamic. Step 2 coalesces surface readbacks into one submit and one map, and reads a surface back only when a draw has made it dirty and a consumer needs RAM. Step 3 caches texture bind groups and keeps a guest-RAM vertex buffer, uploaded in 64 KiB blocks. Attributes WebGPU cannot fetch stay on the CPU packer. Step 4 expands packed texture texels in a compute shader. Step 5 imports the display composite into the GL texture the UI already samples. Frame times have not been compared with Vulkan. |
-| 5. WebGPU UI and browser | Steps 1–3 are done. When `display.renderer` is `WEBGPU`, ImGui, the HUD art, snapshot thumbnails, and the VGA fallback run on a UI-thread Dawn device. The About page and the compatibility report name that adapter. The window present is still a readback into OpenGL, and an accelerated frame is still copied from its GL texture. Step 4 and the browser work are not started. |
+| 5. WebGPU UI and browser | Steps 1–4 are done. When `display.renderer` is `WEBGPU`, the UI thread records ImGui and the HUD and posts that work to the PFIFO thread. The PFIFO thread samples the display composite and records the UI pass on the NV2A device. The window present is still a readback of that combined image into OpenGL. The browser work is not started. |
 
 Phase 0 notes:
 
@@ -1111,6 +1111,41 @@ Phase 5 notes (step 3, remaining GL users):
 - The changed files compile in `build/webgpu-native-check` on macOS arm64.
   The snapshot menu, a VGA frame, and the About page were not compared
   on screen.
+
+Phase 5 notes (step 4, one device):
+
+- The UI thread no longer creates a Dawn device. It records HUD commands
+  and a deep copy of `ImDrawData`, then sets `ui_pending` and waits on
+  `ui_complete`. `process_pending` drops `pfifo.lock`, takes `pgraph.lock`,
+  and runs the job, the same way it handles `sync_pending`. The wait drops
+  the BQL when the UI holds it, so the PFIFO pusher can take that lock.
+  One job runs at a time.
+- The jobs are init, font rebuild, frame, PNG thumbnail, and shutdown.
+  Init creates the ImGui WebGPU backend, the white texture, the HUD
+  pipelines, and the font atlas on the NV2A device. It retries until that
+  device exists. Shutdown releases those objects on the PFIFO thread.
+- Texture ids in the draw lists are handles. The font atlas id is a stable
+  handle, and the copy replaces it with the font view before
+  `ImGui_ImplWGPU_RenderDrawData`. HUD art, snapshots, and VGA images are
+  handles too. A leftover GL name is read with `glGetTexImage` on the UI
+  thread and uploaded on the PFIFO thread. Handles start at `0x100000000`
+  so they do not collide with GL names.
+- An accelerated frame does not call `nv2a_get_framebuffer_surface`.
+  `nv2a_wgpu_display_size` reports the VGA size, interlace, and the surface
+  scale. The UI pass renders the composite into a separate `rgba8unorm`
+  image with `TextureBinding`. The shared IOSurface, dma-buf, or DXGI image
+  stays `bgra8unorm` and is not sampled. That sampleable pass skips the CPU
+  readback. The gamma blit samples the composite with flip disabled, which
+  matches the GL path. A VGA frame still uploads guest pixels and is flipped.
+- The window present is still a readback of the combined image into the
+  OpenGL overlay. A scene replaces the framebuffer. The welcome path clears
+  transparent and blends. The browser canvas is a later step.
+- The About page and the compatibility report read the NV2A adapter. The
+  shader language is still WGSL.
+- A thumbnail or screenshot of a device frame or a VGA upload does not need
+  a GL texture. The fit scale uses that size.
+- `qemu-system-i386-unsigned` links in `build/webgpu-native-check` on macOS
+  arm64. The dashboard, menus, and a screenshot were not compared on screen.
 
 **Exit**: natively, the xemu UI runs entirely on WebGPU with no OpenGL. In
 the browser, an nxdk test XBE renders in Chrome with the game and UI on one

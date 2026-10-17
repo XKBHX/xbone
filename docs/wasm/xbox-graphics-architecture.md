@@ -247,16 +247,22 @@ Backend use:
     (`HAVE_EXTERNAL_MEMORY == 0`), it downloads the surface into guest RAM and
     returns `0`.
   - **WebGPU backend**: renders that composite in `webgpu/display.c`. When
-    the device can import shared memory, the image is an IOSurface (macOS),
-    a dma-buf (Linux), or a DXGI shared handle (Windows). macOS blits the
-    IOSurface from a rectangle texture to the 2D texture the UI samples.
-    Otherwise the composite is read back and uploaded with `glTexImage2D`.
-    Without OpenGL it downloads the surface and returns `0`.
-  - A return value of `0` makes the UI use the **VGA fallback**. It uploads
-    the scanout region of guest RAM as a GL texture
+    the WebGPU UI is active and a colour surface exists, the UI does not
+    take the GL texture. The PFIFO thread renders the composite into a
+    separate `rgba8unorm` image and samples it in the same device pass as
+    ImGui. The combined image is still read back into the OpenGL window.
+    `get_framebuffer_surface` still shares an IOSurface (macOS), a dma-buf
+    (Linux), or a DXGI handle (Windows) when something asks for the GL
+    texture. Otherwise that path reads the composite back and uploads it
+    with `glTexImage2D`. Without OpenGL it downloads the surface and
+    returns `0`.
+  - A return value of `0` makes the UI use the **VGA fallback**. With the
+    WebGPU UI, those guest pixels are uploaded and sampled on the PFIFO
+    device. Otherwise the scanout is a GL texture
     (`xb_surface_gl_create_texture`).
-- The UI then draws the frame plus ImGui (HUD, menus, snapshots) with
-  OpenGL and calls `nv2a_release_framebuffer_surface()`.
+- OpenGL and Vulkan then draw the frame plus ImGui with OpenGL and call
+  `nv2a_release_framebuffer_surface()`. The WebGPU UI records ImGui on the
+  PFIFO device. It calls that release only when it took the GL surface.
 
 ### 3.7 The renderer interface
 
