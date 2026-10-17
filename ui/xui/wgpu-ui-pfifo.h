@@ -21,6 +21,14 @@ void xemu_wgpu_ui_execute(WGPUInstance instance, WGPUDevice device,
                           WGPUTextureView canvas, int canvas_width,
                           int canvas_height, WGPUTextureFormat canvas_format);
 bool xemu_wgpu_ui_needs_display(void);
+
+/* Poll, then suspend through Asyncify or JSPI when the future is still
+ * pending. A finished future does not unwind. */
+bool xemu_wgpu_wait(WGPUInstance instance, WGPUFuture future);
+/* A synchronous buffer map. Counted with the waits and logged per guest
+ * frame. */
+void xemu_wgpu_note_download(void);
+void xemu_wgpu_wait_frame(void);
 #endif
 
 #ifdef __cplusplus

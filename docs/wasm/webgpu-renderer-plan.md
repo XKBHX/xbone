@@ -178,7 +178,7 @@ Each phase ends with a demonstrable exit criterion.
 | 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite. Phase 4 step 5 shares that image with GL; the readback remains the fallback. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
 | 3. WGSL generator | Steps 1–3 are done. Step 1 translates draw shaders from the WebGPU-targeted GLSL. Step 2 did not need new shaders: the pack and unpack kernels and the display composite were already WGSL in phase 2. Step 3 creates every shader module with `WGPUShaderSourceWGSL`. The WebGPU backend no longer links glslang and does not request `ShaderSourceSPIRV`. glslang remains for Vulkan. A translation or Tint failure skips that draw. |
 | 4. Performance | Steps 1–5 are done. Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline. Blend color and the stencil reference stay dynamic. Step 2 coalesces surface readbacks into one submit and one map, and reads a surface back only when a draw has made it dirty and a consumer needs RAM. Step 3 caches texture bind groups and keeps a guest-RAM vertex buffer, uploaded in 64 KiB blocks. Attributes WebGPU cannot fetch stay on the CPU packer. Step 4 expands packed texture texels in a compute shader. Step 5 imports the display composite into the GL texture the UI already samples. Frame times have not been compared with Vulkan. |
-| 5. WebGPU UI and browser | Steps 1–4 are done. When `display.renderer` is `WEBGPU`, the UI thread records ImGui and the HUD and posts that work to the PFIFO thread. The PFIFO thread samples the display composite and records the UI pass on the NV2A device. Natively the window present is still a readback of that combined image into OpenGL. Browser steps 1 and 2 are done. Step 1 (`tests/wasm/webgpu-offscreen-spike`) creates an emdawnwebgpu device on a pthread and clears a transferred `OffscreenCanvas`. Step 2 presents on that canvas: `canvas.c` binds `#canvas` on the PFIFO thread, the UI gamma blit writes the PCRTC composite into the current texture, and ImGui follows in the next pass. `get_framebuffer_surface` returns 0. `wgpuSurfacePresent` is not called. In Chromium on macOS arm64 the step 2 page was green with a red corner, and the readback matched. The xemu WASM binary links and, in Chromium, draws the menu bar onto the canvas. It then aborts because a store hits the Emscripten heap canary at address zero. Browser steps 3–5 are not started. |
+| 5. WebGPU UI and browser | Steps 1–4 are done. When `display.renderer` is `WEBGPU`, the UI thread records ImGui and the HUD and posts that work to the PFIFO thread. The PFIFO thread samples the display composite and records the UI pass on the NV2A device. Natively the window present is still a readback of that combined image into OpenGL. Browser steps 1 and 2 are done. Step 1 (`tests/wasm/webgpu-offscreen-spike`) creates an emdawnwebgpu device on a pthread and clears a transferred `OffscreenCanvas`. Step 2 presents on that canvas: `canvas.c` binds `#canvas` on the PFIFO thread, the UI gamma blit writes the PCRTC composite into the current texture, and ImGui follows in the next pass. `get_framebuffer_surface` returns 0. `wgpuSurfacePresent` is not called. In Chromium on macOS arm64 the step 2 page was green with a red corner, and the readback matched. The xemu WASM binary links and, in Chromium, draws the menu bar onto the canvas. It then aborts because a store hits the Emscripten heap canary at address zero. Browser step 3 is done. A pending `wgpuInstanceWaitAny` suspends through Asyncify. JSPI works in the standalone present test and is not the xemu link, because coroutine fibers still use Asyncify stacks. A finished future is polled and does not suspend. The browser does not map the display image. Browser steps 4 and 5 are not started. |
 
 Phase 0 notes:
 
@@ -1234,6 +1234,47 @@ Phase 5 notes (browser step 2, canvas present):
   browser. `qemu-system-i386-unsigned` still links in
   `build/webgpu-native-check` on macOS arm64.
 
+Phase 5 notes (browser step 3, blocking waits):
+
+- `xemu_wgpu_wait` is the wait used by the renderer and the UI. It calls
+  `wgpuInstanceWaitAny` with a timeout of 0 first. That poll does not enter
+  `emwgpuWaitAny`, so a future that has already finished does not unwind the
+  worker. A future that is still pending is waited on with no timeout.
+  emdawnwebgpu implements that wait as `emwgpuWaitAny`, which is async.
+  With `-sASYNCIFY=1` the import suspends through Asyncify. With `-sJSPI=1`
+  `emscripten_has_asyncify()` is 2 and the same import suspends through
+  JSPI. The xemu link stays on Asyncify. `util/coroutine-wasm.c` swaps
+  emscripten fibers, and those fibers carry Asyncify stacks. JSPI does not
+  replace that. `configs/meson/emscripten.txt` lists `emwgpuWaitAny` in
+  `ASYNCIFY_IMPORTS` next to `ffi_call_js`. The port also marks the import
+  async, so the linker would add it on its own. The Asyncify stack is
+  64 KiB. The default 4 KiB is the unwind buffer for a wait that is not
+  inside a fiber, which is the PFIFO thread. Fiber stacks stay 1 MiB.
+- Device creation fails if the link has neither Asyncify nor JSPI. The
+  instance log line is `[WebGPU] Blocking waits: Asyncify` or `JSPI`.
+  The first suspending wait logs its time. Every 60 `FLIP_STALL`s log how
+  many waits suspended, how many milliseconds that took, and how many
+  buffer maps ran. A map is a surface download, an occlusion readback, or
+  a PNG thumbnail. The native window overlay is a separate map and is
+  not taken for a canvas present.
+- A browser frame does not map the display image. The composite stays a
+  sampleable texture for the UI pass, and `readback_display` is not
+  compiled in. The canvas UI pass does not push an error scope, so it
+  does not suspend to pop one. Uncaptured errors are still logged. An
+  occlusion resolve no longer idles the queue and then maps: the map
+  waits for that submit.
+- Checked in the Cursor Chromium tab on macOS arm64 (Apple M1 Pro),
+  emsdk 6.0.12, `crossOriginIsolated` true. `tests/wasm/webgpu-canvas-present`
+  still drew the green canvas with the red corner, and the center and
+  corner readbacks matched. Eight write-then-map waits all suspended.
+  Two Asyncify runs took 4 ms and 7 ms for those eight maps (13 ms and
+  18 ms for all 12 suspending waits, including adapter, device, and the
+  two pixel readbacks). The same page linked with `-sJSPI=1` reported
+  `asyncify=2`. Two runs took 6 ms and 3 ms for the eight maps (16 ms
+  and 11 ms for all 12 waits). On these short waits the two mechanisms
+  overlap. The full xemu wasm binary was not run again. The changed
+  files compile in `build/wasm/xemu` and in `build/webgpu-native-check`.
+
 **Exit**: natively, the xemu UI runs entirely on WebGPU with no OpenGL. In
 the browser, an nxdk test XBE renders in Chrome with the game and UI on one
 WebGPU canvas. Performance is reported, not gated, until the CPU work in
@@ -1273,7 +1314,7 @@ WebGPU canvas. Performance is reported, not gated, until the CPU work in
 | Guest CPU speed under TCI in the browser | Browser build unplayable regardless of the GPU path | See [cpu-realtime.md](cpu-realtime.md). Justify native WebGPU on its own merits: portability, an easier-to-debug API, and an OpenGL-free UI. |
 | WebGPU UI port scope | Many direct GL call sites outside ImGui | Port and ship it natively first, behind a config switch, before depending on it in the browser. |
 | Prebuilt Dawn ABI drift | `webgpu.h` changes between Dawn releases | Pin one release. Isolate Dawn-specific calls in `instance.c` and `display.c`. |
-| Synchronous readbacks in the browser | Large Asyncify overhead, frame hitches | JSPI, batched downloads, and avoiding readback for display. |
+| Synchronous readbacks in the browser | Large Asyncify overhead, frame hitches | The wait polls first and suspends only while a future is pending. Display is not read back. A guest read or an occlusion report still maps. JSPI was timed on the present test and was not faster on those short waits. The xemu link stays on Asyncify because fibers need it. |
 | No geometry shaders | Point-sprite and wireframe correctness | `prim.c` plus vertex pulling. Wireframe culling is a known limitation at first. |
 | Pipeline compile stutter (pipelines are immutable) | Hitching on first use | Async creation, persistent cache, and pre-warming from a recorded key list. |
 | Optional features missing on some adapters | Formats, depth readback, clip | Every optional feature has a core-only fallback (section 3). Test the fallbacks explicitly by disabling the features. |
