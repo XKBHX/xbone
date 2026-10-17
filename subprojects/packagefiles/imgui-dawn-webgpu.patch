@@ -1,0 +1,194 @@
+diff --git a/backends/imgui_impl_wgpu.cpp b/backends/imgui_impl_wgpu.cpp
+index 2f34c0e..c891250 100644
+--- a/backends/imgui_impl_wgpu.cpp
++++ b/backends/imgui_impl_wgpu.cpp
+@@ -58,6 +58,12 @@
+ #include <limits.h>
+ #include <webgpu/webgpu.h>
+ 
++#if defined(IMGUI_IMPL_WEBGPU_BACKEND_DAWN)
++// Dawn renamed WGPUProgrammableStageDescriptor. Vertex and fragment state
++// both carry the module and entry point this helper returns.
++using WGPUProgrammableStageDescriptor = WGPUVertexState;
++#endif
++
+ // Dear ImGui prototypes from imgui_internal.h
+ extern ImGuiID ImHashData(const void* data_p, size_t data_size, ImU32 seed = 0);
+ #define MEMALIGN(_SIZE,_ALIGN)        (((_SIZE) + ((_ALIGN) - 1)) & ~((_ALIGN) - 1))    // Memory align (copied from IM_ALIGN() macro).
+@@ -245,7 +251,16 @@ static void SafeRelease(RenderResources& res)
+     SafeRelease(res.Sampler);
+     SafeRelease(res.Uniforms);
+     SafeRelease(res.CommonBindGroup);
+-    SafeRelease(res.ImageBindGroup);
++    // The font bind group is stored here as well as in ImageBindGroup.
++    // Releasing the map releases it once.
++    for (int i = 0; i < res.ImageBindGroups.Data.Size; i++)
++    {
++        WGPUBindGroup bind_group = (WGPUBindGroup)res.ImageBindGroups.Data[i].val_p;
++        if (bind_group)
++            wgpuBindGroupRelease(bind_group);
++    }
++    res.ImageBindGroups.Clear();
++    res.ImageBindGroup = nullptr;
+     SafeRelease(res.ImageBindGroupLayout);
+ };
+ 
+@@ -389,17 +404,10 @@ void ImGui_ImplWGPU_RenderDrawData(ImDrawData* draw_data, WGPURenderPassEncoder
+         SafeRelease(fr->VertexBufferHost);
+         fr->VertexBufferSize = draw_data->TotalVtxCount + 5000;
+ 
+-        WGPUBufferDescriptor vb_desc =
+-        {
+-            nullptr,
+-            "Dear ImGui Vertex buffer",
+-#ifdef IMGUI_IMPL_WEBGPU_BACKEND_DAWN
+-            WGPU_STRLEN,
+-#endif
+-            WGPUBufferUsage_CopyDst | WGPUBufferUsage_Vertex,
+-            MEMALIGN(fr->VertexBufferSize * sizeof(ImDrawVert), 4),
+-            false
+-        };
++        WGPUBufferDescriptor vb_desc = {};
++        vb_desc.label = { "Dear ImGui Vertex buffer", WGPU_STRLEN };
++        vb_desc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_Vertex;
++        vb_desc.size = MEMALIGN(fr->VertexBufferSize * sizeof(ImDrawVert), 4);
+         fr->VertexBuffer = wgpuDeviceCreateBuffer(bd->wgpuDevice, &vb_desc);
+         if (!fr->VertexBuffer)
+             return;
+@@ -416,17 +424,10 @@ void ImGui_ImplWGPU_RenderDrawData(ImDrawData* draw_data, WGPURenderPassEncoder
+         SafeRelease(fr->IndexBufferHost);
+         fr->IndexBufferSize = draw_data->TotalIdxCount + 10000;
+ 
+-        WGPUBufferDescriptor ib_desc =
+-        {
+-            nullptr,
+-            "Dear ImGui Index buffer",
+-#ifdef IMGUI_IMPL_WEBGPU_BACKEND_DAWN
+-            WGPU_STRLEN,
+-#endif
+-            WGPUBufferUsage_CopyDst | WGPUBufferUsage_Index,
+-            MEMALIGN(fr->IndexBufferSize * sizeof(ImDrawIdx), 4),
+-            false
+-        };
++        WGPUBufferDescriptor ib_desc = {};
++        ib_desc.label = { "Dear ImGui Index buffer", WGPU_STRLEN };
++        ib_desc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_Index;
++        ib_desc.size = MEMALIGN(fr->IndexBufferSize * sizeof(ImDrawIdx), 4);
+         fr->IndexBuffer = wgpuDeviceCreateBuffer(bd->wgpuDevice, &ib_desc);
+         if (!fr->IndexBuffer)
+             return;
+@@ -559,19 +560,32 @@ static void ImGui_ImplWGPU_CreateFontsTexture()
+         bd->renderResources.FontTextureView = wgpuTextureCreateView(bd->renderResources.FontTexture, &tex_view_desc);
+     }
+ 
+-    // Upload texture data
++    // Upload texture data. bytesPerRow must be a multiple of 256.
+     {
+-        WGPUImageCopyTexture dst_view = {};
++        const uint32_t row_bytes = (uint32_t)width * (uint32_t)size_pp;
++        const uint32_t bytes_per_row = (row_bytes + 255u) & ~255u;
++        unsigned char* upload = pixels;
++        unsigned char* padded = nullptr;
++        if (bytes_per_row != row_bytes)
++        {
++            padded = new unsigned char[(size_t)bytes_per_row * (size_t)height];
++            for (int y = 0; y < height; y++)
++                memcpy(padded + (size_t)y * bytes_per_row, pixels + (size_t)y * row_bytes, row_bytes);
++            upload = padded;
++        }
++
++        WGPUTexelCopyTextureInfo dst_view = {};
+         dst_view.texture = bd->renderResources.FontTexture;
+         dst_view.mipLevel = 0;
+         dst_view.origin = { 0, 0, 0 };
+         dst_view.aspect = WGPUTextureAspect_All;
+-        WGPUTextureDataLayout layout = {};
++        WGPUTexelCopyBufferLayout layout = {};
+         layout.offset = 0;
+-        layout.bytesPerRow = width * size_pp;
++        layout.bytesPerRow = bytes_per_row;
+         layout.rowsPerImage = height;
+         WGPUExtent3D size = { (uint32_t)width, (uint32_t)height, 1 };
+-        wgpuQueueWriteTexture(bd->defaultQueue, &dst_view, pixels, (uint32_t)(width * size_pp * height), &layout, &size);
++        wgpuQueueWriteTexture(bd->defaultQueue, &dst_view, upload, (size_t)bytes_per_row * (size_t)height, &layout, &size);
++        delete[] padded;
+     }
+ 
+     // Create the associated sampler
+@@ -596,17 +610,10 @@ static void ImGui_ImplWGPU_CreateFontsTexture()
+ static void ImGui_ImplWGPU_CreateUniformBuffer()
+ {
+     ImGui_ImplWGPU_Data* bd = ImGui_ImplWGPU_GetBackendData();
+-    WGPUBufferDescriptor ub_desc =
+-    {
+-        nullptr,
+-        "Dear ImGui Uniform buffer",
+-#ifdef IMGUI_IMPL_WEBGPU_BACKEND_DAWN
+-        WGPU_STRLEN,
+-#endif
+-        WGPUBufferUsage_CopyDst | WGPUBufferUsage_Uniform,
+-        MEMALIGN(sizeof(Uniforms), 16),
+-        false
+-    };
++    WGPUBufferDescriptor ub_desc = {};
++    ub_desc.label = { "Dear ImGui Uniform buffer", WGPU_STRLEN };
++    ub_desc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_Uniform;
++    ub_desc.size = MEMALIGN(sizeof(Uniforms), 16);
+     bd->renderResources.Uniforms = wgpuDeviceCreateBuffer(bd->wgpuDevice, &ub_desc);
+ }
+ 
+@@ -666,12 +673,12 @@ bool ImGui_ImplWGPU_CreateDeviceObjects()
+     // Vertex input configuration
+     WGPUVertexAttribute attribute_desc[] =
+     {
+-        { WGPUVertexFormat_Float32x2, (uint64_t)offsetof(ImDrawVert, pos), 0 },
+-        { WGPUVertexFormat_Float32x2, (uint64_t)offsetof(ImDrawVert, uv),  1 },
+-        { WGPUVertexFormat_Unorm8x4,  (uint64_t)offsetof(ImDrawVert, col), 2 },
++        { nullptr, WGPUVertexFormat_Float32x2, (uint64_t)offsetof(ImDrawVert, pos), 0 },
++        { nullptr, WGPUVertexFormat_Float32x2, (uint64_t)offsetof(ImDrawVert, uv),  1 },
++        { nullptr, WGPUVertexFormat_Unorm8x4,  (uint64_t)offsetof(ImDrawVert, col), 2 },
+     };
+ 
+-    WGPUVertexBufferLayout buffer_layouts[1];
++    WGPUVertexBufferLayout buffer_layouts[1] = {};
+     buffer_layouts[0].arrayStride = sizeof(ImDrawVert);
+     buffer_layouts[0].stepMode = WGPUVertexStepMode_Vertex;
+     buffer_layouts[0].attributeCount = 3;
+diff --git a/meson.build b/meson.build
+index e2f7992..e142e03 100644
+--- a/meson.build
++++ b/meson.build
+@@ -72,8 +72,22 @@ if vulkan_dep.found()
+   sources += 'backends/imgui_impl_vulkan.cpp'
+   dependencies += vulkan_dep
+ endif
+-if cpp.has_header('webgpu/webgpu.h', required: get_option('webgpu'))
+-  sources += 'backends/imgui_impl_wgpu.cpp'
++# Dawn is not on the default include path. Look it up the same way xemu does
++# so webgpu.h is visible when the option is enabled.
++wgpu_cpp_args = []
++if not get_option('webgpu').disabled()
++  dawn_dep = dependency('dawn', method: 'pkg-config', required: false)
++  if not dawn_dep.found()
++    dawn_dep = dependency('Dawn', method: 'cmake', modules: ['dawn::webgpu_dawn'], required: false)
++  endif
++  if not dawn_dep.found()
++    dawn_dep = dependency('webgpu_dawn', required: get_option('webgpu'))
++  endif
++  if dawn_dep.found()
++    sources += 'backends/imgui_impl_wgpu.cpp'
++    dependencies += dawn_dep
++    wgpu_cpp_args += '-DIMGUI_IMPL_WEBGPU_BACKEND_DAWN'
++  endif
+ endif
+ 
+ # platform backends
+@@ -118,7 +132,7 @@ endif
+ imgui = library(
+   'imgui',
+   sources,
+-  cpp_args: api,
++  cpp_args: [api] + wgpu_cpp_args,
+   gnu_symbol_visibility: 'hidden',
+   dependencies: dependencies,
+   include_directories: include_dirs,

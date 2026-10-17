@@ -18,6 +18,7 @@
 //
 #include "font-manager.hh"
 #include "viewport-manager.hh"
+#include "wgpu-ui.hh"
 
 #include "data/Roboto-Medium.ttf.h"
 #include "data/RobotoCondensed-Regular.ttf.h"
@@ -99,8 +100,12 @@ void FontManager::Rebuild()
         m_fixed_width_font = io.Fonts->AddFontDefault(&config);
     }
 
-    ImGui_ImplOpenGL3_DestroyFontsTexture();
-    ImGui_ImplOpenGL3_CreateFontsTexture();
+    if (xemu_wgpu_ui_active()) {
+        xemu_wgpu_ui_rebuild_fonts();
+    } else {
+        ImGui_ImplOpenGL3_DestroyFontsTexture();
+        ImGui_ImplOpenGL3_CreateFontsTexture();
+    }
 }
 
 void FontManager::Update()

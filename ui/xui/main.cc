@@ -50,6 +50,7 @@
 #include "welcome.hh"
 #include "menubar.hh"
 #include "compat.hh"
+#include "wgpu-ui.hh"
 #if defined(_WIN32)
 #include "update.hh"
 #endif
@@ -143,9 +144,15 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     io.IniFilename = NULL;
 
-    // Setup Platform/Renderer bindings
-    ImGui_ImplSDL3_InitForOpenGL(window, sdl_gl_context);
-    ImGui_ImplOpenGL3_Init("#version 150");
+    // Setup Platform/Renderer bindings. WebGPU ImGui is used only when that
+    // renderer is selected. OpenGL and Vulkan keep the OpenGL3 backend.
+    if (g_config.display.renderer == CONFIG_DISPLAY_RENDERER_WEBGPU &&
+        xemu_wgpu_ui_init(window)) {
+        ImGui_ImplSDL3_InitForOther(window);
+    } else {
+        ImGui_ImplSDL3_InitForOpenGL(window, sdl_gl_context);
+        ImGui_ImplOpenGL3_Init("#version 150");
+    }
     ImPlot::CreateContext();
 
 #if defined(_WIN32)
@@ -161,7 +168,11 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
 
 void xemu_hud_cleanup(void)
 {
-    ImGui_ImplOpenGL3_Shutdown();
+    if (xemu_wgpu_ui_active()) {
+        xemu_wgpu_ui_shutdown();
+    } else {
+        ImGui_ImplOpenGL3_Shutdown();
+    }
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
 }
@@ -209,7 +220,11 @@ void xemu_hud_update(void)
         RenderFramebuffer(g_tex, ww, wh, g_flip_req);
     }
 
-    ImGui_ImplOpenGL3_NewFrame();
+    if (xemu_wgpu_ui_active()) {
+        xemu_wgpu_ui_new_frame();
+    } else {
+        ImGui_ImplOpenGL3_NewFrame();
+    }
     io.ConfigFlags &= ~ImGuiConfigFlags_NavEnableGamepad;
     ImGui_ImplSDL3_NewFrame();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
@@ -325,7 +340,11 @@ void xemu_hud_update(void)
 void xemu_hud_render()
 {
     ImGui::Render();
-    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    if (xemu_wgpu_ui_active()) {
+        xemu_wgpu_ui_render();
+    } else {
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    }
 
     if (g_vsync != g_config.display.window.vsync) {
         g_vsync = g_config.display.window.vsync;

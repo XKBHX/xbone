@@ -17,8 +17,10 @@ manual under `docs/` (which only builds `.rst`).
 ## Current WASM status in this tree
 
 The tree inherits upstream QEMU's Emscripten host support and adds a native
-WebAssembly TCG backend. The xemu UI has not been ported yet. A WebGPU NV2A
-renderer is in progress natively (Dawn); see the status table in
+WebAssembly TCG backend. When `display.renderer` is `WEBGPU`, Dear ImGui
+draws through Dawn on the UI thread and is composited over the OpenGL
+window. The rest of the UI is still OpenGL. A WebGPU NV2A renderer runs
+natively (Dawn); see the status table in
 [webgpu-renderer-plan.md](webgpu-renderer-plan.md#implementation-status).
 
 What exists:
@@ -66,8 +68,10 @@ What exists:
 What blocks an xemu WASM build today:
 
 - `epoxy` (OpenGL loader) is declared `required: true` in `meson.build`. The
-  xemu UI (`ui/xemu.c`, `ui/xui/`) is SDL3 + OpenGL + Dear ImGui (OpenGL3
-  backend) and is linked unconditionally.
+  xemu UI (`ui/xemu.c`, `ui/xui/`) is SDL3 + OpenGL. Dear ImGui uses its
+  WebGPU backend when the NV2A renderer is WebGPU, and the OpenGL3 backend
+  otherwise. The framebuffer blit, menus art, and the rest of `ui/xui/` are
+  still OpenGL and are linked unconditionally.
 - Both GPU renderers (`hw/xbox/nv2a/pgraph/gl`, `.../vk`) need desktop
   OpenGL. The Vulkan renderer still shows its frames through OpenGL by
   importing them with `GL_EXT_memory_object`.
