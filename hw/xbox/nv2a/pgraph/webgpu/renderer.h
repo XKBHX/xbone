@@ -193,6 +193,7 @@ typedef struct WgpuDisplayState {
     WGPUShaderModule module;
     WGPUBindGroupLayout bind_group_layout;
     WGPURenderPipeline pipeline;
+    WGPUTextureFormat format;
     WGPUSampler frame_sampler;
     WGPUSampler pvideo_sampler;
     WGPUBuffer uniform;
