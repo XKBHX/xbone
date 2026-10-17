@@ -863,6 +863,8 @@ static void draw_uploaded_depth(PGRAPHState *pg, SurfaceBinding *surface,
     ds.view = surface->view;
     ds.depthLoadOp = WGPULoadOp_Load;
     ds.depthStoreOp = WGPUStoreOp_Store;
+    /* emdawnwebgpu forwards this even when the load op is not Clear. */
+    ds.depthClearValue = 1.0f;
     if (zeta_format_has_stencil(surface->host_fmt.format)) {
         ds.stencilLoadOp = WGPULoadOp_Load;
         ds.stencilStoreOp = WGPUStoreOp_Store;
@@ -1048,6 +1050,8 @@ static void upload_stencil_reference(PGRAPHState *pg, SurfaceBinding *surface,
     ds.view = surface->view;
     ds.depthLoadOp = WGPULoadOp_Load;
     ds.depthStoreOp = WGPUStoreOp_Store;
+    /* emdawnwebgpu forwards this even when the load op is not Clear. */
+    ds.depthClearValue = 1.0f;
     ds.stencilLoadOp = WGPULoadOp_Load;
     ds.stencilStoreOp = WGPUStoreOp_Store;
     WGPURenderPassDescriptor pass_desc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;

@@ -347,6 +347,8 @@ void pgraph_wgpu_clear_surface(NV2AState *d, uint32_t parameter)
         ds_attachment.view = zeta->view;
         ds_attachment.depthLoadOp = WGPULoadOp_Load;
         ds_attachment.depthStoreOp = WGPUStoreOp_Store;
+        /* emdawnwebgpu forwards this even when the load op is not Clear. */
+        ds_attachment.depthClearValue = 1.0f;
         if (format_has_stencil(zeta->host_fmt.format)) {
             ds_attachment.stencilLoadOp = WGPULoadOp_Load;
             ds_attachment.stencilStoreOp = WGPUStoreOp_Store;
@@ -797,6 +799,8 @@ static void ensure_draw_render_pass(PGRAPHState *pg)
         ds_attachment.view = r->zeta_binding->view;
         ds_attachment.depthLoadOp = WGPULoadOp_Load;
         ds_attachment.depthStoreOp = WGPUStoreOp_Store;
+        /* emdawnwebgpu forwards this even when the load op is not Clear. */
+        ds_attachment.depthClearValue = 1.0f;
         if (format_has_stencil(r->zeta_binding->host_fmt.format)) {
             ds_attachment.stencilLoadOp = WGPULoadOp_Load;
             ds_attachment.stencilStoreOp = WGPUStoreOp_Store;

@@ -208,12 +208,18 @@ static void dsp_dma_run(DSPDMAState *s)
 
         size_t transfer_size = count * item_size;
 
-        // FIXME: Remove this intermediate buffer
-        static uint8_t *scratch_buf = NULL;
-        static ssize_t scratch_buf_size = -1;
-        if (count * item_size > scratch_buf_size) {
-            scratch_buf_size = count * item_size;
-            scratch_buf = malloc(scratch_buf_size);
+        /*
+         * FIXME: Remove this intermediate buffer.
+         * The size is size_t, not ssize_t. On wasm32 a ssize_t sentinel of
+         * -1 converts to SIZE_MAX in this comparison, so the buffer stayed
+         * NULL and the first sample was stored at address 0.
+         */
+        static uint8_t *scratch_buf;
+        static size_t scratch_buf_size;
+        size_t bytes = (size_t)count * item_size;
+        if (bytes > scratch_buf_size) {
+            scratch_buf_size = bytes;
+            scratch_buf = g_realloc(scratch_buf, scratch_buf_size);
         }
 
         if (direction) {
