@@ -23,7 +23,11 @@ icon, the scaled gamma blit, snapshot thumbnails, and the VGA fallback.
 The PFIFO thread plays that recording on the NV2A Dawn device and samples
 the display composite directly. Natively the combined image is read back
 into the OpenGL window. In the browser the same passes are recorded into
-the page canvas. A WebGPU NV2A renderer runs natively (Dawn); see the status
+the page canvas. That page has to be cross-origin isolated, or the build's
+pthreads never start. `wasm/serve.py` sends the headers; see the phase 5
+browser step 5 notes in
+[webgpu-renderer-plan.md](webgpu-renderer-plan.md#implementation-status).
+A WebGPU NV2A renderer runs natively (Dawn); see the status
 table in
 [webgpu-renderer-plan.md](webgpu-renderer-plan.md#implementation-status).
 
@@ -89,6 +93,15 @@ What exists:
   xemu stays on Asyncify because its coroutine fibers use Asyncify
   stacks. See the phase 5 browser notes in
   [webgpu-renderer-plan.md](webgpu-renderer-plan.md#implementation-status).
+- `wasm/serve.py` serves the browser launcher, `wasm/index.html`, with
+  `Cross-Origin-Opener-Policy: same-origin` and
+  `Cross-Origin-Embedder-Policy: require-corp`. Those headers are what
+  enable `SharedArrayBuffer` and pthreads. The server also sends
+  `Cross-Origin-Resource-Policy: cross-origin`, and it sets `.js` to
+  `text/javascript` and `.wasm` to `application/wasm`. The launcher will
+  not start unless the page is a secure context and `crossOriginIsolated`.
+  `python3 -m http.server` leaves `SharedArrayBuffer` disabled.
+  `python3 wasm/serve.py --check` checks the headers without a browser.
 
 `build/wasm/xemu/qemu-system-i386.js` links with the local emsdk 6.0.12,
 WebGPU enabled, and OpenGL disabled. The browser UI still includes epoxy,
