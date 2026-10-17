@@ -53,8 +53,13 @@ elif host_os == 'windows'
   xemu_ss.add(files('xemu-os-utils-windows.c'))
 elif host_os == 'darwin'
   xemu_ss.add(files('xemu-os-utils-macos.m'))
+elif host_os == 'emscripten'
+  xemu_ss.add(files('xemu-os-utils-emscripten.c'))
 endif
 xemu_ss.add(imgui, implot, stb_image, sdl, opengl, fa, fpng, json, fatx, tomlplusplus, genconfig)
+if host_os == 'emscripten'
+  xemu_ss.add(epoxy)
+endif
 system_ss.add_all(xemu_ss)
 
 system_ss.add(when: pixman, if_true: files('console-vc.c'), if_false: files('console-vc-stubs.c'))

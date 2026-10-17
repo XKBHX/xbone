@@ -1,5 +1,5 @@
 if webgpu.found()
-  specific_ss.add([webgpu, files(
+  webgpu_files = files(
     '../wgsl/gen.c',
     '../wgsl/translate.c',
     'blit.c',
@@ -16,5 +16,9 @@ if webgpu.found()
     'surface-compute.c',
     'texture.c',
     'vertex.c',
-  )])
+  )
+  if host_os == 'emscripten'
+    webgpu_files += files('canvas.c')
+  endif
+  specific_ss.add([webgpu, webgpu_files])
 endif

@@ -22,6 +22,10 @@
 #include <pthread_np.h>
 #endif
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten/threading.h>
+#endif
+
 static bool name_threads;
 
 void qemu_thread_naming(bool enable)
@@ -415,6 +419,23 @@ void qemu_thread_create(QemuThread *thread, const char *name,
     if (mode == QEMU_THREAD_DETACHED) {
         pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
     }
+
+#ifdef __EMSCRIPTEN__
+    /*
+     * Emscripten moves #canvas onto the proxied main thread. xemu's main
+     * then starts qemu_main, and qemu_main starts the PFIFO thread, which
+     * is where the WebGPU device is created. The canvas has to follow that
+     * chain. Pass the element id: "#canvas" means Module.canvas, which
+     * only the browser thread has.
+     */
+    if (name &&
+        (strcmp(name, "qemu_main") == 0 ||
+         strcmp(name, "nv2a.pfifo_thread") == 0) &&
+        emscripten_pthread_attr_settransferredcanvases(&attr, "canvas") !=
+            0) {
+        fprintf(stderr, "WebGPU canvas transfer to %s failed\n", name);
+    }
+#endif
 
     /* Leave signal handling to the iothread.  */
     sigfillset(&set);

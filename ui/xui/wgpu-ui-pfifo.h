@@ -17,7 +17,9 @@ extern "C" {
 
 void xemu_wgpu_ui_execute(WGPUInstance instance, WGPUDevice device,
                           WGPUQueue queue, WGPUTextureView display,
-                          int display_width, int display_height);
+                          int display_width, int display_height,
+                          WGPUTextureView canvas, int canvas_width,
+                          int canvas_height, WGPUTextureFormat canvas_format);
 bool xemu_wgpu_ui_needs_display(void);
 #endif
 

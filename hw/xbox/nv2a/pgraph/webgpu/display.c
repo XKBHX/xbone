@@ -19,6 +19,12 @@
 
 #include <math.h>
 
+#ifdef __EMSCRIPTEN__
+#include "canvas.h"
+
+static WgpuCanvas display_canvas;
+#endif
+
 #ifdef CONFIG_OPENGL
 #include <epoxy/gl.h>
 #endif
@@ -840,6 +846,9 @@ static void ensure_texture(PGRAPHWgpuState *r, WGPUTexture *texture,
     *cur_h = height;
 }
 
+static void ensure_display_pipeline(PGRAPHWgpuState *r,
+                                    WGPUTextureFormat format);
+
 static void ensure_display_target(PGRAPHWgpuState *r, unsigned int width,
                                   unsigned int height)
 {
@@ -1184,11 +1193,57 @@ void pgraph_wgpu_init_display(PGRAPHState *pg)
     disp->uniform = wgpuDeviceCreateBuffer(r->device, &buffer_desc);
 }
 
+#ifdef __EMSCRIPTEN__
+bool pgraph_wgpu_display_canvas_acquire(PGRAPHWgpuState *r,
+                                        WGPUTextureView *view,
+                                        WGPUTextureFormat *format, int *width,
+                                        int *height)
+{
+    static int logged;
+    uint32_t w = 0;
+    uint32_t h = 0;
+    WGPUTextureFormat fmt = WGPUTextureFormat_Undefined;
+    WGPUTextureView acquired = NULL;
+
+    if (!r->instance || !r->adapter || !r->device ||
+        !wgpu_canvas_acquire(&display_canvas, r->instance, r->adapter,
+                             r->device, &fmt, &w, &h, &acquired)) {
+        return false;
+    }
+    if (view) {
+        *view = acquired;
+    }
+    if (format) {
+        *format = fmt;
+    }
+    if (width) {
+        *width = (int)w;
+    }
+    if (height) {
+        *height = (int)h;
+    }
+    if (!logged) {
+        fprintf(stderr, "[WebGPU] Presenting to the canvas (%ux%u)\n", w, h);
+        logged = 1;
+    }
+    return true;
+}
+
+void pgraph_wgpu_display_canvas_release(PGRAPHWgpuState *r)
+{
+    (void)r;
+    wgpu_canvas_release(&display_canvas);
+}
+#endif
+
 void pgraph_wgpu_finalize_display(PGRAPHState *pg)
 {
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
     WgpuDisplayState *disp = &r->display;
 
+#ifdef __EMSCRIPTEN__
+    wgpu_canvas_fini(&display_canvas);
+#endif
     release_bind_group(disp);
 #ifndef __EMSCRIPTEN__
     destroy_shared_display(r);

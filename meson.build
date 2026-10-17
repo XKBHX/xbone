@@ -1884,6 +1884,11 @@ if not get_option('coreaudio').auto() or (host_os == 'darwin' and have_system)
 endif
 
 epoxy = dependency('epoxy', required: true)
+# The browser UI includes epoxy headers even when the OpenGL renderer is
+# disabled. Emscripten's GL entry points come from -lGL.
+if host_os == 'emscripten'
+  epoxy = declare_dependency(dependencies: epoxy, link_args: ['-lGL'])
+endif
 
 opengl = not_found
 if get_option('opengl').enabled() or \
@@ -2477,7 +2482,7 @@ endif
 libsamplerate = dependency('samplerate', method: 'pkg-config', required: true)
 
 imgui_webgpu = 'disabled'
-if webgpu.found() and host_os != 'emscripten'
+if webgpu.found()
   imgui_webgpu = 'enabled'
 endif
 imgui_proj = subproject('imgui', required: true,

@@ -21,8 +21,9 @@ WebAssembly TCG backend. When `display.renderer` is `WEBGPU`, the UI
 thread records Dear ImGui, the logo, controller and memory-unit art, the
 icon, the scaled gamma blit, snapshot thumbnails, and the VGA fallback.
 The PFIFO thread plays that recording on the NV2A Dawn device and samples
-the display composite directly. The combined image is read back into the
-OpenGL window. A WebGPU NV2A renderer runs natively (Dawn); see the status
+the display composite directly. Natively the combined image is read back
+into the OpenGL window. In the browser the same passes are recorded into
+the page canvas. A WebGPU NV2A renderer runs natively (Dawn); see the status
 table in
 [webgpu-renderer-plan.md](webgpu-renderer-plan.md#implementation-status).
 
@@ -31,8 +32,10 @@ What exists:
 - `configure` maps the Emscripten toolchain to `host_os=emscripten`,
   `cpu=wasm32`; `meson.build` lists both as supported.
 - `configs/meson/emscripten.txt` sets link flags: `-pthread`,
-  `-sASYNCIFY=1`, `-sPROXY_TO_PTHREAD=1`, `-sTOTAL_MEMORY=2GB`,
-  `-sWASM_BIGINT`, `-sEXPORT_ES6=1`, and others.
+  `-sASYNCIFY=1`, `-sPROXY_TO_PTHREAD=1`, `-sOFFSCREENCANVAS_SUPPORT=1`,
+  `-sTOTAL_MEMORY=2GB`, `-sWASM_BIGINT`, `-sEXPORT_ES6=1`, and others.
+  `OFFSCREENCANVAS_SUPPORT` pulls in the GL library so Emscripten can
+  transfer `#canvas`. The WebGPU present does not draw with WebGL.
 - `os-wasm.c` and `include/system/os-wasm.h` are Emscripten replacements for
   `os-posix.c`. `util/coroutine-wasm.c` implements coroutines on Asyncify.
 - `tests/docker/dockerfiles/emsdk-wasm32-cross.docker` builds the
@@ -72,22 +75,15 @@ What exists:
 - `tests/wasm/webgpu-offscreen-spike` is a standalone emdawnwebgpu program,
   built with emsdk 6.0.12. A pthread other than the page thread creates a
   device and clears a transferred `OffscreenCanvas`. It is not an xemu
-  build. See the phase 5 browser step 1 notes in
+  build. `tests/wasm/webgpu-canvas-present` links the same `canvas.c` the
+  renderer uses and draws a stand-in scanout plus a UI quad into that
+  canvas. See the phase 5 browser notes in
   [webgpu-renderer-plan.md](webgpu-renderer-plan.md#implementation-status).
 
-What blocks an xemu WASM build today:
-
-- `epoxy` (OpenGL loader) is declared `required: true` in `meson.build`. The
-  xemu UI (`ui/xemu.c`, `ui/xui/`) is SDL3 + OpenGL. When the NV2A renderer
-  is WebGPU, the UI thread records Dear ImGui, the HUD art, snapshot
-  thumbnails, and the VGA fallback, and the PFIFO thread records them on
-  the NV2A device. The combined image is still read back into the OpenGL
-  window. OpenGL and Vulkan keep the OpenGL3 backend and the GLSL HUD
-  shaders. Those paths, and the window present, are linked unconditionally.
-- Both GPU renderers (`hw/xbox/nv2a/pgraph/gl`, `.../vk`) need desktop
-  OpenGL. The Vulkan renderer still shows its frames through OpenGL by
-  importing them with `GL_EXT_memory_object`.
-- `subprojects/dsp56300` rejects `host_os=emscripten` at configure time.
-- Guest CPU performance is not yet real time for a 733 MHz Pentium III. The
-  wasm backend removes the interpreter, but still compiles one module per TB
-  and returns to C between TBs. See [cpu-realtime.md](cpu-realtime.md).
+`build/wasm/xemu/qemu-system-i386.js` links with the local emsdk 6.0.12,
+WebGPU enabled, and OpenGL disabled. The browser UI still includes epoxy,
+so the link pulls in `libepoxy` and Emscripten's `-lGL`. The Rust DSP JIT
+has no wasm32 archive, so this build uses the C interpreter. Guest CPU
+performance is not yet real time for a 733 MHz Pentium III. The wasm
+backend removes the interpreter, but still compiles one module per TB and
+returns to C between TBs. See [cpu-realtime.md](cpu-realtime.md).

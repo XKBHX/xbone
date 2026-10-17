@@ -25,6 +25,9 @@ bool wgpu_helpers_active(void);
 void wgpu_helpers_begin_frame(void);
 bool wgpu_helpers_gpu_init(void);
 void wgpu_helpers_gpu_shutdown(void);
+/* Gamma blit target. RGBA8Unorm keeps the FBO pipelines. A canvas format
+ * builds a second gamma pipeline for the window pass. */
+void wgpu_helpers_set_window_format(WGPUTextureFormat format);
 /* Records HUD passes, then the gamma blit of `display` or the guest
  * upload. Returns true when the window target was drawn. */
 bool wgpu_helpers_replay(WGPUTextureView display, int display_width,

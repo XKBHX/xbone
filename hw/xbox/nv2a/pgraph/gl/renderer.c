@@ -29,6 +29,11 @@ GloContext *g_nv2a_context_display;
 
 static void early_context_init(void)
 {
+#ifdef __EMSCRIPTEN__
+    /* gloffscreen loads libEGL.so.1 with dlopen. Emscripten has no dynamic
+     * linker here, and the browser presents through WebGPU. */
+    return;
+#endif
     g_nv2a_context_render = glo_context_create();
     g_nv2a_context_display = glo_context_create();
 

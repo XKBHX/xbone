@@ -3,8 +3,9 @@
  *
  * The UI thread builds ImDrawData and HUD commands. It posts a copy to the
  * PFIFO thread, which records the game composite and the UI pass into one
- * image. That image is read back into the OpenGL window. Texture ids in the
- * draw lists are handles into the PFIFO-side texture table.
+ * image. Natively that image is read back into the OpenGL window. In the
+ * browser the passes are recorded into the canvas current texture. Texture
+ * ids in the draw lists are handles into the PFIFO-side texture table.
  *
  * Copyright (c) 2026 xemu Project
  *
@@ -66,6 +67,10 @@ static int g_present_h;
 static uint32_t g_present_stride;
 static bool g_present_blend;
 static bool g_present_ok;
+static WGPUTextureView g_canvas_view;
+static WGPUTextureFormat g_target_format = WGPUTextureFormat_RGBA8Unorm;
+static WGPUTextureFormat g_imgui_format = WGPUTextureFormat_Undefined;
+static std::atomic<bool> g_canvas_presented;
 static std::mutex g_submit_lock;
 static std::vector<uint64_t> g_ui_textures;
 
@@ -125,6 +130,11 @@ static void release_gl_images(void)
 
 static bool create_overlay_gl(void)
 {
+#ifdef __EMSCRIPTEN__
+    /* The browser presents into the canvas. There is no GL context to
+     * compile an overlay into, and epoxy would dlopen libEGL.so.1. */
+    return true;
+#endif
     static const char *vs_src =
         "#version 150 core\n"
         "in vec2 a_pos;\n"
@@ -612,8 +622,13 @@ WGPUInstance xemu_wgpu_ui_instance(void)
 
 WGPUTextureView xemu_wgpu_ui_prepare_target(int width, int height)
 {
-    if (!g_active || width <= 0 || height <= 0 ||
-        !ensure_target(width, height)) {
+    if (!g_active || width <= 0 || height <= 0) {
+        return NULL;
+    }
+    if (g_canvas_view) {
+        return g_canvas_view;
+    }
+    if (!ensure_target(width, height)) {
         return NULL;
     }
     return g_target_view;
@@ -727,16 +742,27 @@ static void adopt_font(void)
     fonts->SetTexID((ImTextureID)g_font_handle);
 }
 
-static bool init_backend(void)
+static bool init_imgui(void)
 {
     ImGui_ImplWGPU_InitInfo info = {};
 
     info.Device = g_device;
     info.NumFramesInFlight = 1;
-    info.RenderTargetFormat = WGPUTextureFormat_RGBA8Unorm;
+    info.RenderTargetFormat = g_target_format;
     info.DepthStencilFormat = WGPUTextureFormat_Undefined;
     if (!ImGui_ImplWGPU_Init(&info)) {
         fprintf(stderr, "[WebGPU] UI ImGui backend init failed\n");
+        return false;
+    }
+    ImGui_ImplWGPU_NewFrame();
+    adopt_font();
+    g_imgui_format = g_target_format;
+    return true;
+}
+
+static bool init_backend(void)
+{
+    if (!init_imgui()) {
         return false;
     }
     if (!create_white_texture() || !wgpu_helpers_gpu_init()) {
@@ -751,12 +777,27 @@ static bool init_backend(void)
         }
         g_white_id = 0;
         ImGui_ImplWGPU_Shutdown();
+        g_imgui_format = WGPUTextureFormat_Undefined;
         return false;
     }
-    ImGui_ImplWGPU_NewFrame();
-    adopt_font();
     g_fonts_dirty = false;
     g_backend = true;
+    return true;
+}
+
+static bool ensure_backend(void)
+{
+    if (!g_backend) {
+        return init_backend();
+    }
+    if (g_imgui_format == g_target_format) {
+        return true;
+    }
+    ImGui_ImplWGPU_Shutdown();
+    if (!init_imgui()) {
+        g_backend = false;
+        return false;
+    }
     return true;
 }
 
@@ -799,15 +840,20 @@ static void record_imgui(bool scene)
     bool same_target;
     size_t bytes;
 
+    bool to_canvas = g_canvas_view != NULL;
+
     g_present_ok = false;
     if (!draw_data->Valid) {
         return;
     }
     width = (int)(draw_data->DisplaySize.x * draw_data->FramebufferScale.x);
     height = (int)(draw_data->DisplaySize.y * draw_data->FramebufferScale.y);
-    same_target =
-        g_target && g_target_width == width && g_target_height == height;
-    if (width <= 0 || height <= 0 || !ensure_target(width, height)) {
+    same_target = to_canvas || (g_target && g_target_width == width &&
+                                g_target_height == height);
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    if (!to_canvas && !ensure_target(width, height)) {
         return;
     }
     if (!same_target) {
@@ -826,7 +872,7 @@ static void record_imgui(bool scene)
     WGPUCommandEncoder encoder =
         wgpuDeviceCreateCommandEncoder(g_device, &encoder_desc);
 
-    color.view = g_target_view;
+    color.view = to_canvas ? g_canvas_view : g_target_view;
     color.loadOp = scene ? WGPULoadOp_Load : WGPULoadOp_Clear;
     color.storeOp = WGPUStoreOp_Store;
     color.clearValue = WGPUColor{ 0, 0, 0, 0 };
@@ -840,15 +886,17 @@ static void record_imgui(bool scene)
     wgpuRenderPassEncoderEnd(pass);
     wgpuRenderPassEncoderRelease(pass);
 
-    WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
-    WGPUTexelCopyBufferInfo dst = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
-    WGPUExtent3D extent = { (uint32_t)width, (uint32_t)height, 1 };
-    src.texture = g_target;
-    src.aspect = WGPUTextureAspect_All;
-    dst.buffer = g_readback;
-    dst.layout.bytesPerRow = g_target_stride;
-    dst.layout.rowsPerImage = height;
-    wgpuCommandEncoderCopyTextureToBuffer(encoder, &src, &dst, &extent);
+    if (!to_canvas) {
+        WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+        WGPUTexelCopyBufferInfo dst = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+        WGPUExtent3D extent = { (uint32_t)width, (uint32_t)height, 1 };
+        src.texture = g_target;
+        src.aspect = WGPUTextureAspect_All;
+        dst.buffer = g_readback;
+        dst.layout.bytesPerRow = g_target_stride;
+        dst.layout.rowsPerImage = height;
+        wgpuCommandEncoderCopyTextureToBuffer(encoder, &src, &dst, &extent);
+    }
 
     WGPUCommandBufferDescriptor command_desc =
         WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT;
@@ -860,25 +908,29 @@ static void record_imgui(bool scene)
 
     MapState map_state = {};
     WGPUBufferMapCallbackInfo map_cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
-    bytes = (size_t)g_target_stride * (size_t)height;
-    map_cb.mode = WGPUCallbackMode_WaitAnyOnly;
-    map_cb.callback = buffer_map_callback;
-    map_cb.userdata1 = &map_state;
-    if (wait_future(wgpuBufferMapAsync(g_readback, WGPUMapMode_Read, 0, bytes,
-                                       map_cb)) &&
-        map_state.status == WGPUMapAsyncStatus_Success) {
-        const void *pixels =
-            wgpuBufferGetConstMappedRange(g_readback, 0, bytes);
-        if (pixels) {
-            g_present.assign((const uint8_t *)pixels,
-                             (const uint8_t *)pixels + bytes);
-            g_present_w = width;
-            g_present_h = height;
-            g_present_stride = g_target_stride;
-            g_present_blend = !scene;
-            g_present_ok = true;
+    if (to_canvas) {
+        g_canvas_presented.store(true, std::memory_order_release);
+    } else {
+        bytes = (size_t)g_target_stride * (size_t)height;
+        map_cb.mode = WGPUCallbackMode_WaitAnyOnly;
+        map_cb.callback = buffer_map_callback;
+        map_cb.userdata1 = &map_state;
+        if (wait_future(wgpuBufferMapAsync(g_readback, WGPUMapMode_Read, 0,
+                                           bytes, map_cb)) &&
+            map_state.status == WGPUMapAsyncStatus_Success) {
+            const void *pixels =
+                wgpuBufferGetConstMappedRange(g_readback, 0, bytes);
+            if (pixels) {
+                g_present.assign((const uint8_t *)pixels,
+                                 (const uint8_t *)pixels + bytes);
+                g_present_w = width;
+                g_present_h = height;
+                g_present_stride = g_target_stride;
+                g_present_blend = !scene;
+                g_present_ok = true;
+            }
+            wgpuBufferUnmap(g_readback);
         }
-        wgpuBufferUnmap(g_readback);
     }
 
     ErrorState error_state = {};
@@ -911,7 +963,10 @@ extern "C" bool xemu_wgpu_ui_needs_display(void)
 
 extern "C" void xemu_wgpu_ui_execute(WGPUInstance instance, WGPUDevice device,
                                      WGPUQueue queue, WGPUTextureView display,
-                                     int display_width, int display_height)
+                                     int display_width, int display_height,
+                                     WGPUTextureView canvas, int canvas_width,
+                                     int canvas_height,
+                                     WGPUTextureFormat canvas_format)
 {
     static bool logged;
     int job = g_job.load(std::memory_order_acquire);
@@ -919,9 +974,18 @@ extern "C" void xemu_wgpu_ui_execute(WGPUInstance instance, WGPUDevice device,
     g_instance = instance;
     g_device = device;
     g_queue = queue;
+    g_canvas_presented.store(false, std::memory_order_release);
+    if (canvas && canvas_width > 0 && canvas_height > 0 &&
+        canvas_format != WGPUTextureFormat_Undefined) {
+        g_canvas_view = canvas;
+        g_target_format = canvas_format;
+    } else {
+        g_canvas_view = NULL;
+        g_target_format = WGPUTextureFormat_RGBA8Unorm;
+    }
     if (job == XEMU_WGPU_UI_JOB_SHUTDOWN) {
         release_ui_gpu();
-    } else if (!g_backend && !init_backend()) {
+    } else if (!ensure_backend()) {
         /* The NV2A device is created on the PFIFO thread after UI init.
          * The next frame retries. */
     } else {
@@ -930,6 +994,7 @@ extern "C" void xemu_wgpu_ui_execute(WGPUInstance instance, WGPUDevice device,
                     "[WebGPU] UI pass is recorded on the PFIFO device\n");
             logged = true;
         }
+        wgpu_helpers_set_window_format(g_target_format);
         if (g_fonts_dirty) {
             ImGui_ImplWGPU_CreateDeviceObjects();
             adopt_font();
@@ -944,6 +1009,7 @@ extern "C" void xemu_wgpu_ui_execute(WGPUInstance instance, WGPUDevice device,
             wgpu_helpers_run_png(display);
         }
     }
+    g_canvas_view = NULL;
     g_instance = NULL;
     g_device = NULL;
     g_queue = NULL;
@@ -963,7 +1029,7 @@ void xemu_wgpu_ui_render(void)
         free_copied_draw();
         return;
     }
-    if (g_present_ok) {
+    if (!g_canvas_presented.load(std::memory_order_acquire) && g_present_ok) {
         draw_overlay(g_present.data(), g_present_w, g_present_h,
                      g_present_stride, g_present_blend);
     }

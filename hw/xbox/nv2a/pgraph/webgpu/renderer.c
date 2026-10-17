@@ -67,6 +67,11 @@ static void pgraph_wgpu_process_pending(NV2AState *d)
             int display_width = 0;
             int display_height = 0;
 
+            WGPUTextureView canvas = NULL;
+            int canvas_width = 0;
+            int canvas_height = 0;
+            WGPUTextureFormat canvas_format = WGPUTextureFormat_Undefined;
+
             if (xemu_wgpu_ui_needs_display()) {
                 r->display.sampleable = true;
                 pgraph_wgpu_render_display(pg);
@@ -77,8 +82,23 @@ static void pgraph_wgpu_process_pending(NV2AState *d)
                 }
                 r->display.sampleable = false;
             }
+#ifdef __EMSCRIPTEN__
+            /*
+             * The composite above stays sampleable. The UI gamma blit
+             * writes it into this canvas texture, and ImGui follows.
+             */
+            if (!pgraph_wgpu_display_canvas_acquire(r, &canvas, &canvas_format,
+                                                    &canvas_width,
+                                                    &canvas_height)) {
+                canvas = NULL;
+            }
+#endif
             xemu_wgpu_ui_execute(r->instance, r->device, r->queue, display,
-                                 display_width, display_height);
+                                 display_width, display_height, canvas,
+                                 canvas_width, canvas_height, canvas_format);
+#ifdef __EMSCRIPTEN__
+            pgraph_wgpu_display_canvas_release(r);
+#endif
             qatomic_set(&r->ui_pending, false);
             qemu_event_set(&r->ui_complete);
         }
@@ -158,6 +178,11 @@ static void pgraph_wgpu_pre_shutdown_wait(NV2AState *d)
 
 static int pgraph_wgpu_get_framebuffer_surface(NV2AState *d)
 {
+#ifdef __EMSCRIPTEN__
+    /* The canvas present in process_pending is the browser framebuffer. */
+    (void)d;
+    return 0;
+#else
     PGRAPHState *pg = &d->pgraph;
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
 
@@ -199,6 +224,7 @@ static int pgraph_wgpu_get_framebuffer_surface(NV2AState *d)
         pgraph_wgpu_wait_for_surface_download(surface);
     }
     return 0;
+#endif
 #endif
 }
 
