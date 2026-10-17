@@ -2476,6 +2476,10 @@ endif
 
 libsamplerate = dependency('samplerate', method: 'pkg-config', required: true)
 
+imgui_webgpu = 'disabled'
+if webgpu.found() and host_os != 'emscripten'
+  imgui_webgpu = 'enabled'
+endif
 imgui_proj = subproject('imgui', required: true,
                          default_options: [
                            'default_library=static',
@@ -2488,7 +2492,7 @@ imgui_proj = subproject('imgui', required: true,
                            'sdl2_renderer=disabled',
                            'sdl3_renderer=disabled',
                            'vulkan=disabled',
-                           'webgpu=disabled',
+                           'webgpu=' + imgui_webgpu,
                            'glfw=disabled',
                            'sdl2=disabled',
                            'sdl3=enabled',

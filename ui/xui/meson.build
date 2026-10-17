@@ -23,6 +23,10 @@ xemu_ss.add(files(
   'widgets.cc',
 ))
 
+if webgpu.found()
+  xemu_ss.add(webgpu, files('wgpu-ui.cc'))
+endif
+
 if host_os == 'windows'
   xemu_ss.add(files('update.cc', 'win32-dxgi-present.cc'))
 endif

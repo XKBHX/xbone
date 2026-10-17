@@ -177,7 +177,7 @@ Each phase ends with a demonstrable exit criterion.
 | 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite. Phase 4 step 5 shares that image with GL; the readback remains the fallback. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
 | 3. WGSL generator | Steps 1–3 are done. Step 1 translates draw shaders from the WebGPU-targeted GLSL. Step 2 did not need new shaders: the pack and unpack kernels and the display composite were already WGSL in phase 2. Step 3 creates every shader module with `WGPUShaderSourceWGSL`. The WebGPU backend no longer links glslang and does not request `ShaderSourceSPIRV`. glslang remains for Vulkan. A translation or Tint failure skips that draw. |
 | 4. Performance | Steps 1–5 are done. Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline. Blend color and the stencil reference stay dynamic. Step 2 coalesces surface readbacks into one submit and one map, and reads a surface back only when a draw has made it dirty and a consumer needs RAM. Step 3 caches texture bind groups and keeps a guest-RAM vertex buffer, uploaded in 64 KiB blocks. Attributes WebGPU cannot fetch stay on the CPU packer. Step 4 expands packed texture texels in a compute shader. Step 5 imports the display composite into the GL texture the UI already samples. Frame times have not been compared with Vulkan. |
-| 5. WebGPU UI and browser | Not started. |
+| 5. WebGPU UI and browser | Step 1 is done. ImGui draws with `imgui_impl_wgpu` when `display.renderer` is `WEBGPU`. The rest of the window is still OpenGL. Steps 2–4 and the browser work are not started. |
 
 Phase 0 notes:
 
@@ -1014,6 +1014,29 @@ Browser renderer work:
    `depth-clip-control`.
 5. Hosting requirements: cross-origin isolation (`COOP: same-origin`,
    `COEP: require-corp`) for `SharedArrayBuffer` and pthreads.
+
+Phase 5 notes (step 1, ImGui WebGPU backend):
+
+- The imgui wrap enables `webgpu` when Dawn is found. A build directory
+  that already configured imgui keeps the old option until
+  `meson configure -Dimgui:webgpu=enabled`. `subprojects/packagefiles/imgui-dawn-webgpu.patch`
+  teaches that subproject to find Dawn through pkg-config or CMake, and
+  compiles `imgui_impl_wgpu.cpp` with `IMGUI_IMPL_WEBGPU_BACKEND_DAWN`.
+  The patch also updates the backend for the pinned Dawn: `WGPUVertexState`
+  replaces `WGPUProgrammableStageDescriptor`, texture copies use
+  `WGPUTexelCopyTextureInfo`, font rows are padded to 256 bytes, and font
+  rebuilds release every image bind group.
+- `display.renderer = "WEBGPU"` creates a second Dawn device on the UI
+  thread and draws ImGui with `imgui_impl_wgpu` into an `rgba8unorm`
+  target. That image is read back and blended over the OpenGL framebuffer
+  with premultiplied alpha. OpenGL and Vulkan keep `imgui_impl_opengl3`.
+  The readback is the bring-up path. Step 4 records this pass on the PFIFO
+  device, in the same submit as the game frame.
+- Widgets that pass a GL texture name (`ImGui::Image`, controller art,
+  snapshots) are uploaded into that UI device for the frame. Those calls
+  move to native WebGPU textures in step 2.
+- The browser build does not enable the imgui WebGPU backend yet.
+  Emscripten still stops at `subprojects/dsp56300`.
 
 **Exit**: natively, the xemu UI runs entirely on WebGPU with no OpenGL. In
 the browser, an nxdk test XBE renders in Chrome with the game and UI on one
