@@ -178,7 +178,7 @@ Each phase ends with a demonstrable exit criterion.
 | 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite. Phase 4 step 5 shares that image with GL; the readback remains the fallback. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
 | 3. WGSL generator | Steps 1–3 are done. Step 1 translates draw shaders from the WebGPU-targeted GLSL. Step 2 did not need new shaders: the pack and unpack kernels and the display composite were already WGSL in phase 2. Step 3 creates every shader module with `WGPUShaderSourceWGSL`. The WebGPU backend no longer links glslang and does not request `ShaderSourceSPIRV`. glslang remains for Vulkan. A translation or Tint failure skips that draw. |
 | 4. Performance | Steps 1–5 are done. Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline. Blend color and the stencil reference stay dynamic. Step 2 coalesces surface readbacks into one submit and one map, and reads a surface back only when a draw has made it dirty and a consumer needs RAM. Step 3 caches texture bind groups and keeps a guest-RAM vertex buffer, uploaded in 64 KiB blocks. Attributes WebGPU cannot fetch stay on the CPU packer. Step 4 expands packed texture texels in a compute shader. Step 5 imports the display composite into the GL texture the UI already samples. Frame times have not been compared with Vulkan. |
-| 5. WebGPU UI and browser | Steps 1–4 are done. When `display.renderer` is `WEBGPU`, the UI thread records ImGui and the HUD and posts that work to the PFIFO thread. The PFIFO thread samples the display composite and records the UI pass on the NV2A device. Natively the window present is still a readback of that combined image into OpenGL. Browser steps 1 and 2 are done. Step 1 (`tests/wasm/webgpu-offscreen-spike`) creates an emdawnwebgpu device on a pthread and clears a transferred `OffscreenCanvas`. Step 2 presents on that canvas: `canvas.c` binds `#canvas` on the PFIFO thread, the UI gamma blit writes the PCRTC composite into the current texture, and ImGui follows in the next pass. `get_framebuffer_surface` returns 0. `wgpuSurfacePresent` is not called. In Chromium on macOS arm64 the step 2 page was green with a red corner, and the readback matched. The xemu WASM binary links and, in Chromium, draws the menu bar onto the canvas. It then aborts because a store hits the Emscripten heap canary at address zero. Browser step 3 is done. A pending `wgpuInstanceWaitAny` suspends through Asyncify. JSPI works in the standalone present test and is not the xemu link, because coroutine fibers still use Asyncify stacks. A finished future is polled and does not suspend. The browser does not map the display image. Browser step 4 is done. Optional features are requested when the adapter has them. `depth32float-stencil8` is no longer required: Z16 falls back to `depth32float`, and Z24S8 falls back to `depth24plus-stencil8` plus an `r32float` depth copy. Stencil readback on that fallback is 0. DXT uses `texture-compression-bc` for 2D and cube textures whose base size is a multiple of 4, and `s3tc_decompress` otherwise. `clip-distances` is detected and left off; clip planes stay a fragment discard. Without `depth-clip-control` the vertex shader clamps clip Z. `XEMU_WEBGPU_DISABLE_FEATURES` forces a fallback. The host test `test-nv2a-webgpu-features` passes. The fallbacks were not booted. Browser step 5 is not started. |
+| 5. WebGPU UI and browser | Steps 1–4 are done. When `display.renderer` is `WEBGPU`, the UI thread records ImGui and the HUD and posts that work to the PFIFO thread. The PFIFO thread samples the display composite and records the UI pass on the NV2A device. Natively the window present is still a readback of that combined image into OpenGL. Browser steps 1 and 2 are done. Step 1 (`tests/wasm/webgpu-offscreen-spike`) creates an emdawnwebgpu device on a pthread and clears a transferred `OffscreenCanvas`. Step 2 presents on that canvas: `canvas.c` binds `#canvas` on the PFIFO thread, the UI gamma blit writes the PCRTC composite into the current texture, and ImGui follows in the next pass. `get_framebuffer_surface` returns 0. `wgpuSurfacePresent` is not called. In Chromium on macOS arm64 the step 2 page was green with a red corner, and the readback matched. The xemu WASM binary links and, in Chromium, draws the menu bar onto the canvas. It then aborts because a store hits the Emscripten heap canary at address zero. Browser step 3 is done. A pending `wgpuInstanceWaitAny` suspends through Asyncify. JSPI works in the standalone present test and is not the xemu link, because coroutine fibers still use Asyncify stacks. A finished future is polled and does not suspend. The browser does not map the display image. Browser step 4 is done. Optional features are requested when the adapter has them. `depth32float-stencil8` is no longer required: Z16 falls back to `depth32float`, and Z24S8 falls back to `depth24plus-stencil8` plus an `r32float` depth copy. Stencil readback on that fallback is 0. DXT uses `texture-compression-bc` for 2D and cube textures whose base size is a multiple of 4, and `s3tc_decompress` otherwise. `clip-distances` is detected and left off; clip planes stay a fragment discard. Without `depth-clip-control` the vertex shader clamps clip Z. `XEMU_WEBGPU_DISABLE_FEATURES` forces a fallback. The host test `test-nv2a-webgpu-features` passes. The fallbacks were not booted. Browser step 5 is done. `wasm/serve.py` sends `COOP: same-origin` and `COEP: require-corp`, plus `CORP: cross-origin` as emrun does, and the JavaScript and WebAssembly MIME types. `wasm/index.html` will not start unless the page is a secure context and `crossOriginIsolated`. `python3 wasm/serve.py --check` passes. In Chromium on macOS arm64 the page served by that script was isolated and had `SharedArrayBuffer`. The same page from `python3 -m http.server` was not isolated, and `SharedArrayBuffer` was missing. The xemu module was not started. |
 
 Phase 0 notes:
 
@@ -1333,6 +1333,41 @@ Phase 5 notes (browser step 4, feature fallbacks):
   The browser binary was not rebuilt. An M1 Pro has every feature, so a
   default device still takes the `depth32float-stencil8` path. Set the
   environment variable to exercise a fallback.
+
+Phase 5 notes (browser step 5, hosting):
+
+- `wasm/serve.py` is the page host. It is not linked into xemu. The default
+  directory is `build/wasm/dist`, and the default bind address is
+  `127.0.0.1`, which is a secure context. Binding any other address over
+  plain http prints a warning: `SharedArrayBuffer` stays disabled there
+  unless the origin is https.
+- Every response carries `Cross-Origin-Opener-Policy: same-origin`,
+  `Cross-Origin-Embedder-Policy: require-corp`, and
+  `Cross-Origin-Resource-Policy: cross-origin`. Those are the isolation
+  headers emrun sends, which is how the earlier browser steps were served.
+  `Cache-Control` is `no-cache, must-revalidate`, so a rebuilt `.wasm` is
+  not kept. `.js` and `.mjs` are `text/javascript`. The link uses
+  `-sEXPORT_ES6=1`, and a module script is rejected when the script is
+  `text/plain`. `.wasm` is `application/wasm`.
+- `wasm/index.html` is the launcher. Copy it next to
+  `qemu-system-i386.js`. It checks WebAssembly, a secure context,
+  `SharedArrayBuffer`, cross-origin isolation, WebGPU, and the Gamepad
+  API. Start stays disabled until the page is isolated and a boot ROM,
+  flash image, and hard disk are selected. The module is not loaded
+  before that.
+- `python3 -m http.server` does not send the isolation headers. On that
+  server the same page is still a secure context, `crossOriginIsolated`
+  is false, and `SharedArrayBuffer` is missing.
+- `python3 wasm/serve.py --check` serves a temporary directory and checks
+  the three isolation headers and the MIME types for `.html`, `.js`, and
+  `.wasm`. It does not need a browser.
+- Checked in the Cursor Chromium tab on macOS arm64.
+  `http://127.0.0.1:8099/` from `wasm/serve.py` reported
+  `crossOriginIsolated` true, a secure context, `SharedArrayBuffer`, and
+  WebGPU. The same page from `python3 -m http.server` on port 8100
+  reported isolation false and no `SharedArrayBuffer`, and Start stayed
+  disabled. The xemu module was not started. The phase exit, an nxdk test
+  XBE on one canvas, has not been run.
 
 **Exit**: natively, the xemu UI runs entirely on WebGPU with no OpenGL. In
 the browser, an nxdk test XBE renders in Chrome with the game and UI on one

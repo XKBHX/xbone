@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<!--
+  Browser launcher for the xemu WebAssembly build.
+
+  Expects the Emscripten build output (qemu-system-i386.js, .wasm and, with
+  emsdk < 4, .worker.js) next to this file. Override with ?module=<url>.
+
+  The build uses pthreads (SharedArrayBuffer), so the page must be a
+  secure context (https, or http://127.0.0.1 / localhost) and cross-origin
+  isolated:
+    Cross-Origin-Opener-Policy: same-origin
+    Cross-Origin-Embedder-Policy: require-corp
+
+  wasm/serve.py sets those headers. Opening this file directly, or serving
+  it with "python3 -m http.server", leaves SharedArrayBuffer disabled.
+
+  See docs/wasm/ for the state of the port.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>xemu (WebAssembly)</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #0d0f0d;
+    --panel: #171a17;
+    --border: #2a2f2a;
+    --fg: #d8e0d8;
+    --muted: #8a948a;
+    --accent: #6cc04a;
+    --warn: #e0b040;
+    --err: #e06050;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: grid;
+    grid-template-columns: 320px 1fr;
+    grid-template-rows: 100vh;
+  }
+  aside {
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    padding: 16px;
+    overflow-y: auto;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; color: var(--accent); }
+  h2 { font-size: 13px; margin: 18px 0 8px; text-transform: uppercase;
+       letter-spacing: .05em; color: var(--muted); }
+  label { display: block; margin: 8px 0 2px; }
+  label small { color: var(--muted); }
+  input[type=file], select { width: 100%; font: inherit; color: var(--fg); }
+  select { background: var(--bg); border: 1px solid var(--border); padding: 4px; }
+  .row { display: flex; align-items: center; gap: 6px; margin: 6px 0; }
+  .row label { margin: 0; }
+  button {
+    width: 100%; margin-top: 16px; padding: 10px;
+    font: inherit; font-weight: 600;
+    background: var(--accent); color: #0b130b;
+    border: 0; border-radius: 4px; cursor: pointer;
+  }
+  button:disabled { opacity: .4; cursor: default; }
+  #checks { list-style: none; padding: 0; margin: 0; }
+  #checks li { margin: 2px 0; }
+  #checks li::before { display: inline-block; width: 1.3em; }
+  #checks li.ok::before { content: "\2713"; color: var(--accent); }
+  #checks li.warn::before { content: "!"; color: var(--warn); }
+  #checks li.fail::before { content: "\2717"; color: var(--err); }
+  main {
+    display: grid;
+    grid-template-rows: 1fr 200px;
+    min-width: 0;
+  }
+  #screen {
+    display: flex; align-items: center; justify-content: center;
+    background: #000; min-height: 0; position: relative;
+  }
+  #canvas {
+    max-width: 100%; max-height: 100%;
+    aspect-ratio: 4 / 3; width: 100%;
+    background: #000; outline: none;
+  }
+  #status {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--muted); pointer-events: none;
+  }
+  #log {
+    margin: 0; padding: 8px 12px; overflow-y: auto;
+    border-top: 1px solid var(--border);
+    font: 12px/1.35 ui-monospace, Menlo, Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all;
+  }
+  #log .err { color: var(--err); }
+  .toolbar { display: flex; gap: 6px; }
+  .toolbar button { margin-top: 8px; padding: 6px; font-weight: 400;
+                    background: var(--border); color: var(--fg); }
+</style>
+</head>
+<body>
+<aside>
+  <h1>xemu</h1>
+  <div style="color: var(--muted)">Original Xbox emulator, WebAssembly build</div>
+
+  <h2>Environment</h2>
+  <ul id="checks"></ul>
+
+  <h2>System files</h2>
+  <label for="f-bootrom">MCPX Boot ROM <small>(512 bytes)</small></label>
+  <input type="file" id="f-bootrom">
+  <label for="f-flash">Flash ROM (BIOS)</label>
+  <input type="file" id="f-flash">
+  <label for="f-hdd">Hard disk image <small>(.qcow2)</small></label>
+  <input type="file" id="f-hdd">
+  <label for="f-eeprom">EEPROM <small>(optional, 256 bytes)</small></label>
+  <input type="file" id="f-eeprom">
+  <label for="f-dvd">Game disc <small>(optional, .iso / .xiso)</small></label>
+  <input type="file" id="f-dvd">
+
+  <h2>Settings</h2>
+  <label for="renderer">Renderer</label>
+  <select id="renderer">
+    <option value="WEBGPU" selected>WebGPU</option>
+    <option value="NULL">Null (no GPU output)</option>
+    <option value="OPENGL">OpenGL</option>
+    <option value="VULKAN">Vulkan</option>
+  </select>
+  <label for="mem">Memory</label>
+  <select id="mem">
+    <option value="64" selected>64 MiB (retail)</option>
+    <option value="128">128 MiB (dev kit)</option>
+  </select>
+  <label for="avpack">AV pack</label>
+  <select id="avpack">
+    <option value="hdtv" selected>HDTV</option>
+    <option value="composite">Composite</option>
+    <option value="svideo">S-Video</option>
+    <option value="scart">SCART</option>
+    <option value="vga">VGA</option>
+    <option value="rfu">RFU</option>
+    <option value="none">None</option>
+  </select>
+  <div class="row">
+    <input type="checkbox" id="skip-anim" checked>
+    <label for="skip-anim">Skip boot animation</label>
+  </div>
+
+  <button id="start" disabled>Start</button>
+  <div class="toolbar">
+    <button id="fullscreen" disabled>Fullscreen</button>
+    <button id="clear-log">Clear log</button>
+  </div>
+</aside>
+
+<main>
+  <div id="screen">
+    <canvas id="canvas" tabindex="-1" oncontextmenu="event.preventDefault()"></canvas>
+    <canvas id="xemu-hold" width="1" height="1" hidden></canvas>
+    <div id="status">Select the system files, then press Start.</div>
+  </div>
+  <pre id="log"></pre>
+</main>
+
+<script type="module">
+const params = new URLSearchParams(location.search);
+const MODULE_URL = params.get("module") ?? "./qemu-system-i386.js";
+const ROOT = "/xemu";
+
+const $ = (id) => document.getElementById(id);
+const canvas = $("canvas");
+const statusEl = $("status");
+const logEl = $("log");
+const startBtn = $("start");
+
+const MAX_LOG_LINES = 2000;
+function log(text, isErr = false) {
+  const line = document.createElement("div");
+  if (isErr) line.className = "err";
+  line.textContent = text;
+  logEl.appendChild(line);
+  while (logEl.childElementCount > MAX_LOG_LINES) logEl.firstChild.remove();
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function setStatus(text) {
+  statusEl.textContent = text ?? "";
+  statusEl.style.display = text ? "flex" : "none";
+}
+
+function check(label, state, detail) {
+  const li = document.createElement("li");
+  li.className = state;
+  li.textContent = detail ? `${label}: ${detail}` : label;
+  $("checks").appendChild(li);
+  return state !== "fail";
+}
+
+let envOk = true;
+envOk &= check("WebAssembly", typeof WebAssembly === "object" ? "ok" : "fail");
+envOk &= check("Secure context", window.isSecureContext ? "ok" : "fail",
+               window.isSecureContext ? "" : "use https, or http://127.0.0.1");
+envOk &= check("SharedArrayBuffer",
+               typeof SharedArrayBuffer === "function" ? "ok" : "fail");
+envOk &= check("Cross-origin isolated", self.crossOriginIsolated ? "ok" : "fail",
+               self.crossOriginIsolated ? "" : "serve with wasm/serve.py");
+check("WebGPU", navigator.gpu ? "ok" : "warn",
+      navigator.gpu ? "" : "not available (needed for the planned renderer)");
+check("Gamepad API", "getGamepads" in navigator ? "ok" : "warn");
+
+const files = {
+  bootrom: $("f-bootrom"),
+  flash: $("f-flash"),
+  hdd: $("f-hdd"),
+  eeprom: $("f-eeprom"),
+  dvd: $("f-dvd"),
+};
+
+function updateStart() {
+  const required = files.bootrom.files.length && files.flash.files.length &&
+                   files.hdd.files.length;
+  startBtn.disabled = !(envOk && required);
+}
+Object.values(files).forEach((el) => el.addEventListener("change", updateStart));
+updateStart();
+
+function tomlString(s) {
+  return JSON.stringify(s);
+}
+
+function buildConfig(paths) {
+  return [
+    "[general]",
+    "show_welcome = false",
+    `skip_boot_anim = ${$("skip-anim").checked}`,
+    "",
+    "[general.updates]",
+    "check = false",
+    "",
+    "[display]",
+    `renderer = ${tomlString($("renderer").value)}`,
+    "",
+    "[sys]",
+    `mem_limit = ${tomlString($("mem").value)}`,
+    `avpack = ${tomlString($("avpack").value)}`,
+    "",
+    "[sys.files]",
+    `bootrom_path = ${tomlString(paths.bootrom)}`,
+    `flashrom_path = ${tomlString(paths.flash)}`,
+    `eeprom_path = ${tomlString(paths.eeprom)}`,
+    `hdd_path = ${tomlString(paths.hdd)}`,
+    `dvd_path = ${tomlString(paths.dvd ?? "")}`,
+    "",
+  ].join("\n");
+}
+
+async function readSelected() {
+  const out = {};
+  let total = 0;
+  for (const [key, el] of Object.entries(files)) {
+    const file = el.files[0];
+    if (!file) continue;
+    total += file.size;
+    out[key] = { name: file.name, file };
+  }
+  if (out.bootrom && out.bootrom.file.size !== 512) {
+    throw new Error(`MCPX Boot ROM must be 512 bytes, got ${out.bootrom.file.size}`);
+  }
+  if (out.eeprom && out.eeprom.file.size !== 256) {
+    throw new Error(`EEPROM must be 256 bytes, got ${out.eeprom.file.size}`);
+  }
+  if (total > 1.5 * 2 ** 30) {
+    log(`Warning: ${(total / 2 ** 30).toFixed(2)} GiB of images will be copied ` +
+        "into the in-memory filesystem. The browser may run out of memory.", true);
+  }
+  for (const [key, entry] of Object.entries(out)) {
+    setStatus(`Reading ${entry.name}...`);
+    entry.data = new Uint8Array(await entry.file.arrayBuffer());
+    log(`Loaded ${key}: ${entry.name} (${entry.data.length} bytes)`);
+  }
+  return out;
+}
+
+function installFiles(FS, selected) {
+  FS.mkdirTree(ROOT);
+  const paths = { eeprom: `${ROOT}/eeprom.bin` };
+  const names = {
+    bootrom: "mcpx.bin",
+    flash: "flash.bin",
+    hdd: "hdd.qcow2",
+    eeprom: "eeprom.bin",
+    dvd: "disc.iso",
+  };
+  for (const [key, entry] of Object.entries(selected)) {
+    const path = `${ROOT}/${names[key]}`;
+    FS.writeFile(path, entry.data);
+    entry.data = null;
+    paths[key] = path;
+  }
+  const config = buildConfig(paths);
+  FS.writeFile(`${ROOT}/xemu.toml`, config);
+  log(`Wrote ${ROOT}/xemu.toml:\n${config}`);
+}
+
+async function start() {
+  startBtn.disabled = true;
+  Object.values(files).forEach((el) => (el.disabled = true));
+
+  let selected;
+  try {
+    selected = await readSelected();
+  } catch (e) {
+    log(String(e.message ?? e), true);
+    setStatus("Failed to read files. See log.");
+    startBtn.disabled = false;
+    Object.values(files).forEach((el) => (el.disabled = false));
+    return;
+  }
+
+  setStatus(`Loading ${MODULE_URL}...`);
+  let factory;
+  try {
+    factory = (await import(MODULE_URL)).default;
+  } catch (e) {
+    log(`Failed to load ${MODULE_URL}: ${e}`, true);
+    setStatus("Could not load the xemu WebAssembly build. See log.");
+    return;
+  }
+
+  const moduleBase = new URL(MODULE_URL, location.href);
+  const Module = {
+    canvas,
+    // SDL replaces this. Defining it keeps Emscripten's assertion builds
+    // from installing a getter-only stub that makes that assignment throw.
+    requestFullscreen: () => canvas.requestFullscreen(),
+    arguments: ["-config_path", `${ROOT}/xemu.toml`],
+    locateFile: (path) => new URL(path, moduleBase).href,
+    print: (text) => log(text),
+    printErr: (text) => log(text, true),
+    setStatus: (text) => setStatus(text),
+    preRun: [(mod) => installFiles(mod.FS, selected)],
+    onRuntimeInitialized: () => {
+      setStatus(null);
+      $("fullscreen").disabled = false;
+      canvas.focus();
+    },
+    onAbort: (what) => {
+      log(`Aborted: ${what}`, true);
+      setStatus("xemu aborted. See log.");
+    },
+    onExit: (code) => {
+      log(`xemu exited with code ${code}`);
+      setStatus(`Exited (${code}).`);
+    },
+  };
+
+  try {
+    await factory(Module);
+  } catch (e) {
+    log(`Startup failed: ${e?.stack ?? e}`, true);
+    setStatus("xemu failed to start. See log.");
+  }
+}
+
+startBtn.addEventListener("click", start);
+
+if (params.get("autostart") === "1") {
+  const fixtures = {
+    bootrom: "mcpx.bin",
+    flash: "flash.bin",
+    hdd: "hdd.qcow2",
+    eeprom: "eeprom.bin",
+    dvd: "disc.iso",
+  };
+  (async () => {
+    setStatus("Fetching system files...");
+    const selected = {};
+    for (const [key, name] of Object.entries(fixtures)) {
+      const res = await fetch(`fixtures/${name}`);
+      if (!res.ok) {
+        log(`Missing fixtures/${name}`, true);
+        setStatus("System files were not found next to this page.");
+        return;
+      }
+      const data = new Uint8Array(await res.arrayBuffer());
+      selected[key] = { name, data };
+      log(`Fetched ${key}: ${name} (${data.length} bytes)`);
+    }
+    const backingRes = await fetch("fixtures/xbox_hdd.qcow2");
+    if (!backingRes.ok) {
+      log("Missing fixtures/xbox_hdd.qcow2", true);
+      setStatus("System files were not found next to this page.");
+      return;
+    }
+    let backing = new Uint8Array(await backingRes.arrayBuffer());
+    log(`Fetched hdd backing: xbox_hdd.qcow2 (${backing.length} bytes)`);
+    startBtn.disabled = true;
+    setStatus(`Loading ${MODULE_URL}...`);
+    let factory;
+    try {
+      factory = (await import(MODULE_URL)).default;
+    } catch (e) {
+      log(`Failed to load ${MODULE_URL}: ${e}`, true);
+      setStatus("Could not load the xemu WebAssembly build. See log.");
+      return;
+    }
+    const moduleBase = new URL(MODULE_URL, location.href);
+    const Module = {
+      canvas,
+      requestFullscreen: () => canvas.requestFullscreen(),
+      arguments: ["-config_path", `${ROOT}/xemu.toml`],
+      locateFile: (path) => new URL(path, moduleBase).href,
+      print: (text) => log(text),
+      printErr: (text) => log(text, true),
+      setStatus: (text) => setStatus(text),
+      preRun: [(mod) => {
+        installFiles(mod.FS, selected);
+        mod.FS.writeFile("/xemu/xbox_hdd.qcow2", backing);
+        backing = null;
+        log("Wrote /xemu/xbox_hdd.qcow2");
+      }],
+      onRuntimeInitialized: () => {
+        setStatus(null);
+        $("fullscreen").disabled = false;
+        canvas.focus();
+      },
+      onAbort: (what) => {
+        log(`Aborted: ${what}`, true);
+        setStatus("xemu aborted. See log.");
+      },
+      onExit: (code) => {
+        log(`xemu exited with code ${code}`);
+        setStatus(`Exited (${code}).`);
+      },
+    };
+    try {
+      await factory(Module);
+    } catch (e) {
+      log(`Startup failed: ${e?.stack ?? e}`, true);
+      setStatus("xemu failed to start. See log.");
+    }
+  })();
+}
+$("fullscreen").addEventListener("click", () => canvas.requestFullscreen());
+$("clear-log").addEventListener("click", () => (logEl.textContent = ""));
+canvas.addEventListener("click", () => canvas.focus());
+
+window.addEventListener("error", (e) => log(`Error: ${e.message}`, true));
+window.addEventListener("unhandledrejection",
+                        (e) => log(`Unhandled rejection: ${e.reason}`, true));
+</script>
+</body>
+</html>
