@@ -147,6 +147,9 @@ typedef struct SurfaceBinding {
 
     WGPUTexture texture;
     WGPUTextureView view;
+    /* Readable depth for a depth24plus-stencil8 zeta. NULL otherwise. */
+    WGPUTexture depth_copy;
+    WGPUTextureView depth_copy_view;
 
     bool initialized;
 } SurfaceBinding;
@@ -314,13 +317,23 @@ typedef struct PGRAPHWgpuState {
 
     WGPUShaderModule depth_upload_module;
     WGPUBindGroupLayout depth_upload_bind_group_layout;
-    WGPURenderPipeline depth_upload_pipeline;
+    WGPUPipelineLayout depth_upload_pipeline_layout;
+    WGPUTextureFormat depth_upload_formats[2];
+    WGPURenderPipeline depth_upload_pipelines[2];
 
-    /* Pack/unpack kernels, plus the Z16 surface-to-texture kernel. */
-    WGPUShaderModule surface_compute_modules[9];
-    WGPUBindGroupLayout surface_compute_layouts[9];
-    WGPUPipelineLayout surface_compute_pipeline_layouts[9];
-    WGPUComputePipeline surface_compute_pipelines[9];
+    /* Stencil upload when the zeta format cannot be a copy destination. */
+    WGPUShaderModule stencil_upload_module;
+    WGPUBindGroupLayout stencil_upload_layout;
+    WGPUPipelineLayout stencil_upload_pipeline_layout;
+    WGPURenderPipeline stencil_upload_pipeline;
+    WGPUBuffer stencil_upload_refs;
+
+    /* Pack/unpack kernels, plus the Z16 surface-to-texture kernel and the
+     * depth24plus depth-copy pack. */
+    WGPUShaderModule surface_compute_modules[10];
+    WGPUBindGroupLayout surface_compute_layouts[10];
+    WGPUPipelineLayout surface_compute_pipeline_layouts[10];
+    WGPUComputePipeline surface_compute_pipelines[10];
     WGPUBuffer surface_compute_uniform;
     WGPUBuffer surface_compute_storage[3];
     uint64_t surface_compute_storage_size[3];
@@ -338,6 +351,10 @@ typedef struct PGRAPHWgpuState {
     WGPUBuffer texture_decode_dst;
     uint64_t texture_decode_dst_size;
 
+    bool depth32float_stencil8;
+    bool texture_compression_bc;
+    /* Queried only. User clip stays a fragment discard either way. */
+    bool clip_distances;
     bool depth_clip_control;
     bool float32_filterable;
     /* Display target can be imported into GL. Browser builds leave this off. */
@@ -386,6 +403,18 @@ typedef struct PGRAPHWgpuState {
     GHashTable *pipeline_cache; // PipelineKey -> WGPURenderPipeline
     WGPUTexture scratch_zeta;
     WGPUTextureView scratch_zeta_view;
+    /* Stand-in color targets when a fallback shader writes @location(1)
+     * and the real surface is missing or not sampleable. */
+    WGPUTexture fallback_color;
+    WGPUTextureView fallback_color_view;
+    uint32_t fallback_color_width;
+    uint32_t fallback_color_height;
+    WGPUTexture fallback_depth;
+    WGPUTextureView fallback_depth_view;
+    uint32_t fallback_depth_width;
+    uint32_t fallback_depth_height;
+    WGPUShaderModule depth_copy_clear_module;
+    WGPURenderPipeline depth_copy_clear_pipeline;
 
     WgpuVertexLayout vertex_layout;
     WgpuVertexSource vertex_sources[NV2A_VERTEXSHADER_ATTRIBUTES];
@@ -469,6 +498,8 @@ const void *pgraph_wgpu_read_buffer(PGRAPHWgpuState *r, WGPUBuffer buffer,
 
 // surface.c
 void pgraph_wgpu_init_surfaces(PGRAPHState *pg);
+WGPURenderPipeline pgraph_wgpu_depth_upload_pipeline(PGRAPHWgpuState *r,
+                                                     WGPUTextureFormat format);
 void pgraph_wgpu_finalize_surfaces(PGRAPHState *pg);
 void pgraph_wgpu_surface_flush(NV2AState *d);
 void pgraph_wgpu_process_pending_downloads(NV2AState *d);

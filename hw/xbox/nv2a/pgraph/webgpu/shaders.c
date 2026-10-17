@@ -252,6 +252,7 @@ static ShaderBinding *create_shader_binding(PGRAPHWgpuState *r,
         .ubo_binding = VSH_UBO_BINDING,
         .point_quads = pgraph_wgpu_prim_topology(&prim, &expand) ==
                        WGPUPrimitiveTopology_PointList,
+        .clamp_clip_z = !r->depth_clip_control,
     };
     MString *vsh_code = pgraph_glsl_gen_vsh(&state->vsh, vsh_opts);
     b->vsh = create_draw_module(r, "PGRAPH vertex", vsh_code, true);
@@ -261,6 +262,7 @@ static ShaderBinding *create_shader_binding(PGRAPHWgpuState *r,
         .target = PGRAPH_GLSL_TARGET_WEBGPU,
         .ubo_binding = PSH_UBO_BINDING,
         .tex_binding = PSH_TEX_BINDING,
+        .depth_color_copy = !r->depth32float_stencil8,
     };
     MString *psh_code = pgraph_glsl_gen_psh(&state->psh, psh_opts);
     b->psh = create_draw_module(r, "PGRAPH fragment", psh_code, false);

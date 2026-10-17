@@ -84,6 +84,9 @@ enum {
     COMPUTE_UNPACK_X1R5G5B5,
     /* Z16 depth sampled as a Y16 float texture. One thread per row. */
     COMPUTE_Z16_TO_FLOAT,
+    /* depth24plus cannot be sampled. Pack the r32float depth copy. Stencil
+     * is not readable, so the packed byte is zero. */
+    COMPUTE_PACK_Z24_COLOR,
     COMPUTE__COUNT,
 };
 
@@ -137,6 +140,21 @@ static const char unpack_z24_wgsl[] = PARAMS
     "            stencil_out[byte_off / 4u] = stencil_word;\n"
     "            stencil_word = 0u;\n"
     "        }\n"
+    "    }\n"
+    "}\n";
+
+static const char pack_z24_color_wgsl[] = PARAMS
+    "@group(0) @binding(0) var depth_tex: texture_2d<f32>;\n"
+    "@group(0) @binding(1) var<storage, read_write> dst: array<u32>;\n"
+    "@group(0) @binding(3) var<uniform> params: Params;\n" FUNCS MAIN_ROW
+    "    let scale = pack_scale();\n"
+    "    let y = y_out * scale;\n"
+    "    let stride = params.dst_stride / 4u;\n"
+    "    for (var x_out = 0u; x_out < params.width_out; x_out++) {\n"
+    "        let x = x_out * scale;\n"
+    "        let d = textureLoad(depth_tex, vec2i(i32(x), i32(y)), 0).r;\n"
+    "        let depth_value = u32(i32(d * 16777215.0));\n"
+    "        dst[y_out * stride + x_out] = depth_value << 8u;\n"
     "    }\n"
     "}\n";
 
@@ -275,12 +293,16 @@ static const char *const compute_shader_source[COMPUTE__COUNT] = {
     [COMPUTE_PACK_X1R5G5B5] = pack_x1r5g5b5_wgsl,
     [COMPUTE_UNPACK_X1R5G5B5] = unpack_x1r5g5b5_wgsl,
     [COMPUTE_Z16_TO_FLOAT] = z16_to_float_wgsl,
+    [COMPUTE_PACK_Z24_COLOR] = pack_z24_color_wgsl,
 };
 
 static int compute_op(const SurfaceBinding *surface, bool pack)
 {
     switch (surface->host_fmt.conversion) {
     case WGPU_SURFACE_CONV_Z24S8:
+        if (pack && surface->depth_copy) {
+            return COMPUTE_PACK_Z24_COLOR;
+        }
         return pack ? COMPUTE_PACK_Z24 : COMPUTE_UNPACK_Z24;
     case WGPU_SURFACE_CONV_Z16:
         return pack ? COMPUTE_PACK_Z16 : COMPUTE_UNPACK_Z16;
@@ -332,6 +354,11 @@ static void fill_layout_entries(int op, WGPUBindGroupLayoutEntry *entries,
         entries[n++] = buffer_entry(0, WGPUBufferBindingType_ReadOnlyStorage);
         entries[n++] = buffer_entry(1, WGPUBufferBindingType_Storage);
         entries[n++] = buffer_entry(2, WGPUBufferBindingType_Storage);
+        break;
+    case COMPUTE_PACK_Z24_COLOR:
+        entries[n++] =
+            texture_entry(0, WGPUTextureSampleType_UnfilterableFloat);
+        entries[n++] = buffer_entry(1, WGPUBufferBindingType_Storage);
         break;
     case COMPUTE_PACK_Z16:
     case COMPUTE_Z16_TO_FLOAT:
@@ -440,6 +467,26 @@ void pgraph_wgpu_finalize_surface_compute(PGRAPHWgpuState *r)
         r->surface_compute_readback = NULL;
         r->surface_compute_readback_size = 0;
     }
+    if (r->stencil_upload_pipeline) {
+        wgpuRenderPipelineRelease(r->stencil_upload_pipeline);
+        r->stencil_upload_pipeline = NULL;
+    }
+    if (r->stencil_upload_pipeline_layout) {
+        wgpuPipelineLayoutRelease(r->stencil_upload_pipeline_layout);
+        r->stencil_upload_pipeline_layout = NULL;
+    }
+    if (r->stencil_upload_layout) {
+        wgpuBindGroupLayoutRelease(r->stencil_upload_layout);
+        r->stencil_upload_layout = NULL;
+    }
+    if (r->stencil_upload_module) {
+        wgpuShaderModuleRelease(r->stencil_upload_module);
+        r->stencil_upload_module = NULL;
+    }
+    if (r->stencil_upload_refs) {
+        wgpuBufferRelease(r->stencil_upload_refs);
+        r->stencil_upload_refs = NULL;
+    }
 }
 
 static WGPUBuffer ensure_buffer(PGRAPHWgpuState *r, int index, uint64_t size,
@@ -494,6 +541,24 @@ static WGPUTextureView aspect_view(WGPUTexture texture,
     desc.aspect = aspect;
     desc.usage = WGPUTextureUsage_TextureBinding;
     return wgpuTextureCreateView(texture, &desc);
+}
+
+/* Depth32Float has no separate aspect. depth32float-stencil8 is viewed as
+ * depth32float. A depth24plus copy is the surface's r32float texture. */
+static WGPUTextureView depth_sample_view(SurfaceBinding *surface, bool *owned)
+{
+    *owned = false;
+    if (surface->depth_copy) {
+        return surface->depth_copy_view;
+    }
+    if (surface->host_fmt.format == WGPUTextureFormat_Depth32Float) {
+        *owned = true;
+        return aspect_view(surface->texture, WGPUTextureFormat_Depth32Float,
+                           WGPUTextureAspect_All);
+    }
+    *owned = true;
+    return aspect_view(surface->texture, WGPUTextureFormat_Depth32Float,
+                       WGPUTextureAspect_DepthOnly);
 }
 
 static void dispatch_compute(PGRAPHState *pg, int op,
@@ -613,10 +678,10 @@ void pgraph_wgpu_record_converted_download(PGRAPHState *pg,
     WGPUTextureView stencil_view = NULL;
     WGPUTextureView color_view = NULL;
 
-    if (op == COMPUTE_PACK_Z24 || op == COMPUTE_PACK_Z16) {
-        depth_view =
-            aspect_view(surface->texture, WGPUTextureFormat_Depth32Float,
-                        WGPUTextureAspect_DepthOnly);
+    bool release_depth = false;
+    if (op == COMPUTE_PACK_Z24 || op == COMPUTE_PACK_Z16 ||
+        op == COMPUTE_PACK_Z24_COLOR) {
+        depth_view = depth_sample_view(surface, &release_depth);
         entries[nentries] = WGPU_BIND_GROUP_ENTRY_INIT;
         entries[nentries].binding = 0;
         entries[nentries].textureView = depth_view;
@@ -651,7 +716,7 @@ void pgraph_wgpu_record_converted_download(PGRAPHState *pg,
                                          dst, offset, ROUND_UP(dst_bytes, 4));
     pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_SURFACE_DOWN, false);
 
-    if (depth_view) {
+    if (release_depth && depth_view) {
         wgpuTextureViewRelease(depth_view);
     }
     if (stencil_view) {
@@ -695,7 +760,9 @@ void pgraph_wgpu_copy_zeta_to_texture(PGRAPHState *pg, SurfaceBinding *surface,
     scaled_size(pg, surface, &scaled_w, &scaled_h);
 
     bool z24 = dst_format == WGPUTextureFormat_R32Uint;
-    int op = z24 ? COMPUTE_PACK_Z24 : COMPUTE_Z16_TO_FLOAT;
+    int op = !z24                ? COMPUTE_Z16_TO_FLOAT :
+             surface->depth_copy ? COMPUTE_PACK_Z24_COLOR :
+                                   COMPUTE_PACK_Z24;
     uint32_t texel_bytes = z24 ? 4 : 16;
     uint32_t dst_stride = ROUND_UP(scaled_w * texel_bytes, 256);
     uint64_t dst_bytes = (uint64_t)dst_stride * scaled_h;
@@ -717,9 +784,8 @@ void pgraph_wgpu_copy_zeta_to_texture(PGRAPHState *pg, SurfaceBinding *surface,
         "Surface to texture");
     WGPUBindGroupEntry entries[4];
     uint32_t nentries = 0;
-    WGPUTextureView depth_view =
-        aspect_view(surface->texture, WGPUTextureFormat_Depth32Float,
-                    WGPUTextureAspect_DepthOnly);
+    bool release_depth = false;
+    WGPUTextureView depth_view = depth_sample_view(surface, &release_depth);
     WGPUTextureView stencil_view = NULL;
 
     entries[nentries] = WGPU_BIND_GROUP_ENTRY_INIT;
@@ -727,7 +793,7 @@ void pgraph_wgpu_copy_zeta_to_texture(PGRAPHState *pg, SurfaceBinding *surface,
     entries[nentries].textureView = depth_view;
     nentries++;
 
-    if (z24) {
+    if (op == COMPUTE_PACK_Z24) {
         stencil_view = aspect_view(surface->texture, WGPUTextureFormat_Stencil8,
                                    WGPUTextureAspect_StencilOnly);
         entries[nentries] = WGPU_BIND_GROUP_ENTRY_INIT;
@@ -737,7 +803,7 @@ void pgraph_wgpu_copy_zeta_to_texture(PGRAPHState *pg, SurfaceBinding *surface,
     }
 
     entries[nentries] = WGPU_BIND_GROUP_ENTRY_INIT;
-    entries[nentries].binding = z24 ? 2 : 1;
+    entries[nentries].binding = op == COMPUTE_PACK_Z24 ? 2 : 1;
     entries[nentries].buffer = out;
     entries[nentries].size = dst_bytes;
     nentries++;
@@ -749,7 +815,9 @@ void pgraph_wgpu_copy_zeta_to_texture(PGRAPHState *pg, SurfaceBinding *surface,
     /* Submit before releasing the views the compute pass sampled. */
     pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_SURFACE_DOWN, false);
 
-    wgpuTextureViewRelease(depth_view);
+    if (release_depth) {
+        wgpuTextureViewRelease(depth_view);
+    }
     if (stencil_view) {
         wgpuTextureViewRelease(stencil_view);
     }
@@ -764,10 +832,21 @@ static void queue_write_source(PGRAPHWgpuState *r, WGPUBuffer buffer,
     wgpuQueueWriteBuffer(r->queue, buffer, 0, tmp, padded);
 }
 
+static bool zeta_format_has_stencil(WGPUTextureFormat format)
+{
+    return format == WGPUTextureFormat_Depth32FloatStencil8 ||
+           format == WGPUTextureFormat_Depth24PlusStencil8;
+}
+
 static void draw_uploaded_depth(PGRAPHState *pg, SurfaceBinding *surface,
                                 WGPUTexture staging)
 {
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
+    WGPURenderPipeline pipeline =
+        pgraph_wgpu_depth_upload_pipeline(r, surface->host_fmt.format);
+    if (!pipeline) {
+        return;
+    }
     WGPUTextureView staging_view = wgpuTextureCreateView(staging, NULL);
 
     WGPUBindGroupEntry entry = WGPU_BIND_GROUP_ENTRY_INIT;
@@ -784,8 +863,10 @@ static void draw_uploaded_depth(PGRAPHState *pg, SurfaceBinding *surface,
     ds.view = surface->view;
     ds.depthLoadOp = WGPULoadOp_Load;
     ds.depthStoreOp = WGPUStoreOp_Store;
-    ds.stencilLoadOp = WGPULoadOp_Load;
-    ds.stencilStoreOp = WGPUStoreOp_Store;
+    if (zeta_format_has_stencil(surface->host_fmt.format)) {
+        ds.stencilLoadOp = WGPULoadOp_Load;
+        ds.stencilStoreOp = WGPUStoreOp_Store;
+    }
     WGPURenderPassDescriptor pass_desc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
     pass_desc.label = pgraph_wgpu_str("Depth upload");
     pass_desc.depthStencilAttachment = &ds;
@@ -793,13 +874,207 @@ static void draw_uploaded_depth(PGRAPHState *pg, SurfaceBinding *surface,
     WGPUCommandEncoder encoder = pgraph_wgpu_ensure_encoder(pg);
     WGPURenderPassEncoder pass =
         wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
-    wgpuRenderPassEncoderSetPipeline(pass, r->depth_upload_pipeline);
+    wgpuRenderPassEncoderSetPipeline(pass, pipeline);
     wgpuRenderPassEncoderSetBindGroup(pass, 0, bind_group, 0, NULL);
     wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
     wgpuRenderPassEncoderEnd(pass);
     wgpuRenderPassEncoderRelease(pass);
     wgpuBindGroupRelease(bind_group);
     wgpuTextureViewRelease(staging_view);
+}
+
+#define STENCIL_REF_STRIDE 256
+
+static const char stencil_upload_wgsl[] =
+    "struct Params { ref: u32 }\n"
+    "@group(0) @binding(0) var stencil_tex: texture_2d<u32>;\n"
+    "@group(0) @binding(1) var<uniform> params: Params;\n"
+    "@vertex fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) "
+    "vec4f {\n"
+    "    let uv = vec2f(f32((i << 1u) & 2u), f32(i & 2u));\n"
+    "    return vec4f(uv * 2.0 - 1.0, 0.0, 1.0);\n"
+    "}\n"
+    "@fragment fn fs(@builtin(position) pos: vec4f) {\n"
+    "    let s = textureLoad(stencil_tex, vec2i(pos.xy), 0).r;\n"
+    "    if (s != params.ref) { discard; }\n"
+    "}\n";
+
+static bool ensure_stencil_upload(PGRAPHWgpuState *r)
+{
+    WGPUBindGroupLayoutEntry entries[2];
+    WGPUBufferDescriptor buffer_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+    uint32_t refs[256];
+
+    if (r->stencil_upload_pipeline) {
+        return true;
+    }
+    if (r->stencil_upload_module) {
+        return false;
+    }
+    r->stencil_upload_module = pgraph_wgpu_create_wgsl_module(
+        r, "Stencil upload", stencil_upload_wgsl);
+    if (!r->stencil_upload_module) {
+        return false;
+    }
+
+    entries[0] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+    entries[0].binding = 0;
+    entries[0].visibility = WGPUShaderStage_Fragment;
+    entries[0].texture.sampleType = WGPUTextureSampleType_Uint;
+    entries[0].texture.viewDimension = WGPUTextureViewDimension_2D;
+    entries[1] = WGPU_BIND_GROUP_LAYOUT_ENTRY_INIT;
+    entries[1].binding = 1;
+    entries[1].visibility = WGPUShaderStage_Fragment;
+    entries[1].buffer.type = WGPUBufferBindingType_Uniform;
+    entries[1].buffer.hasDynamicOffset = true;
+    entries[1].buffer.minBindingSize = sizeof(uint32_t);
+
+    WGPUBindGroupLayoutDescriptor bgl_desc =
+        WGPU_BIND_GROUP_LAYOUT_DESCRIPTOR_INIT;
+    bgl_desc.entryCount = 2;
+    bgl_desc.entries = entries;
+    r->stencil_upload_layout =
+        wgpuDeviceCreateBindGroupLayout(r->device, &bgl_desc);
+
+    WGPUPipelineLayoutDescriptor layout_desc =
+        WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
+    layout_desc.bindGroupLayoutCount = 1;
+    layout_desc.bindGroupLayouts = &r->stencil_upload_layout;
+    r->stencil_upload_pipeline_layout =
+        wgpuDeviceCreatePipelineLayout(r->device, &layout_desc);
+
+    WGPUStencilFaceState face = WGPU_STENCIL_FACE_STATE_INIT;
+    face.compare = WGPUCompareFunction_Always;
+    face.failOp = WGPUStencilOperation_Replace;
+    face.depthFailOp = WGPUStencilOperation_Replace;
+    face.passOp = WGPUStencilOperation_Replace;
+
+    WGPUDepthStencilState depth_stencil = WGPU_DEPTH_STENCIL_STATE_INIT;
+    depth_stencil.format = WGPUTextureFormat_Depth24PlusStencil8;
+    depth_stencil.depthWriteEnabled = WGPUOptionalBool_False;
+    depth_stencil.depthCompare = WGPUCompareFunction_Always;
+    depth_stencil.stencilFront = face;
+    depth_stencil.stencilBack = face;
+    depth_stencil.stencilReadMask = 0xff;
+    depth_stencil.stencilWriteMask = 0xff;
+
+    WGPUFragmentState fragment = WGPU_FRAGMENT_STATE_INIT;
+    fragment.module = r->stencil_upload_module;
+    fragment.entryPoint = pgraph_wgpu_str("fs");
+
+    WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
+    desc.label = pgraph_wgpu_str("Stencil upload");
+    desc.layout = r->stencil_upload_pipeline_layout;
+    desc.vertex.module = r->stencil_upload_module;
+    desc.vertex.entryPoint = pgraph_wgpu_str("vs");
+    desc.depthStencil = &depth_stencil;
+    desc.fragment = &fragment;
+    r->stencil_upload_pipeline =
+        wgpuDeviceCreateRenderPipeline(r->device, &desc);
+
+    for (uint32_t i = 0; i < 256; i++) {
+        refs[i] = i;
+    }
+    g_autofree uint8_t *packed = g_malloc0(256 * STENCIL_REF_STRIDE);
+    for (uint32_t i = 0; i < 256; i++) {
+        memcpy(packed + i * STENCIL_REF_STRIDE, &refs[i], sizeof(refs[i]));
+    }
+    buffer_desc.label = pgraph_wgpu_str("Stencil upload refs");
+    buffer_desc.size = 256 * STENCIL_REF_STRIDE;
+    buffer_desc.usage = WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst;
+    r->stencil_upload_refs = wgpuDeviceCreateBuffer(r->device, &buffer_desc);
+    wgpuQueueWriteBuffer(r->queue, r->stencil_upload_refs, 0, packed,
+                         buffer_desc.size);
+    return r->stencil_upload_pipeline != NULL;
+}
+
+/* depth24plus-stencil8 cannot be a copy destination. Pixels whose unpacked
+ * stencil matches the reference are replaced; the rest are discarded. */
+static void upload_stencil_reference(PGRAPHState *pg, SurfaceBinding *surface,
+                                     WGPUBuffer stencil,
+                                     uint32_t stencil_stride,
+                                     unsigned int scaled_w,
+                                     unsigned int scaled_h,
+                                     const uint8_t *guest, unsigned int pitch)
+{
+    PGRAPHWgpuState *r = pg->wgpu_renderer_state;
+    bool used[256];
+    WGPUTextureView view = NULL;
+
+    memset(used, 0, sizeof(used));
+    if (surface->width && pitch >= surface->width * 4) {
+        for (unsigned int y = 0; y < surface->height; y++) {
+            const uint8_t *row = guest + (size_t)y * pitch;
+            for (unsigned int x = 0; x < surface->width; x++) {
+                used[row[x * 4]] = true;
+            }
+        }
+    } else {
+        memset(used, 1, sizeof(used));
+    }
+    if (!ensure_stencil_upload(r)) {
+        fprintf(stderr, "[WebGPU] Stencil upload unavailable\n");
+        return;
+    }
+
+    WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+    desc.label = pgraph_wgpu_str("Stencil upload");
+    desc.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+    desc.size = (WGPUExtent3D){ scaled_w, scaled_h, 1 };
+    desc.format = WGPUTextureFormat_R8Uint;
+    WGPUTexture tex = wgpuDeviceCreateTexture(r->device, &desc);
+    copy_storage_to_texture(pgraph_wgpu_ensure_encoder(pg), stencil,
+                            stencil_stride, tex, WGPUTextureAspect_All,
+                            scaled_w, scaled_h);
+    view = wgpuTextureCreateView(tex, NULL);
+
+    WGPUBindGroupEntry binds[2] = {
+        WGPU_BIND_GROUP_ENTRY_INIT,
+        WGPU_BIND_GROUP_ENTRY_INIT,
+    };
+    binds[0].binding = 0;
+    binds[0].textureView = view;
+    binds[1].binding = 1;
+    binds[1].buffer = r->stencil_upload_refs;
+    binds[1].size = sizeof(uint32_t);
+    WGPUBindGroupDescriptor bg_desc = WGPU_BIND_GROUP_DESCRIPTOR_INIT;
+    bg_desc.layout = r->stencil_upload_layout;
+    bg_desc.entryCount = 2;
+    bg_desc.entries = binds;
+    WGPUBindGroup group = wgpuDeviceCreateBindGroup(r->device, &bg_desc);
+
+    WGPURenderPassDepthStencilAttachment ds =
+        WGPU_RENDER_PASS_DEPTH_STENCIL_ATTACHMENT_INIT;
+    ds.view = surface->view;
+    ds.depthLoadOp = WGPULoadOp_Load;
+    ds.depthStoreOp = WGPUStoreOp_Store;
+    ds.stencilLoadOp = WGPULoadOp_Load;
+    ds.stencilStoreOp = WGPUStoreOp_Store;
+    WGPURenderPassDescriptor pass_desc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
+    pass_desc.label = pgraph_wgpu_str("Stencil upload");
+    pass_desc.depthStencilAttachment = &ds;
+
+    WGPUCommandEncoder encoder = pgraph_wgpu_ensure_encoder(pg);
+    WGPURenderPassEncoder pass =
+        wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
+    wgpuRenderPassEncoderSetPipeline(pass, r->stencil_upload_pipeline);
+    wgpuRenderPassEncoderSetViewport(pass, 0, 0, scaled_w, scaled_h, 0, 1);
+    for (uint32_t ref = 0; ref < 256; ref++) {
+        uint32_t offset;
+
+        if (!used[ref]) {
+            continue;
+        }
+        offset = ref * STENCIL_REF_STRIDE;
+        wgpuRenderPassEncoderSetBindGroup(pass, 0, group, 1, &offset);
+        wgpuRenderPassEncoderSetStencilReference(pass, ref);
+        wgpuRenderPassEncoderDraw(pass, 3, 1, 0, 0);
+    }
+    wgpuRenderPassEncoderEnd(pass);
+    wgpuRenderPassEncoderRelease(pass);
+    wgpuBindGroupRelease(group);
+    wgpuTextureViewRelease(view);
+    wgpuTextureRelease(tex);
 }
 
 void pgraph_wgpu_unpack_converted_surface(PGRAPHState *pg,
@@ -872,8 +1147,9 @@ void pgraph_wgpu_unpack_converted_surface(PGRAPHState *pg,
     if (depth) {
         WGPUTextureDescriptor staging_desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
         staging_desc.label = pgraph_wgpu_str("Depth upload staging");
-        staging_desc.usage =
-            WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+        staging_desc.usage = WGPUTextureUsage_TextureBinding |
+                             WGPUTextureUsage_CopyDst |
+                             WGPUTextureUsage_CopySrc;
         staging_desc.dimension = WGPUTextureDimension_2D;
         staging_desc.size = (WGPUExtent3D){ scaled_w, scaled_h, 1 };
         staging_desc.format = WGPUTextureFormat_R32Float;
@@ -881,12 +1157,29 @@ void pgraph_wgpu_unpack_converted_surface(PGRAPHState *pg,
 
         copy_storage_to_texture(encoder, unpacked, dst_stride, staging,
                                 WGPUTextureAspect_All, scaled_w, scaled_h);
-        if (stencil) {
+        if (stencil && surface->host_fmt.format ==
+                           WGPUTextureFormat_Depth32FloatStencil8) {
             copy_storage_to_texture(
                 encoder, stencil, stencil_stride, surface->texture,
                 WGPUTextureAspect_StencilOnly, scaled_w, scaled_h);
         }
         draw_uploaded_depth(pg, surface, staging);
+        encoder = pgraph_wgpu_ensure_encoder(pg);
+        if (surface->depth_copy) {
+            WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+            WGPUExtent3D extent = { scaled_w, scaled_h, 1 };
+
+            src.texture = staging;
+            dst.texture = surface->depth_copy;
+            wgpuCommandEncoderCopyTextureToTexture(encoder, &src, &dst,
+                                                   &extent);
+        }
+        if (stencil &&
+            surface->host_fmt.format == WGPUTextureFormat_Depth24PlusStencil8) {
+            upload_stencil_reference(pg, surface, stencil, stencil_stride,
+                                     scaled_w, scaled_h, src, pitch);
+        }
         pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_SURFACE_CREATE, false);
         wgpuTextureRelease(staging);
     } else {

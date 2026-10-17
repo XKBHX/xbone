@@ -17,6 +17,7 @@
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "hw/xbox/nv2a/pgraph/swizzle.h"
 #include "ui/xemu-settings.h"
+#include "features.h"
 #include "renderer.h"
 
 static const int num_invalid_surfaces_to_keep = 10;
@@ -654,6 +655,20 @@ SurfaceBinding *pgraph_wgpu_surface_get_within(NV2AState *d, hwaddr addr)
     return NULL;
 }
 
+static WGPUTextureUsage surface_texture_usage(WGPUTextureFormat format)
+{
+    if (format == WGPUTextureFormat_Depth24PlusStencil8) {
+        /* Not sampleable and not copyable. Depth is written to depth_copy. */
+        return WGPUTextureUsage_RenderAttachment;
+    }
+    if (format == WGPUTextureFormat_Depth32Float) {
+        return WGPUTextureUsage_RenderAttachment |
+               WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopySrc;
+    }
+    return WGPUTextureUsage_RenderAttachment | WGPUTextureUsage_TextureBinding |
+           WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
+}
+
 static void create_surface_texture(PGRAPHState *pg, SurfaceBinding *surface)
 {
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
@@ -673,14 +688,26 @@ static void create_surface_texture(PGRAPHState *pg, SurfaceBinding *surface)
 
     WGPUTextureDescriptor descriptor = WGPU_TEXTURE_DESCRIPTOR_INIT;
     descriptor.label = pgraph_wgpu_str(label);
-    descriptor.usage = WGPUTextureUsage_RenderAttachment |
-                       WGPUTextureUsage_TextureBinding |
-                       WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
+    descriptor.usage = surface_texture_usage(surface->host_fmt.format);
     descriptor.dimension = WGPUTextureDimension_2D;
     descriptor.size = (WGPUExtent3D){ width, height, 1 };
     descriptor.format = surface->host_fmt.format;
     surface->texture = wgpuDeviceCreateTexture(r->device, &descriptor);
     surface->view = wgpuTextureCreateView(surface->texture, NULL);
+
+    if (surface->host_fmt.format == WGPUTextureFormat_Depth24PlusStencil8) {
+        WGPUTextureDescriptor copy_desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+        copy_desc.label = pgraph_wgpu_str("Zeta depth copy");
+        copy_desc.usage = WGPUTextureUsage_RenderAttachment |
+                          WGPUTextureUsage_TextureBinding |
+                          WGPUTextureUsage_CopySrc | WGPUTextureUsage_CopyDst;
+        copy_desc.dimension = WGPUTextureDimension_2D;
+        copy_desc.size = descriptor.size;
+        copy_desc.format = WGPUTextureFormat_R32Float;
+        surface->depth_copy = wgpuDeviceCreateTexture(r->device, &copy_desc);
+        surface->depth_copy_view =
+            wgpuTextureCreateView(surface->depth_copy, NULL);
+    }
 
     nv2a_profile_inc_counter(NV2A_PROF_SURF_CREATE);
 }
@@ -689,12 +716,24 @@ static void migrate_surface_texture(SurfaceBinding *dst, SurfaceBinding *src)
 {
     dst->texture = src->texture;
     dst->view = src->view;
+    dst->depth_copy = src->depth_copy;
+    dst->depth_copy_view = src->depth_copy_view;
     src->texture = NULL;
     src->view = NULL;
+    src->depth_copy = NULL;
+    src->depth_copy_view = NULL;
 }
 
 static void destroy_surface_texture(SurfaceBinding *surface)
 {
+    if (surface->depth_copy_view) {
+        wgpuTextureViewRelease(surface->depth_copy_view);
+        surface->depth_copy_view = NULL;
+    }
+    if (surface->depth_copy) {
+        wgpuTextureRelease(surface->depth_copy);
+        surface->depth_copy = NULL;
+    }
     if (surface->view) {
         wgpuTextureViewRelease(surface->view);
         surface->view = NULL;
@@ -943,6 +982,18 @@ static void populate_surface_binding_target_sized(NV2AState *d, bool color,
         fmt = kelvin_surface_zeta_format_map[pg->surface_shape.zeta_format];
         host_fmt =
             kelvin_surface_zeta_format_wgpu_map[pg->surface_shape.zeta_format];
+        switch (pgraph_wgpu_zeta_backing(r->depth32float_stencil8,
+                                         host_fmt.conversion ==
+                                             WGPU_SURFACE_CONV_Z16)) {
+        case WGPU_ZETA_BACKING_DEPTH32_STENCIL8:
+            break;
+        case WGPU_ZETA_BACKING_DEPTH32:
+            host_fmt.format = WGPUTextureFormat_Depth32Float;
+            break;
+        case WGPU_ZETA_BACKING_DEPTH24PLUS_STENCIL8:
+            host_fmt.format = WGPUTextureFormat_Depth24PlusStencil8;
+            break;
+        }
     }
 
     DMAObject dma = nv_dma_load(d, dma_address);
@@ -1264,7 +1315,7 @@ void pgraph_wgpu_set_surface_dirty(PGRAPHState *pg, bool color, bool zeta)
     }
 }
 
-static void create_depth_upload_pipeline(PGRAPHWgpuState *r)
+static void create_depth_upload_layout(PGRAPHWgpuState *r)
 {
     r->depth_upload_module =
         pgraph_wgpu_create_wgsl_module(r, "Depth upload", depth_upload_wgsl);
@@ -1285,11 +1336,36 @@ static void create_depth_upload_pipeline(PGRAPHWgpuState *r)
         WGPU_PIPELINE_LAYOUT_DESCRIPTOR_INIT;
     layout_desc.bindGroupLayoutCount = 1;
     layout_desc.bindGroupLayouts = &r->depth_upload_bind_group_layout;
-    WGPUPipelineLayout layout =
+    r->depth_upload_pipeline_layout =
         wgpuDeviceCreatePipelineLayout(r->device, &layout_desc);
+}
+
+WGPURenderPipeline pgraph_wgpu_depth_upload_pipeline(PGRAPHWgpuState *r,
+                                                     WGPUTextureFormat format)
+{
+    for (int i = 0; i < ARRAY_SIZE(r->depth_upload_pipelines); i++) {
+        if (r->depth_upload_pipelines[i] &&
+            r->depth_upload_formats[i] == format) {
+            return r->depth_upload_pipelines[i];
+        }
+    }
+    if (!r->depth_upload_module || !r->depth_upload_pipeline_layout) {
+        return NULL;
+    }
+
+    int slot = -1;
+    for (int i = 0; i < ARRAY_SIZE(r->depth_upload_pipelines); i++) {
+        if (!r->depth_upload_pipelines[i]) {
+            slot = i;
+            break;
+        }
+    }
+    if (slot < 0) {
+        return NULL;
+    }
 
     WGPUDepthStencilState depth_stencil = WGPU_DEPTH_STENCIL_STATE_INIT;
-    depth_stencil.format = WGPUTextureFormat_Depth32FloatStencil8;
+    depth_stencil.format = format;
     depth_stencil.depthWriteEnabled = WGPUOptionalBool_True;
     depth_stencil.depthCompare = WGPUCompareFunction_Always;
     depth_stencil.stencilReadMask = 0;
@@ -1301,14 +1377,15 @@ static void create_depth_upload_pipeline(PGRAPHWgpuState *r)
 
     WGPURenderPipelineDescriptor desc = WGPU_RENDER_PIPELINE_DESCRIPTOR_INIT;
     desc.label = pgraph_wgpu_str("Depth upload");
-    desc.layout = layout;
+    desc.layout = r->depth_upload_pipeline_layout;
     desc.vertex.module = r->depth_upload_module;
     desc.vertex.entryPoint = pgraph_wgpu_str("vs");
     desc.depthStencil = &depth_stencil;
     desc.fragment = &fragment;
-    r->depth_upload_pipeline = wgpuDeviceCreateRenderPipeline(r->device, &desc);
-
-    wgpuPipelineLayoutRelease(layout);
+    r->depth_upload_formats[slot] = format;
+    r->depth_upload_pipelines[slot] =
+        wgpuDeviceCreateRenderPipeline(r->device, &desc);
+    return r->depth_upload_pipelines[slot];
 }
 
 void pgraph_wgpu_init_surfaces(PGRAPHState *pg)
@@ -1326,7 +1403,7 @@ void pgraph_wgpu_init_surfaces(PGRAPHState *pg)
     r->zeta_binding = NULL;
     r->framebuffer_dirty = true;
 
-    create_depth_upload_pipeline(r);
+    create_depth_upload_layout(r);
     pgraph_wgpu_init_surface_compute(r);
     pgraph_wgpu_reload_surface_scale_factor(pg);
 }
@@ -1337,9 +1414,15 @@ void pgraph_wgpu_finalize_surfaces(PGRAPHState *pg)
 
     pgraph_wgpu_surface_flush(container_of(pg, NV2AState, pgraph));
 
-    if (r->depth_upload_pipeline) {
-        wgpuRenderPipelineRelease(r->depth_upload_pipeline);
-        r->depth_upload_pipeline = NULL;
+    for (int i = 0; i < ARRAY_SIZE(r->depth_upload_pipelines); i++) {
+        if (r->depth_upload_pipelines[i]) {
+            wgpuRenderPipelineRelease(r->depth_upload_pipelines[i]);
+            r->depth_upload_pipelines[i] = NULL;
+        }
+    }
+    if (r->depth_upload_pipeline_layout) {
+        wgpuPipelineLayoutRelease(r->depth_upload_pipeline_layout);
+        r->depth_upload_pipeline_layout = NULL;
     }
     if (r->depth_upload_bind_group_layout) {
         wgpuBindGroupLayoutRelease(r->depth_upload_bind_group_layout);

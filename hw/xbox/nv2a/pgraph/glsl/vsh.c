@@ -453,6 +453,15 @@ MString *pgraph_glsl_gen_vsh(const VshState *state, GenVshGlslOptions opts)
     }
 
     if (opts.target == PGRAPH_GLSL_TARGET_WEBGPU) {
+        /* Without depth-clip-control the rasterizer clips Z. Pull clip Z
+         * into the volume so a primitive that should be clamped is still
+         * rasterized. vtxPos is already stored, and the fragment shader
+         * writes the real depth. */
+        if (opts.clamp_clip_z) {
+            mstring_append(body, "  if (oPos.w > 0.0) {\n"
+                                 "    oPos.z = clamp(oPos.z, 0.0, oPos.w);\n"
+                                 "  }\n");
+        }
         /* WebGPU normalized device coordinates are y-up */
         mstring_append(body,
                    "  gl_Position = vec4(oPos.x, -oPos.y, oPos.z, oPos.w);\n"

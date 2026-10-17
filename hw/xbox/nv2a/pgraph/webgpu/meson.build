@@ -7,6 +7,7 @@ if webgpu.found()
     'command.c',
     'display.c',
     'draw.c',
+    'features.c',
     'instance.c',
     'prim.c',
     'renderer.c',

@@ -104,6 +104,8 @@ typedef struct GenVshGlslOptions {
     /* WebGPU only: each point is an instance of a 4-vertex triangle strip,
      * expanded here to the point size */
     bool point_quads;
+    /* WebGPU only: clamp clip Z when the device has no depth-clip-control. */
+    bool clamp_clip_z;
 } GenVshGlslOptions;
 
 MString *pgraph_glsl_gen_vsh(const VshState *state,

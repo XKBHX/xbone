@@ -71,8 +71,14 @@ What exists:
   cached by the views and samplers they name. A guest-RAM vertex buffer is
   uploaded in 64 KiB blocks and used when every attribute fits a core
   vertex format. Other attributes are still packed on the CPU. Packed
-  texture texels are expanded by a compute shader; palette, YUV, DXT and
-  unswizzle stay on the CPU.
+  texture texels are expanded by a compute shader. Palette, YUV, and
+  unswizzle stay on the CPU. DXT is uploaded as BC1, BC2, or BC3 when the
+  device has `texture-compression-bc` and the texture is 2D or a cube
+  whose base size is a multiple of 4. Otherwise DXT is decompressed on
+  the CPU. `depth32float-stencil8`, `texture-compression-bc`, and
+  `depth-clip-control` are optional. `XEMU_WEBGPU_DISABLE_FEATURES` forces
+  the fallback. See the phase 5 browser step 4 notes in
+  [webgpu-renderer-plan.md](webgpu-renderer-plan.md#implementation-status).
 - `tests/wasm/webgpu-offscreen-spike` is a standalone emdawnwebgpu program,
   built with emsdk 6.0.12. A pthread other than the page thread creates a
   device and clears a transferred `OffscreenCanvas`. It is not an xemu

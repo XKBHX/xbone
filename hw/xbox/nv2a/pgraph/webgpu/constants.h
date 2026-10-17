@@ -72,8 +72,9 @@ static const BasicSurfaceFormatInfo kelvin_surface_zeta_format_map[] = {
     [NV097_SET_SURFACE_FORMAT_ZETA_Z24S8] = { 4 },
 };
 
-/* Depth formats can't be copied to from buffers, and depth24plus can't be
- * copied from either, so both zeta formats use depth32float-stencil8.
+/* Preferred zeta format. depth32float-stencil8 can be sampled. Without that
+ * feature, Z16 uses depth32float and Z24S8 uses depth24plus-stencil8 plus an
+ * r32float depth copy. See pgraph_wgpu_zeta_backing.
  */
 static const WgpuSurfaceFormatInfo kelvin_surface_zeta_format_wgpu_map[] = {
     [NV097_SET_SURFACE_FORMAT_ZETA_Z16] = {
@@ -225,9 +226,9 @@ static const WgpuColorFormatInfo kelvin_color_format_wgpu_map[66] = {
     [NV097_SET_TEXTURE_FORMAT_COLOR_SZ_X8R8G8B8] =
         DECODE(BGRA8, ID, ID, ID, ONE),
     [NV097_SET_TEXTURE_FORMAT_COLOR_SZ_I8_A8R8G8B8] = COPY(BGRA8Unorm),
-    [NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT1_A1R5G5B5] = COPY(RGBA8Unorm),
-    [NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT23_A8R8G8B8] = COPY(RGBA8Unorm),
-    [NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT45_A8R8G8B8] = COPY(RGBA8Unorm),
+    [NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT1_A1R5G5B5] = COPY(BC1RGBAUnorm),
+    [NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT23_A8R8G8B8] = COPY(BC2RGBAUnorm),
+    [NV097_SET_TEXTURE_FORMAT_COLOR_L_DXT45_A8R8G8B8] = COPY(BC3RGBAUnorm),
     [NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A1R5G5B5] = DECODE(A1R5G5B5),
     [NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_R5G6B5] = DECODE(R5G6B5),
     [NV097_SET_TEXTURE_FORMAT_COLOR_LU_IMAGE_A8R8G8B8] = COPY(BGRA8Unorm),

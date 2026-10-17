@@ -879,6 +879,10 @@ static MString* psh_convert(struct PixelShader *ps)
     if (psh_uses_spirv(ps)) {
         mstring_append(preflight,
                        "layout(location = 0) out vec4 fragColor;\n");
+        if (ps->opts.depth_color_copy) {
+            mstring_append(preflight,
+                           "layout(location = 1) out float depthCopy;\n");
+        }
         mstring_append_fmt(
             preflight,
             ps->opts.target == PGRAPH_GLSL_TARGET_WEBGPU
@@ -1674,23 +1678,25 @@ static MString* psh_convert(struct PixelShader *ps)
      * due to rounding.)
      */
 
+    const char *depth_expr;
     switch (ps->state->depth_format) {
     case DEPTH_FORMAT_D16:
         // 16-bit unsigned int
-        mstring_append(
-            ps->code,
-            "gl_FragDepth = floor(zvalue) / 65535.0;\n");
+        depth_expr = "floor(zvalue) / 65535.0";
         break;
     case DEPTH_FORMAT_D24:
         // 24-bit unsigned int
-        mstring_append(
-            ps->code,
-            "gl_FragDepth = uintBitsToFloat(floatBitsToUint(floor(zvalue) / 16777216.0) + 1u);\n");
+        depth_expr = "uintBitsToFloat(floatBitsToUint(floor(zvalue) / "
+                     "16777216.0) + 1u)";
         break;
     default:
         // TODO: handle floating-point depth buffers properly
-        mstring_append(ps->code, "gl_FragDepth = zvalue / clipRange.y;\n");
+        depth_expr = "zvalue / clipRange.y";
         break;
+    }
+    mstring_append_fmt(ps->code, "gl_FragDepth = %s;\n", depth_expr);
+    if (ps->opts.depth_color_copy) {
+        mstring_append_fmt(ps->code, "depthCopy = %s;\n", depth_expr);
     }
 
     MString *final = mstring_new();

@@ -11,6 +11,7 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "features.h"
 #include "renderer.h"
 #include "ui/xemu-settings.h"
 #include "ui/xui/wgpu-ui-pfifo.h"
@@ -317,9 +318,8 @@ static void device_lost_callback(WGPUDevice const *device,
 }
 
 /*
- * Sharing is optional. Depth32FloatStencil8 stays required. The fence
- * feature is requested with the memory feature because EndAccess rejects
- * the texture without it.
+ * Sharing is optional. The fence feature is requested with the memory
+ * feature because EndAccess rejects the texture without it.
  */
 static void add_shared_display_features(PGRAPHWgpuState *r, WGPUAdapter adapter,
                                         WGPUFeatureName *features,
@@ -370,6 +370,31 @@ static void add_shared_display_features(PGRAPHWgpuState *r, WGPUAdapter adapter,
 #endif
 }
 
+static bool enable_feature(WGPUAdapter adapter, WGPUFeatureName feature,
+                           const char *name, bool request, bool *enabled,
+                           const char *fallback, WGPUFeatureName *required,
+                           size_t *count)
+{
+    const char *disabled = getenv("XEMU_WEBGPU_DISABLE_FEATURES");
+
+    if (pgraph_wgpu_feature_disabled(disabled, name)) {
+        *enabled = false;
+        fprintf(stderr, "[WebGPU] %s: off (XEMU_WEBGPU_DISABLE_FEATURES)\n",
+                name);
+        return false;
+    }
+    *enabled = wgpuAdapterHasFeature(adapter, feature);
+    if (*enabled && request) {
+        required[(*count)++] = feature;
+        fprintf(stderr, "[WebGPU] %s: on\n", name);
+    } else if (*enabled) {
+        fprintf(stderr, "[WebGPU] %s: present (%s)\n", name, fallback);
+    } else {
+        fprintf(stderr, "[WebGPU] %s: absent (%s)\n", name, fallback);
+    }
+    return *enabled && request;
+}
+
 static WGPUDevice request_device(PGRAPHWgpuState *r, Error **errp)
 {
     WGPUInstance instance = r->instance;
@@ -379,29 +404,45 @@ static WGPUDevice request_device(PGRAPHWgpuState *r, Error **errp)
     WGPURequestDeviceCallbackInfo callback =
         WGPU_REQUEST_DEVICE_CALLBACK_INFO_INIT;
     WGPUFutureWaitInfo wait_info = WGPU_FUTURE_WAIT_INFO_INIT;
-    WGPUFeatureName required_features[8] = {
-        WGPUFeatureName_Depth32FloatStencil8,
-    };
-    size_t num_required_features = 1;
+    WGPUFeatureName required_features[8];
+    size_t num_required_features = 0;
 
-    for (size_t i = 0; i < num_required_features; i++) {
-        if (!wgpuAdapterHasFeature(adapter, required_features[i])) {
-            error_setg(errp, "WebGPU adapter lacks required feature %d",
-                       required_features[i]);
-            return NULL;
-        }
-    }
-    r->depth_clip_control =
-        wgpuAdapterHasFeature(adapter, WGPUFeatureName_DepthClipControl);
-    if (r->depth_clip_control) {
-        required_features[num_required_features++] =
-            WGPUFeatureName_DepthClipControl;
-    }
+    enable_feature(adapter, WGPUFeatureName_Depth32FloatStencil8,
+                   WGPU_FEATURE_DEPTH32FLOAT_STENCIL8, true,
+                   &r->depth32float_stencil8,
+                   "depth32float / depth24plus-stencil8", required_features,
+                   &num_required_features);
+    enable_feature(adapter, WGPUFeatureName_TextureCompressionBC,
+                   WGPU_FEATURE_TEXTURE_COMPRESSION_BC, true,
+                   &r->texture_compression_bc, "s3tc", required_features,
+                   &num_required_features);
+    /* Clip planes and window clip already discard in the fragment shader.
+     * The generator does not emit clip distances, so the feature stays off
+     * the device even when the adapter has it. */
+    enable_feature(adapter, WGPUFeatureName_ClipDistances,
+                   WGPU_FEATURE_CLIP_DISTANCES, false, &r->clip_distances,
+                   "fragment discard", required_features,
+                   &num_required_features);
+    enable_feature(adapter, WGPUFeatureName_DepthClipControl,
+                   WGPU_FEATURE_DEPTH_CLIP_CONTROL, true,
+                   &r->depth_clip_control, "shader clamp", required_features,
+                   &num_required_features);
     r->float32_filterable =
-        wgpuAdapterHasFeature(adapter, WGPUFeatureName_Float32Filterable);
+        wgpuAdapterHasFeature(adapter, WGPUFeatureName_Float32Filterable) &&
+        !pgraph_wgpu_feature_disabled(getenv("XEMU_WEBGPU_DISABLE_FEATURES"),
+                                      "float32-filterable");
     if (r->float32_filterable) {
         required_features[num_required_features++] =
             WGPUFeatureName_Float32Filterable;
+        fprintf(stderr, "[WebGPU] float32-filterable: on\n");
+    } else if (pgraph_wgpu_feature_disabled(
+                   getenv("XEMU_WEBGPU_DISABLE_FEATURES"),
+                   "float32-filterable")) {
+        fprintf(stderr,
+                "[WebGPU] float32-filterable: off "
+                "(XEMU_WEBGPU_DISABLE_FEATURES)\n");
+    } else {
+        fprintf(stderr, "[WebGPU] float32-filterable: absent (rgba16float)\n");
     }
     add_shared_display_features(r, adapter, required_features,
                                 &num_required_features);

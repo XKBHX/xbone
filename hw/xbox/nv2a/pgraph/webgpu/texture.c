@@ -69,11 +69,21 @@ static void create_dummy_texture(PGRAPHWgpuState *r, PshTextureType type)
     r->dummy_texture_views[type] = wgpuTextureCreateView(texture, &view_desc);
 }
 
+static bool format_is_bc(WGPUTextureFormat format)
+{
+    return format == WGPUTextureFormat_BC1RGBAUnorm ||
+           format == WGPUTextureFormat_BC2RGBAUnorm ||
+           format == WGPUTextureFormat_BC3RGBAUnorm;
+}
+
 static WGPUTextureFormat get_host_format(PGRAPHWgpuState *r,
                                          const WgpuColorFormatInfo *f)
 {
     switch (f->decode) {
     case WGPU_TEX_DECODE_COPY:
+        if (!r->texture_compression_bc && format_is_bc(f->format)) {
+            return WGPUTextureFormat_RGBA8Unorm;
+        }
         return f->format;
     case WGPU_TEX_DECODE_RGB8_SNORM:
         return WGPUTextureFormat_RGBA8Snorm;
@@ -84,6 +94,26 @@ static WGPUTextureFormat get_host_format(PGRAPHWgpuState *r,
     default:
         return WGPUTextureFormat_RGBA8Unorm;
     }
+}
+
+/* BC is 2D, and the base level must be a multiple of the 4x4 block unless
+ * the adapter has texture-compression-unaligned, which we do not request.
+ * Anything else stays on s3tc_decompress. */
+static WGPUTextureFormat texture_host_format(PGRAPHWgpuState *r,
+                                             const TextureShape *s,
+                                             const WgpuColorFormatInfo *f,
+                                             unsigned int width,
+                                             unsigned int height)
+{
+    WGPUTextureFormat format = get_host_format(r, f);
+
+    if (!format_is_bc(format)) {
+        return format;
+    }
+    if (!s || s->dimensionality != 2 || width % 4 || height % 4) {
+        return WGPUTextureFormat_RGBA8Unorm;
+    }
+    return format;
 }
 
 static unsigned int get_host_texel_size(WGPUTextureFormat format)
@@ -693,6 +723,44 @@ static void write_level(PGRAPHState *pg, WGPUTexture texture,
                     src, src_pitch);
 }
 
+static void write_bc_level(PGRAPHWgpuState *r, WGPUTexture texture,
+                           WGPUTextureFormat format, unsigned int layer,
+                           unsigned int level, unsigned int width,
+                           unsigned int height, const uint8_t *src)
+{
+    unsigned int block_bytes =
+        format == WGPUTextureFormat_BC1RGBAUnorm ? 8 : 16;
+    unsigned int blocks_x = (width + 3) / 4;
+    unsigned int blocks_y = (height + 3) / 4;
+    unsigned int row_bytes = blocks_x * block_bytes;
+    unsigned int stride = ROUND_UP(row_bytes, 256);
+    size_t size = (size_t)stride * blocks_y;
+    g_autofree uint8_t *padded = NULL;
+    const uint8_t *data = src;
+
+    if (stride != row_bytes) {
+        padded = g_malloc0(size);
+        for (unsigned int row = 0; row < blocks_y; row++) {
+            memcpy(padded + (size_t)row * stride, src + (size_t)row * row_bytes,
+                   row_bytes);
+        }
+        data = padded;
+    }
+
+    WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+    dst.texture = texture;
+    dst.mipLevel = level;
+    dst.origin.z = layer;
+
+    WGPUTexelCopyBufferLayout layout = WGPU_TEXEL_COPY_BUFFER_LAYOUT_INIT;
+    layout.bytesPerRow = stride;
+    layout.rowsPerImage = blocks_y;
+
+    /* Physical size: a 2x2 mip is still one 4x4 block. */
+    WGPUExtent3D extent = { blocks_x * 4, blocks_y * 4, 1 };
+    wgpuQueueWriteTexture(r->queue, &dst, data, size, &layout, &extent);
+}
+
 static void init_texture_decode(PGRAPHWgpuState *r)
 {
     WGPUBindGroupLayoutEntry entries[3];
@@ -861,7 +929,6 @@ static void upload_texture_data(PGRAPHState *pg, TextureBinding *binding)
     BasicColorFormatInfo f = kelvin_color_format_info_map[s.color_format];
     const WgpuColorFormatInfo *wf =
         &kelvin_color_format_wgpu_map[s.color_format];
-    WGPUTextureFormat format = get_host_format(r, wf);
     unsigned int decode_size = get_decode_texel_size(wf->decode);
     WGPUTexture texture = binding->texture;
 
@@ -874,6 +941,8 @@ static void upload_texture_data(PGRAPHState *pg, TextureBinding *binding)
 
     unsigned int adjusted_width, adjusted_height, adjusted_depth;
     get_texture_size(&s, &adjusted_width, &adjusted_height, &adjusted_depth);
+    WGPUTextureFormat format = wgpuTextureGetFormat(texture);
+    bool upload_bc = format_is_bc(format);
 
     if (f.linear) {
         assert(s.pitch % f.bytes_per_pixel == 0 &&
@@ -905,7 +974,14 @@ static void upload_texture_data(PGRAPHState *pg, TextureBinding *binding)
                 width = MAX(width, 1);
                 height = MAX(height, 1);
 
-                if (is_compressed) {
+                if (is_compressed && upload_bc) {
+                    unsigned int physical_width = (width + 3) & ~3,
+                                 physical_height = (height + 3) & ~3;
+                    write_bc_level(r, texture, format, layer, level, width,
+                                   height, src);
+                    src +=
+                        physical_width / 4 * physical_height / 4 * block_size;
+                } else if (is_compressed) {
                     unsigned int physical_width = (width + 3) & ~3,
                                  physical_height = (height + 3) & ~3;
                     g_autofree uint8_t *converted = s3tc_decompress_2d(
@@ -998,7 +1074,7 @@ static void create_texture_object(PGRAPHWgpuState *r, TextureBinding *binding)
     WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
     desc.label = pgraph_wgpu_str(label);
     desc.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
-    desc.format = get_host_format(r, wf);
+    desc.format = texture_host_format(r, s, wf, width, height);
     desc.mipLevelCount = f.linear ? 1 : s->levels;
     desc.size = (WGPUExtent3D){ width, height, 1 };
 
