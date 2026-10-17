@@ -69,6 +69,11 @@ What exists:
   vertex format. Other attributes are still packed on the CPU. Packed
   texture texels are expanded by a compute shader; palette, YUV, DXT and
   unswizzle stay on the CPU.
+- `tests/wasm/webgpu-offscreen-spike` is a standalone emdawnwebgpu program,
+  built with emsdk 6.0.12. A pthread other than the page thread creates a
+  device and clears a transferred `OffscreenCanvas`. It is not an xemu
+  build. See the phase 5 browser step 1 notes in
+  [webgpu-renderer-plan.md](webgpu-renderer-plan.md#implementation-status).
 
 What blocks an xemu WASM build today:
 

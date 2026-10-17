@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <title>WebGPU OffscreenCanvas spike</title>
+    <style>
+      body { font-family: sans-serif; background: #1c1c1c; color: #eee; }
+      canvas { background: #400; display: block; }
+      pre { white-space: pre-wrap; }
+    </style>
+  </head>
+  <body>
+    <div id="status">Downloading...</div>
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <pre id="spike-result">running</pre>
+    <script type="text/javascript">
+      var statusElement = document.getElementById('status');
+      var canvasElement = document.getElementById('canvas');
+      function setStatus(text) {
+        statusElement.textContent = text;
+      }
+#if MODULARIZE && !EXPORT_ES6
+      var moduleArgs = {
+#else
+      var Module = {
+#endif
+        print(...args) {
+          console.log(...args);
+        },
+        canvas: canvasElement,
+        setStatus: setStatus
+      };
+      setStatus('Downloading...');
+      window.onerror = window.onunhandledrejection = (event) => {
+        var message = event && (event.message || event.reason) || 'exception';
+        setStatus('Exception: ' + message);
+        var result = document.getElementById('spike-result');
+        if (result && result.textContent === 'running') {
+          result.textContent = 'exception: ' + message;
+        }
+      };
+    </script>
+    {{{ SCRIPT }}}
+#if MODULARIZE && !EXPORT_ES6
+    <script type="text/javascript">
+      {{{ EXPORT_NAME }}}(moduleArgs);
+    </script>
+#endif
+  </body>
+</html>
