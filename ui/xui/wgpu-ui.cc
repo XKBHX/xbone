@@ -48,6 +48,10 @@ static WGPUTexture g_white;
 static WGPUTextureView g_white_view;
 static ImTextureID g_white_id;
 static std::vector<GlImage> g_gl_images;
+static std::vector<uint64_t> g_ui_textures;
+
+static bool is_ui_texture(ImTextureID id);
+static bool g_scene_drawn;
 
 static GLuint g_overlay_program;
 static GLuint g_overlay_vao;
@@ -171,7 +175,7 @@ static void release_gl_images(void)
 static bool create_overlay_gl(void)
 {
     static const char *vs_src =
-        "#version 150\n"
+        "#version 150 core\n"
         "in vec2 a_pos;\n"
         "in vec2 a_uv;\n"
         "out vec2 v_uv;\n"
@@ -180,7 +184,7 @@ static bool create_overlay_gl(void)
         "    gl_Position = vec4(a_pos, 0.0, 1.0);\n"
         "}\n";
     static const char *fs_src =
-        "#version 150\n"
+        "#version 150 core\n"
         "in vec2 v_uv;\n"
         "out vec4 frag;\n"
         "uniform sampler2D u_tex;\n"
@@ -195,7 +199,7 @@ static bool create_overlay_gl(void)
     GLuint vs = glCreateShader(GL_VERTEX_SHADER);
     GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
     GLint ok = 0;
-    char log[512];
+    char log[512] = { 0 };
     GLsizei len = 0;
 
     glShaderSource(vs, 1, &vs_src, NULL);
@@ -507,6 +511,9 @@ static void bind_draw_textures(ImDrawData *draw_data)
                 cmd->TextureId = g_white_id;
                 continue;
             }
+            if (is_ui_texture(cmd->TextureId)) {
+                continue;
+            }
             cmd->TextureId = upload_gl_texture((GLuint)cmd->TextureId);
         }
     }
@@ -563,8 +570,20 @@ static void pop_error_callback(WGPUPopErrorScopeStatus status,
     }
 }
 
+static bool is_ui_texture(ImTextureID id)
+{
+    uint64_t key = (uint64_t)id;
+
+    for (uint64_t stored : g_ui_textures) {
+        if (stored == key) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void draw_overlay(const void *pixels, int width, int height,
-                         uint32_t stride)
+                         uint32_t stride, bool blend_over)
 {
     GLboolean blend = glIsEnabled(GL_BLEND);
     GLboolean depth = glIsEnabled(GL_DEPTH_TEST);
@@ -592,8 +611,12 @@ static void draw_overlay(const void *pixels, int width, int height,
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_CULL_FACE);
     glDisable(GL_SCISSOR_TEST);
+    if (blend_over) {
     glEnable(GL_BLEND);
     glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+    } else {
+        glDisable(GL_BLEND);
+    }
     glViewport(0, 0, width, height);
     glUseProgram(g_overlay_program);
     glBindVertexArray(g_overlay_vao);
@@ -602,7 +625,9 @@ static void draw_overlay(const void *pixels, int width, int height,
     glUseProgram(0);
 
     glBlendFunc(blend_src, blend_dst);
-    if (!blend) {
+    if (blend) {
+        glEnable(GL_BLEND);
+    } else {
         glDisable(GL_BLEND);
     }
     if (depth) {
@@ -667,7 +692,8 @@ bool xemu_wgpu_ui_init(SDL_Window *window)
     device_cb.mode = WGPUCallbackMode_WaitAnyOnly;
     device_cb.callback = request_device_callback;
     device_cb.userdata1 = &device_request;
-    if (!wait_future(wgpuAdapterRequestDevice(g_adapter, &device_desc,
+    if (!wait_future(
+            wgpuAdapterRequestDevice(g_adapter, &device_desc,
                                               device_cb)) ||
         device_request.status != WGPURequestDeviceStatus_Success) {
         fprintf(stderr, "[WebGPU] UI device request failed: %s\n",
@@ -704,6 +730,8 @@ bool xemu_wgpu_ui_init(SDL_Window *window)
 void xemu_wgpu_ui_shutdown(void)
 {
     g_active = false;
+    g_scene_drawn = false;
+    g_ui_textures.clear();
     if (ImGui::GetCurrentContext() &&
         ImGui::GetIO().BackendRendererUserData) {
         ImGui_ImplWGPU_Shutdown();
@@ -750,19 +778,74 @@ void xemu_wgpu_ui_rebuild_fonts(void)
     }
 }
 
+WGPUDevice xemu_wgpu_ui_device(void)
+{
+    return g_device;
+}
+
+WGPUQueue xemu_wgpu_ui_queue(void)
+{
+    return g_queue;
+}
+
+WGPUInstance xemu_wgpu_ui_instance(void)
+{
+    return g_instance;
+}
+
+WGPUTextureView xemu_wgpu_ui_prepare_target(int width, int height)
+{
+    if (!g_active || width <= 0 || height <= 0 ||
+        !ensure_target(width, height)) {
+        return NULL;
+    }
+    return g_target_view;
+}
+
+void xemu_wgpu_ui_mark_scene(void)
+{
+    g_scene_drawn = true;
+}
+
+void xemu_wgpu_ui_register_texture(uint64_t id)
+{
+    if (id) {
+        g_ui_textures.push_back(id);
+    }
+}
+
+void xemu_wgpu_ui_unregister_texture(uint64_t id)
+{
+    for (size_t i = 0; i < g_ui_textures.size(); i++) {
+        if (g_ui_textures[i] == id) {
+            g_ui_textures.erase(g_ui_textures.begin() + i);
+            return;
+        }
+    }
+}
+
 void xemu_wgpu_ui_render(void)
 {
     ImDrawData *draw_data = ImGui::GetDrawData();
     int width;
     int height;
+    bool scene = g_scene_drawn;
+    bool same_target;
+
+    g_scene_drawn = false;
 
     if (!g_active || !draw_data) {
         return;
     }
     width = (int)(draw_data->DisplaySize.x * draw_data->FramebufferScale.x);
     height = (int)(draw_data->DisplaySize.y * draw_data->FramebufferScale.y);
+    same_target =
+        g_target && g_target_width == width && g_target_height == height;
     if (width <= 0 || height <= 0 || !ensure_target(width, height)) {
         return;
+    }
+    if (!same_target) {
+        scene = false;
     }
 
     wgpuDevicePushErrorScope(g_device, WGPUErrorFilter_Validation);
@@ -778,7 +861,7 @@ void xemu_wgpu_ui_render(void)
         wgpuDeviceCreateCommandEncoder(g_device, &encoder_desc);
 
     color.view = g_target_view;
-    color.loadOp = WGPULoadOp_Clear;
+    color.loadOp = scene ? WGPULoadOp_Load : WGPULoadOp_Clear;
     color.storeOp = WGPUStoreOp_Store;
     color.clearValue = WGPUColor{ 0, 0, 0, 0 };
     pass_desc.label = wgpu_label("ImGui");
@@ -820,7 +903,7 @@ void xemu_wgpu_ui_render(void)
         const void *pixels =
             wgpuBufferGetConstMappedRange(g_readback, 0, bytes);
         if (pixels) {
-            draw_overlay(pixels, width, height, g_target_stride);
+            draw_overlay(pixels, width, height, g_target_stride, !scene);
         }
         wgpuBufferUnmap(g_readback);
     }

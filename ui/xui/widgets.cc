@@ -538,7 +538,7 @@ void Logo()
     }
 
     logo_fbo->Target();
-    ImTextureID id = (ImTextureID)(intptr_t)logo_fbo->Texture();
+    ImTextureID id = logo_fbo->Texture();
     float t_w = 256.0;
     float t_h = 256.0;
     float x_off = 0;

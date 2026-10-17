@@ -24,7 +24,7 @@ xemu_ss.add(files(
 ))
 
 if webgpu.found()
-  xemu_ss.add(webgpu, files('wgpu-ui.cc'))
+  xemu_ss.add(webgpu, files('wgpu-ui.cc', 'wgpu-helpers.cc'))
 endif
 
 if host_os == 'windows'

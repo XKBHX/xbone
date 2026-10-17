@@ -3,6 +3,7 @@ shaders = [
   ['texture-blit', 'vert'],
   ['texture-blit-flip', 'vert'],
   ['xemu-logo', 'frag'],
+  ['ui-widgets', 'wgsl'],
 ]
 
 foreach e : shaders
