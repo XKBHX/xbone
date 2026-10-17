@@ -152,6 +152,7 @@ static void pgraph_wgpu_finalize(NV2AState *d)
 static void pgraph_wgpu_flip_stall(NV2AState *d)
 {
     pgraph_wgpu_finish(&d->pgraph, WGPU_FINISH_REASON_FLIP_STALL, true);
+    xemu_wgpu_wait_frame();
 }
 
 static void pgraph_wgpu_pre_savevm_trigger(NV2AState *d)

@@ -32,7 +32,8 @@ What exists:
 - `configure` maps the Emscripten toolchain to `host_os=emscripten`,
   `cpu=wasm32`; `meson.build` lists both as supported.
 - `configs/meson/emscripten.txt` sets link flags: `-pthread`,
-  `-sASYNCIFY=1`, `-sPROXY_TO_PTHREAD=1`, `-sOFFSCREENCANVAS_SUPPORT=1`,
+  `-sASYNCIFY=1`, `-sASYNCIFY_STACK_SIZE=65536`, `-sPROXY_TO_PTHREAD=1`,
+  `-sOFFSCREENCANVAS_SUPPORT=1`, `-sASYNCIFY_IMPORTS=ffi_call_js,emwgpuWaitAny`,
   `-sTOTAL_MEMORY=2GB`, `-sWASM_BIGINT`, `-sEXPORT_ES6=1`, and others.
   `OFFSCREENCANVAS_SUPPORT` pulls in the GL library so Emscripten can
   transfer `#canvas`. The WebGPU present does not draw with WebGL.
@@ -77,7 +78,10 @@ What exists:
   device and clears a transferred `OffscreenCanvas`. It is not an xemu
   build. `tests/wasm/webgpu-canvas-present` links the same `canvas.c` the
   renderer uses and draws a stand-in scanout plus a UI quad into that
-  canvas. See the phase 5 browser notes in
+  canvas. A pending `wgpuInstanceWaitAny` suspends through Asyncify.
+  The same present test linked with JSPI suspends that way instead.
+  xemu stays on Asyncify because its coroutine fibers use Asyncify
+  stacks. See the phase 5 browser notes in
   [webgpu-renderer-plan.md](webgpu-renderer-plan.md#implementation-status).
 
 `build/wasm/xemu/qemu-system-i386.js` links with the local emsdk 6.0.12,

@@ -251,6 +251,7 @@ static void destroy_texture(WGPUTexture *texture, WGPUTextureView *view)
     }
 }
 
+#ifndef __EMSCRIPTEN__
 static void log_shared_failure(const char *why)
 {
     static int logged;
@@ -264,6 +265,7 @@ static void log_shared_failure(const char *why)
             "back\n",
             why);
 }
+#endif
 
 #ifndef __EMSCRIPTEN__
 #ifdef __linux__
@@ -941,6 +943,7 @@ static void upload_pvideo_image(PGRAPHState *pg, const PvideoState *state)
                           &layout, &extent);
 }
 
+#ifndef __EMSCRIPTEN__
 static void ensure_readback(PGRAPHWgpuState *r, uint64_t size)
 {
     WgpuDisplayState *disp = &r->display;
@@ -1014,6 +1017,7 @@ static bool readback_display(PGRAPHState *pg)
     pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_PRESENTING, false);
     return map_display_readback(pg);
 }
+#endif
 
 static void update_bind_group(PGRAPHWgpuState *r, WGPUTextureView frame)
 {
@@ -1415,7 +1419,12 @@ void pgraph_wgpu_render_display(PGRAPHState *pg)
         pgraph_wgpu_finish(pg, WGPU_FINISH_REASON_PRESENTING, false);
         return;
     }
+#ifdef __EMSCRIPTEN__
+    /* The canvas is the present. Guest RAM is not a copy of this image. */
+    return;
+#else
     disp->pixels_valid = readback_display(pg);
+#endif
 }
 
 #ifdef CONFIG_OPENGL

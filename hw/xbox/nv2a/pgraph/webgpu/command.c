@@ -11,6 +11,7 @@
 
 #include "qemu/osdep.h"
 #include "renderer.h"
+#include "ui/xui/wgpu-ui-pfifo.h"
 
 static const enum NV2A_PROF_COUNTERS_ENUM finish_reason_to_counter_enum[] = {
     [WGPU_FINISH_REASON_VERTEX_BUFFER_DIRTY] =
@@ -94,7 +95,9 @@ void pgraph_wgpu_finish(PGRAPHState *pg, WgpuFinishReason why, bool wait)
         r->submit_count++;
     }
 
-    if (wait) {
+    /* The occlusion map waits for this submit. Idling first would suspend
+     * again for the same GPU work. */
+    if (wait && !r->occlusion_readback_pending) {
         pgraph_wgpu_wait_idle(r);
     }
 
@@ -127,6 +130,7 @@ const void *pgraph_wgpu_read_buffer(PGRAPHWgpuState *r, WGPUBuffer buffer,
     callback.mode = WGPUCallbackMode_WaitAnyOnly;
     callback.callback = buffer_map_callback;
     callback.userdata1 = &state;
+    xemu_wgpu_note_download();
     WGPUFuture future =
         wgpuBufferMapAsync(buffer, WGPUMapMode_Read, 0, size, callback);
     if (!pgraph_wgpu_wait(r, future) ||

@@ -13,6 +13,11 @@
 #include "qapi/error.h"
 #include "renderer.h"
 #include "ui/xemu-settings.h"
+#include "ui/xui/wgpu-ui-pfifo.h"
+
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
 
 #ifndef __EMSCRIPTEN__
 struct WgpuBlobCache {
@@ -123,6 +128,120 @@ typedef struct RequestDeviceState {
     char *message;
 } RequestDeviceState;
 
+#ifdef __EMSCRIPTEN__
+#define WGPU_WAIT_LOG_FRAMES 60
+
+typedef struct WgpuWaitStats {
+    uint32_t frames;
+    uint64_t frame_suspends;
+    uint64_t frame_downloads;
+    double frame_suspend_ms;
+    bool logged_first;
+} WgpuWaitStats;
+
+static WgpuWaitStats wgpu_wait_stats;
+
+static const char *wgpu_wait_backend(void)
+{
+    int mode = emscripten_has_asyncify();
+
+    if (mode == 2) {
+        return "JSPI";
+    }
+    if (mode == 1) {
+        return "Asyncify";
+    }
+    return "none";
+}
+
+static void wgpu_wait_account(bool suspended, double ms)
+{
+    if (!suspended) {
+        return;
+    }
+    wgpu_wait_stats.frame_suspends++;
+    wgpu_wait_stats.frame_suspend_ms += ms;
+    if (!wgpu_wait_stats.logged_first) {
+        wgpu_wait_stats.logged_first = true;
+        fprintf(stderr, "[WebGPU] First suspending wait: %.1f ms (%s)\n", ms,
+                wgpu_wait_backend());
+    }
+}
+#else
+static void wgpu_wait_account(bool suspended, double ms)
+{
+    (void)suspended;
+    (void)ms;
+}
+#endif
+
+bool xemu_wgpu_wait(WGPUInstance instance, WGPUFuture future)
+{
+    WGPUFutureWaitInfo info = WGPU_FUTURE_WAIT_INFO_INIT;
+    WGPUWaitStatus status;
+#ifdef __EMSCRIPTEN__
+    double start_ms;
+#endif
+
+    if (!instance) {
+        return false;
+    }
+
+    /* timeout 0 does not enter emwgpuWaitAny, so a future that has already
+     * resolved does not unwind the worker. */
+    info.future = future;
+    status = wgpuInstanceWaitAny(instance, 1, &info, 0);
+    if (status == WGPUWaitStatus_Success && info.completed) {
+        return true;
+    }
+
+#ifdef __EMSCRIPTEN__
+    if (!emscripten_has_asyncify()) {
+        fprintf(stderr, "[WebGPU] Wait failed: Asyncify or JSPI is required\n");
+        return false;
+    }
+    start_ms = emscripten_get_now();
+#endif
+    info.completed = false;
+    status = wgpuInstanceWaitAny(instance, 1, &info, UINT64_MAX);
+#ifdef __EMSCRIPTEN__
+    wgpu_wait_account(true, emscripten_get_now() - start_ms);
+#else
+    wgpu_wait_account(true, 0);
+#endif
+    if (status != WGPUWaitStatus_Success || !info.completed) {
+        fprintf(stderr, "[WebGPU] Wait failed (%d)\n", status);
+        return false;
+    }
+    return true;
+}
+
+void xemu_wgpu_note_download(void)
+{
+#ifdef __EMSCRIPTEN__
+    wgpu_wait_stats.frame_downloads++;
+#endif
+}
+
+void xemu_wgpu_wait_frame(void)
+{
+#ifdef __EMSCRIPTEN__
+    wgpu_wait_stats.frames++;
+    if (wgpu_wait_stats.frames % WGPU_WAIT_LOG_FRAMES != 0) {
+        return;
+    }
+    fprintf(stderr,
+            "[WebGPU] Wait: %u frames, %" PRIu64 " suspends, %.1f ms, %" PRIu64
+            " downloads (%s)\n",
+            WGPU_WAIT_LOG_FRAMES, wgpu_wait_stats.frame_suspends,
+            wgpu_wait_stats.frame_suspend_ms, wgpu_wait_stats.frame_downloads,
+            wgpu_wait_backend());
+    wgpu_wait_stats.frame_suspends = 0;
+    wgpu_wait_stats.frame_downloads = 0;
+    wgpu_wait_stats.frame_suspend_ms = 0;
+#endif
+}
+
 static char *pgraph_wgpu_string_dup(WGPUStringView string)
 {
     if (!string.data) {
@@ -166,11 +285,8 @@ static WGPUAdapter request_adapter(WGPUInstance instance, Error **errp)
     callback.callback = request_adapter_callback;
     callback.userdata1 = &state;
     wait_info.future = wgpuInstanceRequestAdapter(instance, &options, callback);
-    WGPUWaitStatus wait_status =
-        wgpuInstanceWaitAny(instance, 1, &wait_info, UINT64_MAX);
-
-    if (wait_status != WGPUWaitStatus_Success) {
-        error_setg(errp, "Waiting for WebGPU adapter failed (%d)", wait_status);
+    if (!xemu_wgpu_wait(instance, wait_info.future)) {
+        error_setg(errp, "Waiting for WebGPU adapter failed");
     } else if (state.status != WGPURequestAdapterStatus_Success) {
         error_setg(errp, "WebGPU adapter request failed: %s", state.message);
     }
@@ -312,11 +428,8 @@ static WGPUDevice request_device(PGRAPHWgpuState *r, Error **errp)
     callback.callback = request_device_callback;
     callback.userdata1 = &state;
     wait_info.future = wgpuAdapterRequestDevice(adapter, &descriptor, callback);
-    WGPUWaitStatus wait_status =
-        wgpuInstanceWaitAny(instance, 1, &wait_info, UINT64_MAX);
-
-    if (wait_status != WGPUWaitStatus_Success) {
-        error_setg(errp, "Waiting for WebGPU device failed (%d)", wait_status);
+    if (!xemu_wgpu_wait(instance, wait_info.future)) {
+        error_setg(errp, "Waiting for WebGPU device failed");
     } else if (state.status != WGPURequestDeviceStatus_Success) {
         error_setg(errp, "WebGPU device request failed: %s", state.message);
     }
@@ -428,16 +541,7 @@ static void log_adapter(WGPUAdapter adapter)
 
 bool pgraph_wgpu_wait(PGRAPHWgpuState *r, WGPUFuture future)
 {
-    WGPUFutureWaitInfo wait_info = WGPU_FUTURE_WAIT_INFO_INIT;
-
-    wait_info.future = future;
-    WGPUWaitStatus status =
-        wgpuInstanceWaitAny(r->instance, 1, &wait_info, UINT64_MAX);
-    if (status != WGPUWaitStatus_Success) {
-        fprintf(stderr, "[WebGPU] Wait failed (%d)\n", status);
-        return false;
-    }
-    return true;
+    return xemu_wgpu_wait(r->instance, future);
 }
 
 typedef struct ErrorScopeState {
@@ -509,6 +613,13 @@ bool pgraph_wgpu_init_instance(PGRAPHState *pg, Error **errp)
 
     descriptor.requiredFeatureCount = ARRAY_SIZE(instance_features);
     descriptor.requiredFeatures = instance_features;
+#ifdef __EMSCRIPTEN__
+    if (!emscripten_has_asyncify()) {
+        error_setg(errp, "WebGPU timed waits need Asyncify or JSPI");
+        return false;
+    }
+    fprintf(stderr, "[WebGPU] Blocking waits: %s\n", wgpu_wait_backend());
+#endif
     r->instance = wgpuCreateInstance(&descriptor);
     if (!r->instance) {
         error_setg(errp, "Failed to create WebGPU instance");

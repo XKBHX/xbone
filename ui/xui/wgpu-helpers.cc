@@ -19,6 +19,7 @@
 #include "wgpu-ui.hh"
 
 #include "ui/shader/ui-widgets-wgsl.h"
+#include "ui/xui/wgpu-ui-pfifo.h"
 
 #include "data/controller_mask.png.h"
 #include "data/controller_mask_s.png.h"
@@ -216,14 +217,11 @@ static void copy_message(char *dst, size_t dst_size, WGPUStringView message)
 static bool wait_future(WGPUFuture future)
 {
     WGPUInstance instance = xemu_wgpu_ui_instance();
-    WGPUFutureWaitInfo info = WGPU_FUTURE_WAIT_INFO_INIT;
 
     if (!instance) {
         return false;
     }
-    info.future = future;
-    return wgpuInstanceWaitAny(instance, 1, &info, UINT64_MAX) ==
-           WGPUWaitStatus_Success;
+    return xemu_wgpu_wait(instance, future);
 }
 
 struct IdleState {
@@ -1711,6 +1709,7 @@ void wgpu_helpers_run_png(WGPUTextureView display)
     map_callback.mode = WGPUCallbackMode_WaitAnyOnly;
     map_callback.callback = buffer_map_callback;
     map_callback.userdata1 = &map_state;
+    xemu_wgpu_note_download();
     if (!wait_future(wgpuBufferMapAsync(g_png_readback, WGPUMapMode_Read, 0,
                                         bytes, map_callback)) ||
         map_state.status != WGPUMapAsyncStatus_Success) {

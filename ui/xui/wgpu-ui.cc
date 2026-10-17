@@ -106,11 +106,7 @@ static void copy_message(char *dst, size_t dst_size, WGPUStringView message)
 
 static bool wait_future(WGPUFuture future)
 {
-    WGPUFutureWaitInfo info = WGPU_FUTURE_WAIT_INFO_INIT;
-
-    info.future = future;
-    return wgpuInstanceWaitAny(g_instance, 1, &info, UINT64_MAX) ==
-           WGPUWaitStatus_Success;
+    return xemu_wgpu_wait(g_instance, future);
 }
 
 static uint32_t align_row(uint32_t row_bytes)
@@ -861,7 +857,11 @@ static void record_imgui(bool scene)
     }
     translate_draw_textures(draw_data);
 
-    wgpuDevicePushErrorScope(g_device, WGPUErrorFilter_Validation);
+    /* The canvas has no pixel readback. An error-scope wait would suspend
+     * the worker on every present. Uncaptured errors still log. */
+    if (!to_canvas) {
+        wgpuDevicePushErrorScope(g_device, WGPUErrorFilter_Validation);
+    }
 
     WGPUCommandEncoderDescriptor encoder_desc =
         WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT;
@@ -915,6 +915,7 @@ static void record_imgui(bool scene)
         map_cb.mode = WGPUCallbackMode_WaitAnyOnly;
         map_cb.callback = buffer_map_callback;
         map_cb.userdata1 = &map_state;
+        xemu_wgpu_note_download();
         if (wait_future(wgpuBufferMapAsync(g_readback, WGPUMapMode_Read, 0,
                                            bytes, map_cb)) &&
             map_state.status == WGPUMapAsyncStatus_Success) {
@@ -933,15 +934,18 @@ static void record_imgui(bool scene)
         }
     }
 
-    ErrorState error_state = {};
-    WGPUPopErrorScopeCallbackInfo pop_cb =
-        WGPU_POP_ERROR_SCOPE_CALLBACK_INFO_INIT;
-    pop_cb.mode = WGPUCallbackMode_WaitAnyOnly;
-    pop_cb.callback = pop_error_callback;
-    pop_cb.userdata1 = &error_state;
-    if (wait_future(wgpuDevicePopErrorScope(g_device, pop_cb)) &&
-        error_state.type != WGPUErrorType_NoError) {
-        fprintf(stderr, "[WebGPU] UI validation: %s\n", error_state.message);
+    if (!to_canvas) {
+        ErrorState error_state = {};
+        WGPUPopErrorScopeCallbackInfo pop_cb =
+            WGPU_POP_ERROR_SCOPE_CALLBACK_INFO_INIT;
+        pop_cb.mode = WGPUCallbackMode_WaitAnyOnly;
+        pop_cb.callback = pop_error_callback;
+        pop_cb.userdata1 = &error_state;
+        if (wait_future(wgpuDevicePopErrorScope(g_device, pop_cb)) &&
+            error_state.type != WGPUErrorType_NoError) {
+            fprintf(stderr, "[WebGPU] UI validation: %s\n",
+                    error_state.message);
+        }
     }
 }
 

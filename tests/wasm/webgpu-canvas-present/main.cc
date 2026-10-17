@@ -13,6 +13,8 @@
  * thread uses hw/xbox/nv2a/pgraph/webgpu/canvas.c to bind the canvas,
  * samples a stand-in PCRTC texture into the current texture, then
  * draws a UI quad on top. wgpuSurfacePresent is not called.
+ * The report also times eight write-then-map waits. Link with -sJSPI=1
+ * instead of -sASYNCIFY=1 to time JavaScript Promise Integration.
  *
  * Build (emsdk 4.0.10 or newer):
  *
@@ -78,6 +80,8 @@ static const char k_ui_wgsl[] =
 
 static char g_report[4096];
 static int g_ok;
+static int g_suspends;
+static double g_suspend_ms;
 
 static void report_append(const char *text)
 {
@@ -168,9 +172,18 @@ static int wait_future(WGPUInstance instance, WGPUFuture future,
 {
     WGPUFutureWaitInfo info = WGPU_FUTURE_WAIT_INFO_INIT;
     WGPUWaitStatus status;
+    double start_ms;
 
     info.future = future;
+    status = wgpuInstanceWaitAny(instance, 1, &info, 0);
+    if (status == WGPUWaitStatus_Success && info.completed) {
+        return 1;
+    }
+    start_ms = emscripten_get_now();
+    info.completed = false;
     status = wgpuInstanceWaitAny(instance, 1, &info, UINT64_MAX);
+    g_suspend_ms += emscripten_get_now() - start_ms;
+    g_suspends++;
     if (status != WGPUWaitStatus_Success || !info.completed) {
         report_append(what);
         report_fmt(" wait failed (%d)\n", status);
@@ -447,6 +460,51 @@ static int present_frame(WGPUInstance instance, WGPUAdapter adapter,
     report_fmt(" g=%d", ug);
     report_fmt(" b=%d", ub);
     report_fmt(" a=%d\n", ua);
+
+    /* Eight write-then-map cycles while the device is still current.
+     * Each pending map suspends once. The write size is a multiple of 4. */
+    {
+        WGPUBufferDescriptor copy_desc = WGPU_BUFFER_DESCRIPTOR_INIT;
+        WGPUBuffer copy_buf;
+        int suspends_before = g_suspends;
+        double ms_before = g_suspend_ms;
+        uint8_t bytes[4] = { 7, 7, 7, 7 };
+
+        copy_desc.size = 256;
+        copy_desc.usage = WGPUBufferUsage_CopyDst | WGPUBufferUsage_MapRead;
+        copy_buf = wgpuDeviceCreateBuffer(device, &copy_desc);
+        if (!copy_buf) {
+            report_append("copy buffer create failed\n");
+            wgpu_canvas_fini(&canvas);
+            return 0;
+        }
+        for (int i = 0; i < 8; i++) {
+            WGPUBufferMapCallbackInfo map_info =
+                WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
+            WaitState mapped = { 0 };
+
+            wgpuQueueWriteBuffer(queue, copy_buf, 0, bytes, sizeof(bytes));
+            map_info.mode = WGPUCallbackMode_WaitAnyOnly;
+            map_info.callback = on_map;
+            map_info.userdata1 = &mapped;
+            if (!wait_future(instance,
+                             wgpuBufferMapAsync(copy_buf, WGPUMapMode_Read, 0,
+                                                256, map_info),
+                             "copy map")) {
+                wgpuBufferRelease(copy_buf);
+                wgpu_canvas_fini(&canvas);
+                return 0;
+            }
+            wgpuBufferUnmap(copy_buf);
+        }
+        wgpuBufferRelease(copy_buf);
+        report_fmt("asyncify=%d\n", emscripten_has_asyncify());
+        report_fmt("copy_suspends=%d\n", g_suspends - suspends_before);
+        report_fmt("copy_ms=%d\n", (int)(g_suspend_ms - ms_before + 0.5));
+        report_fmt("suspends=%d\n", g_suspends);
+        report_fmt("suspend_ms=%d\n", (int)(g_suspend_ms + 0.5));
+    }
+
     wgpuBufferRelease(center_buf);
     wgpuBufferRelease(corner_buf);
     wgpuBindGroupRelease(bind);
