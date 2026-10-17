@@ -17,10 +17,11 @@ manual under `docs/` (which only builds `.rst`).
 ## Current WASM status in this tree
 
 The tree inherits upstream QEMU's Emscripten host support and adds a native
-WebAssembly TCG backend. When `display.renderer` is `WEBGPU`, Dear ImGui
-draws through Dawn on the UI thread and is composited over the OpenGL
-window. The rest of the UI is still OpenGL. A WebGPU NV2A renderer runs
-natively (Dawn); see the status table in
+WebAssembly TCG backend. When `display.renderer` is `WEBGPU`, Dear ImGui,
+the logo, controller and memory-unit art, the icon, and the scaled gamma
+blit run on a Dawn device on the UI thread. That image is read back into
+the OpenGL window. Snapshot thumbnails are still OpenGL. A WebGPU NV2A
+renderer runs natively (Dawn); see the status table in
 [webgpu-renderer-plan.md](webgpu-renderer-plan.md#implementation-status).
 
 What exists:
@@ -45,10 +46,10 @@ What exists:
   (polygon modes and the flat-shading provoking vertex), point size and
   point sprites, surface pack and unpack, copies of a render target into
   a texture, the PCRTC/PVIDEO display composite, ZPASS occlusion queries,
-  and the surface scale factor. The composite is shared into the GL texture
-  the UI already samples when the platform can import it (an IOSurface on
-  macOS, a dma-buf on Linux, a DXGI shared handle on Windows). Otherwise it
-  is read back. Every shader module is WGSL. Draw
+  and the surface scale factor. The composite is shared into a GL texture
+  when the platform can import it (an IOSurface on macOS, a dma-buf on
+  Linux, a DXGI shared handle on Windows). Otherwise it is read back. The
+  WebGPU UI uploads that texture to its own device for the gamma blit. Every shader module is WGSL. Draw
   shaders are translated from the GLSL generator. Pack, unpack, clears,
   depth upload, texture upload, and the display composite are written in
   WGSL. The WebGPU
@@ -68,10 +69,12 @@ What exists:
 What blocks an xemu WASM build today:
 
 - `epoxy` (OpenGL loader) is declared `required: true` in `meson.build`. The
-  xemu UI (`ui/xemu.c`, `ui/xui/`) is SDL3 + OpenGL. Dear ImGui uses its
-  WebGPU backend when the NV2A renderer is WebGPU, and the OpenGL3 backend
-  otherwise. The framebuffer blit, menus art, and the rest of `ui/xui/` are
-  still OpenGL and are linked unconditionally.
+  xemu UI (`ui/xemu.c`, `ui/xui/`) is SDL3 + OpenGL. When the NV2A renderer
+  is WebGPU, Dear ImGui and the HUD art draw on a UI-thread Dawn device and
+  the result is read back into the OpenGL window. OpenGL and Vulkan keep
+  the OpenGL3 backend and the GLSL HUD shaders. Snapshot thumbnails, the
+  VGA fallback, and the other direct GL users in `ui/xemu.c` and `ui/xui/`
+  are still OpenGL and are linked unconditionally.
 - Both GPU renderers (`hw/xbox/nv2a/pgraph/gl`, `.../vk`) need desktop
   OpenGL. The Vulkan renderer still shows its frames through OpenGL by
   importing them with `GL_EXT_memory_object`.

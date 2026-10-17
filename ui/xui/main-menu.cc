@@ -123,7 +123,7 @@ void MainMenuInputView::Draw()
 
     // Setup rendering to fbo for controller and port images
     controller_fbo->Target();
-    ImTextureID id = (ImTextureID)(intptr_t)controller_fbo->Texture();
+    ImTextureID id = controller_fbo->Texture();
 
     //
     // Render buttons with icons of the Xbox style port sockets with
@@ -372,7 +372,7 @@ void MainMenuInputView::Draw()
         ImGui::Columns(2, "mixed", false);
 
         xmu_fbo->Target();
-        id = (ImTextureID)(intptr_t)xmu_fbo->Texture();
+        id = xmu_fbo->Texture();
 
         static const SDL_DialogFileFilter img_file_filters[] = {
             { ".img Files", "img" },
@@ -1198,15 +1198,22 @@ bool MainMenuSnapshotsView::BigSnapshotButton(QEMUSnapshotInfo *snapshot,
     const ImVec2 p1 = ImGui::GetItemRectMax();
     draw_list->PushClipRect(p0, p1, true);
 
-    // Snapshot thumbnail
-    GLuint thumbnail = data->gl_thumbnail ? data->gl_thumbnail : g_icon_tex;
+    // Snapshot thumbnail. The fallback icon is a WebGPU view when that UI
+    // is active. Snapshot images themselves stay GL until the thumbnail
+    // readback moves.
+    ImTextureID thumbnail_id;
     int thumbnail_width, thumbnail_height;
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, thumbnail);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
-                             &thumbnail_width);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
-                             &thumbnail_height);
+    if (data->gl_thumbnail) {
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, data->gl_thumbnail);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,
+                                 &thumbnail_width);
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT,
+                                 &thumbnail_height);
+        thumbnail_id = (ImTextureID)(uintptr_t)data->gl_thumbnail;
+    } else {
+        thumbnail_id = xemu_ui_icon_texture(&thumbnail_width, &thumbnail_height);
+    }
 
     // Draw black background behind thumbnail
     ImVec2 thumbnail_min(p0.x + thumbnail_pos.x, p0.y + thumbnail_pos.y);
@@ -1223,7 +1230,7 @@ bool MainMenuSnapshotsView::BigSnapshotButton(QEMUSnapshotInfo *snapshot,
                thumbnail_min.y + (thumbnail_size.y - scaled_height) / 2);
     ImVec2 img_max =
         ImVec2(img_min.x + scaled_width, img_min.y + scaled_height);
-    draw_list->AddImage((ImTextureID)(uint64_t)thumbnail, img_min, img_max);
+    draw_list->AddImage(thumbnail_id, img_min, img_max);
 
     // Snapshot title
     ImGui::PushFont(g_font_mgr.m_menu_font_medium);

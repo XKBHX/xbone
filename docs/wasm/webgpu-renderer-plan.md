@@ -177,7 +177,7 @@ Each phase ends with a demonstrable exit criterion.
 | 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite. Phase 4 step 5 shares that image with GL; the readback remains the fallback. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
 | 3. WGSL generator | Steps 1–3 are done. Step 1 translates draw shaders from the WebGPU-targeted GLSL. Step 2 did not need new shaders: the pack and unpack kernels and the display composite were already WGSL in phase 2. Step 3 creates every shader module with `WGPUShaderSourceWGSL`. The WebGPU backend no longer links glslang and does not request `ShaderSourceSPIRV`. glslang remains for Vulkan. A translation or Tint failure skips that draw. |
 | 4. Performance | Steps 1–5 are done. Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline. Blend color and the stencil reference stay dynamic. Step 2 coalesces surface readbacks into one submit and one map, and reads a surface back only when a draw has made it dirty and a consumer needs RAM. Step 3 caches texture bind groups and keeps a guest-RAM vertex buffer, uploaded in 64 KiB blocks. Attributes WebGPU cannot fetch stay on the CPU packer. Step 4 expands packed texture texels in a compute shader. Step 5 imports the display composite into the GL texture the UI already samples. Frame times have not been compared with Vulkan. |
-| 5. WebGPU UI and browser | Step 1 is done. ImGui draws with `imgui_impl_wgpu` when `display.renderer` is `WEBGPU`. The rest of the window is still OpenGL. Steps 2–4 and the browser work are not started. |
+| 5. WebGPU UI and browser | Steps 1 and 2 are done. When `display.renderer` is `WEBGPU`, ImGui and the HUD art (logo, controller, memory unit, icon, and the scaled gamma blit) run on a UI-thread Dawn device. The window present is still a readback into OpenGL. Snapshot thumbnails and the other direct GL users are step 3. Steps 3–4 and the browser work are not started. |
 
 Phase 0 notes:
 
@@ -1036,10 +1036,44 @@ Phase 5 notes (step 1, ImGui WebGPU backend):
   The readback is the bring-up path. Step 4 records this pass on the PFIFO
   device, in the same submit as the game frame.
 - Widgets that pass a GL texture name (`ImGui::Image`, controller art,
-  snapshots) are uploaded into that UI device for the frame. Those calls
-  move to native WebGPU textures in step 2.
+  snapshots) are uploaded into that UI device for the frame. Step 2 moves
+  the HUD art and the framebuffer blit onto native UI textures. Snapshot
+  thumbnails stay on this upload path until step 3.
 - The browser build does not enable the imgui WebGPU backend yet.
   Emscripten still stops at `subprojects/dsp56300`.
+
+Phase 5 notes (step 2, HUD art and the framebuffer blit):
+
+- `ui/shader/ui-widgets.wgsl` is the WebGPU port of the shaders that
+  `ui/xui/gl-helpers.cc` used to compile as GLSL: the controller and
+  memory-unit mask, the SDF logo from `ui/shader/xemu-logo.frag`, and the
+  gamma framebuffer blit. OpenGL and Vulkan still use that GLSL.
+  `ui/shader/texture-blit*` stays GLSL. `ui/shader.c` blits the QEMU
+  console, not the HUD. The palette is `array<vec4u, 64>` because a
+  uniform `array<u32, 256>` is not 16-byte aligned. Controller blend
+  modes are separate pipelines: replace, `OneMinusDstAlpha`/`One` behind
+  the cutouts, and straight alpha for the sticks.
+- The UI device cannot sample the PFIFO device's textures. The framebuffer
+  path reads the GL game texture with `glGetTexImage` and uploads it.
+  That copy stays until step 4 records the game and the UI in one submit.
+  Draws into the logo and controller targets flip clip Y, so the existing
+  ImGui coordinates (v = 0 at the bottom of the widget) still match. The
+  window composite does not flip: row 0 is the top of the window. ImGui
+  then loads that target when the size matches and composites with
+  straight alpha. One readback is copied into the GL window. With a scene,
+  that copy replaces the framebuffer. The welcome path still clears
+  transparent and blends. The icon is a native UI texture. Snapshot
+  thumbnails are still GL names and are uploaded each frame; that is step 3.
+- macOS OpenGL here is 4.1 core. The step 1 overlay shaders were
+  `#version 150` with no profile, so UI init failed (`UI overlay vertex
+  shader failed`) and ImGui never attached, while the NV2A device still
+  started. Those shaders are `#version 150 core` now.
+- Checked on macOS arm64 (Apple M1 Pro, Dawn's Metal backend). With
+  `display.renderer = "WEBGPU"`, startup logs `[WebGPU] UI device` and
+  `[WebGPU] UI shaders: WGSL`, then shares the display image with GL. The
+  process ran for about 50 seconds with no validation errors and no
+  asserts. The picture (dashboard, logo, controller menu, aspect ratio,
+  and a screenshot) was not compared by eye.
 
 **Exit**: natively, the xemu UI runs entirely on WebGPU with no OpenGL. In
 the browser, an nxdk test XBE renders in Chrome with the game and UI on one

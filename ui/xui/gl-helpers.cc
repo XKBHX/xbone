@@ -19,6 +19,7 @@
 #include "ui/xemu-widescreen.h"
 #include "gl-helpers.hh"
 #include "common.hh"
+#include "wgpu-helpers.hh"
 #include "data/controller_mask.png.h"
 #include "data/controller_mask_s.png.h"
 #include "data/logo_sdf.png.h"
@@ -35,6 +36,7 @@
 
 Fbo *controller_fbo, *xmu_fbo, *logo_fbo;
 GLuint g_controller_duke_tex, g_controller_s_tex, g_logo_tex, g_icon_tex, g_xmu_tex;
+static int g_icon_width, g_icon_height;
 
 enum class ShaderType {
     Blit,
@@ -75,7 +77,7 @@ void DeleteDecalShader(DecalShader *s);
 static GLint GetCurrentFbo()
 {
     GLint fbo;
-    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, (GLint*)&fbo);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, (GLint *)&fbo);
     return fbo;
 }
 
@@ -83,6 +85,12 @@ Fbo::Fbo(int width, int height)
 {
     w = width;
     h = height;
+    fbo = 0;
+    tex = 0;
+    if (wgpu_helpers_active()) {
+        wgpu_helpers_fbo_create(this);
+        return;
+    }
 
     // Allocate the texture
     glGenTextures(1, &tex);
@@ -110,12 +118,30 @@ Fbo::Fbo(int width, int height)
 
 Fbo::~Fbo()
 {
+    wgpu_helpers_fbo_destroy(this);
+    if (tex) {
     glDeleteTextures(1, &tex);
+    }
+    if (fbo) {
     glDeleteFramebuffers(1, &fbo);
+    }
+}
+
+ImTextureID Fbo::Texture()
+{
+    uint64_t id = wgpu_helpers_fbo_texture(this);
+    if (id) {
+        return (ImTextureID)id;
+    }
+    return (ImTextureID)(uintptr_t)tex;
 }
 
 void Fbo::Target()
 {
+    if (wgpu_helpers_active()) {
+        wgpu_helpers_fbo_target(this);
+        return;
+    }
     GLint vp[4];
     glGetIntegerv(GL_VIEWPORT, vp);
 
@@ -132,6 +158,10 @@ void Fbo::Target()
 
 void Fbo::Restore()
 {
+    if (wgpu_helpers_active()) {
+        wgpu_helpers_fbo_restore(this);
+        return;
+    }
     if (!blend) {
         glDisable(GL_BLEND);
     }
@@ -158,7 +188,8 @@ static GLuint InitTexture(unsigned char *data, int width, int height,
     return tex;
 }
 
-static GLuint LoadTextureFromMemory(const unsigned char *buf, unsigned int size, bool flip=true)
+static GLuint LoadTextureFromMemory(const unsigned char *buf, unsigned int size, bool flip = true, int *out_w = NULL,
+                                    int *out_h = NULL)
 {
     // Flip vertically so textures are loaded according to GL convention.
     stbi_set_flip_vertically_on_load(flip);
@@ -167,10 +198,58 @@ static GLuint LoadTextureFromMemory(const unsigned char *buf, unsigned int size,
     unsigned char *data = stbi_load_from_memory(buf, size, &width, &height, &channels, 4);
     assert(data != NULL);
 
+    if (out_w) {
+        *out_w = width;
+    }
+    if (out_h) {
+        *out_h = height;
+    }
+
     GLuint tex = InitTexture(data, width, height, channels);
     stbi_image_free(data);
 
     return tex;
+}
+
+static void DecalBegin(int art, GLuint gl_tex, bool logo, float time_sec)
+{
+    if (wgpu_helpers_active()) {
+        wgpu_helpers_begin(art, logo, time_sec);
+        return;
+    }
+
+    DecalShader *shader = logo ? g_logo_shader : g_decal_shader;
+    glUseProgram(shader->prog);
+    glBindVertexArray(g_decal_shader->vao);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, gl_tex);
+    (void)time_sec;
+}
+
+static void DecalBlendMode(int blend)
+{
+    if (wgpu_helpers_active()) {
+        wgpu_helpers_blend(blend);
+        return;
+    }
+
+    glBlendEquation(GL_FUNC_ADD);
+    if (blend == DECAL_BLEND_UNDER) {
+        glBlendFunc(GL_ONE_MINUS_DST_ALPHA, GL_ONE);
+    } else if (blend == DECAL_BLEND_ALPHA) {
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    } else {
+        glBlendFunc(GL_ONE, GL_ZERO);
+    }
+}
+
+static void DecalEnd(void)
+{
+    if (wgpu_helpers_active()) {
+        return;
+    }
+    glBindVertexArray(0);
+    glUseProgram(0);
 }
 
 static GLuint Shader(GLenum type, const char *src)
@@ -256,7 +335,8 @@ void main() {
 
     // Simple 2-color decal shader
     // - in_ColorFill is first pass
-    // - Red channel of the texture is used as primary color, mixed with 1-Red for
+    // - Red channel of the texture is used as primary color, mixed with 1-Red
+    // for
     //   secondary color.
     // - Blue is a lazy alpha removal for now
     // - Alpha channel passed through
@@ -337,13 +417,15 @@ void main() {
 
     GLint loc = glGetAttribLocation(s->prog, "in_Position");
     if (loc >= 0) {
-        glVertexAttribPointer(loc, 2, GL_FLOAT, GL_FALSE, 4*sizeof(GLfloat), (void*)0);
+        glVertexAttribPointer(loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
+                              (void *)0);
         glEnableVertexAttribArray(loc);
     }
 
     loc = glGetAttribLocation(s->prog, "in_Texcoord");
     if (loc >= 0) {
-        glVertexAttribPointer(loc, 2, GL_FLOAT, GL_FALSE, 4*sizeof(GLfloat), (void*)(2*sizeof(GLfloat)));
+        glVertexAttribPointer(loc, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(GLfloat),
+                              (void *)(2 * sizeof(GLfloat)));
         glEnableVertexAttribArray(loc);
     }
 
@@ -354,9 +436,13 @@ static void RenderDecal(DecalShader *s, float x, float y, float w, float h,
                         float tex_x, float tex_y, float tex_w, float tex_h,
                         uint32_t primary, uint32_t secondary, uint32_t fill)
 {
+    float ww, wh;
+    if (wgpu_helpers_active()) {
+        wgpu_helpers_target_size(&ww, &wh);
+    } else {
     GLint vp[4];
-    glGetIntegerv(GL_VIEWPORT, vp);
-    float ww = vp[2], wh = vp[3];
+    glGetIntegerv(GL_VIEWPORT, vp); ww = vp[2]; wh = vp[3];
+    }
 
     x = (int)x;
     y = (int)y;
@@ -367,12 +453,39 @@ static void RenderDecal(DecalShader *s, float x, float y, float w, float h,
     tex_w = (int)tex_w;
     tex_h = (int)tex_h;
 
+    float tw, th;
+    if (wgpu_helpers_active()) {
+        wgpu_helpers_art_size(&tw, &th);
+    } else {
+
     int tw_i, th_i;
     glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH,  &tw_i);
-    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &th_i);
-    float tw = tw_i, th = th_i;
+    glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_HEIGHT, &th_i); tw = tw_i; th = th_i;
+    }
+    if (tw <= 0) {
+        tw = 1;
+    }
+    if (th <= 0) {
+        th = 1;
+    }
+    if (ww <= 0) {
+        ww = 1;
+    }
+    if (wh <= 0) {
+        wh = 1;
+    }
 
-#define COL(color, c) (float)(((color) >> ((c)*8)) & 0xff) / 255.0
+    if (wgpu_helpers_active()) {
+        float scale_offset[4] = { w / ww, h / wh, -1 + ((2 * x + w) / ww),
+                                  -1 + ((2 * y + h) / wh) };
+        float tex_scale_offset[4] = { tex_w / tw, tex_h / th, tex_x / tw,
+                                      tex_y / th };
+        wgpu_helpers_draw(scale_offset, tex_scale_offset, primary, secondary,
+                          fill);
+        return;
+    }
+
+#define COL(color, c) (float)(((color) >> ((c) * 8)) & 0xff) / 255.0
     if (s->flipy_loc >= 0) {
         glUniform1i(s->flipy_loc, s->flip);
     }
@@ -400,7 +513,7 @@ static void RenderDecal(DecalShader *s, float x, float y, float w, float h,
                     COL(fill, 0));
     }
     if (s->time_loc >= 0) {
-        glUniform1f(s->time_loc, s->time/1000.0f);
+        glUniform1f(s->time_loc, s->time / 1000.0f);
     }
     if (s->scale_loc >= 0) {
         glUniform1f(s->scale_loc, s->scale);
@@ -439,6 +552,12 @@ enum tex_item_names {
 
 void InitCustomRendering(void)
 {
+    if (wgpu_helpers_init()) {
+        controller_fbo = new Fbo(512, 512);
+        xmu_fbo = new Fbo(512, 256);
+        logo_fbo = new Fbo(512, 512);
+        return;
+    }
     glActiveTexture(GL_TEXTURE0);
     g_controller_duke_tex =
         LoadTextureFromMemory(controller_mask_data, controller_mask_size);
@@ -454,9 +573,29 @@ void InitCustomRendering(void)
     g_logo_shader = NewDecalShader(ShaderType::Logo);
     logo_fbo = new Fbo(512, 512);
 
-    g_icon_tex = LoadTextureFromMemory(xemu_64x64_data, xemu_64x64_size, false);
+    g_icon_tex = LoadTextureFromMemory(xemu_64x64_data, xemu_64x64_size, false,
+                                       &g_icon_width, &g_icon_height);
 
     g_framebuffer_shader = NewDecalShader(ShaderType::BlitGamma);
+}
+
+void ShutdownCustomRendering(void)
+{
+    wgpu_helpers_shutdown();
+}
+
+ImTextureID xemu_ui_icon_texture(int *width, int *height)
+{
+    if (wgpu_helpers_active()) {
+        return (ImTextureID)wgpu_helpers_icon(width, height);
+    }
+    if (width) {
+        *width = g_icon_width;
+    }
+    if (height) {
+        *height = g_icon_height;
+    }
+    return (ImTextureID)(uintptr_t)g_icon_tex;
 }
 
 static void RenderMeter(DecalShader *s, float x, float y, float width,
@@ -494,10 +633,7 @@ static void RenderDukeController(float frame_x, float frame_y, uint32_t primary_
     uint32_t now = SDL_GetTicks();
     float t;
 
-    glUseProgram(g_decal_shader->prog);
-    glBindVertexArray(g_decal_shader->vao);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_controller_duke_tex);
+    DecalBegin(WGPU_ART_DUKE, g_controller_duke_tex, false, 0);
 
     // Add a 5 pixel space around the controller so we can wiggle the controller
     // around to visualize rumble in action
@@ -510,8 +646,7 @@ static void RenderDukeController(float frame_x, float frame_y, uint32_t primary_
     float rumble_l = 0;
     float rumble_r = 0;
 
-    glBlendEquation(GL_FUNC_ADD);
-    glBlendFunc(GL_ONE, GL_ZERO);
+    DecalBlendMode(DECAL_BLEND_REPLACE);
 
     uint32_t jewel_color = secondary_color;
 
@@ -522,16 +657,18 @@ static void RenderDukeController(float frame_x, float frame_y, uint32_t primary_
     }
 
     if (now < state->animate_guide_button_end) {
-        t = 1.0f - (float)(state->animate_guide_button_end-now)/(float)animate_guide_button_duration;
-        float sin_wav = (1-sin(M_PI * t / 2.0f));
+        t = 1.0f - (float)(state->animate_guide_button_end - now) /
+                       (float)animate_guide_button_duration;
+        float sin_wav = (1 - sin(M_PI * t / 2.0f));
 
-        // Animate guide button by highlighting logo jewel and fading out over time
+        // Animate guide button by highlighting logo jewel and fading out over
+        // time
         alpha = sin_wav * 255.0f;
         jewel_color = primary_color + alpha;
 
         // Add a little extra flare: wiggle the frame around while we rumble
-        frame_x += ((float)(rand() % 5)-2.5) * (1-t);
-        frame_y += ((float)(rand() % 5)-2.5) * (1-t);
+        frame_x += ((float)(rand() % 5) - 2.5) * (1 - t);
+        frame_y += ((float)(rand() % 5) - 2.5) * (1 - t);
         rumble_l = rumble_r = sin_wav;
     }
 
@@ -542,7 +679,7 @@ static void RenderDukeController(float frame_x, float frame_y, uint32_t primary_
                 tex_items[obj_controller].w, tex_items[obj_controller].h,
                 primary_color, secondary_color, 0);
 
-    glBlendFunc(GL_ONE_MINUS_DST_ALPHA, GL_ONE); // Blend with controller cutouts
+    DecalBlendMode(DECAL_BLEND_UNDER); // Blend with controller cutouts
     RenderDecal(g_decal_shader, frame_x + jewel.x, frame_y + jewel.y, jewel.w,
                 jewel.h, 0, 0, 1, 1, 0, 0, jewel_color);
 
@@ -556,15 +693,15 @@ static void RenderDukeController(float frame_x, float frame_y, uint32_t primary_
         }
     }
 
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); // Blend with controller
+    DecalBlendMode(DECAL_BLEND_ALPHA); // Blend with controller
 
     // Render left thumbstick
     float w = tex_items[obj_lstick].w;
     float h = tex_items[obj_lstick].h;
-    float c_x = frame_x+lstick_ctr.x;
-    float c_y = frame_y+lstick_ctr.y;
-    float lstick_x = (float)state->axis[CONTROLLER_AXIS_LSTICK_X]/32768.0;
-    float lstick_y = (float)state->axis[CONTROLLER_AXIS_LSTICK_Y]/32768.0;
+    float c_x = frame_x + lstick_ctr.x;
+    float c_y = frame_y + lstick_ctr.y;
+    float lstick_x = (float)state->axis[CONTROLLER_AXIS_LSTICK_X] / 32768.0;
+    float lstick_y = (float)state->axis[CONTROLLER_AXIS_LSTICK_Y] / 32768.0;
     RenderDecal(g_decal_shader, (int)(c_x - w / 2.0f + 10.0f * lstick_x),
                 (int)(c_y - h / 2.0f + 10.0f * lstick_y), w, h,
                 tex_items[obj_lstick].x, tex_items[obj_lstick].y, w, h,
@@ -577,10 +714,10 @@ static void RenderDukeController(float frame_x, float frame_y, uint32_t primary_
     // Render right thumbstick
     w = tex_items[obj_rstick].w;
     h = tex_items[obj_rstick].h;
-    c_x = frame_x+rstick_ctr.x;
-    c_y = frame_y+rstick_ctr.y;
-    float rstick_x = (float)state->axis[CONTROLLER_AXIS_RSTICK_X]/32768.0;
-    float rstick_y = (float)state->axis[CONTROLLER_AXIS_RSTICK_Y]/32768.0;
+    c_x = frame_x + rstick_ctr.x;
+    c_y = frame_y + rstick_ctr.y;
+    float rstick_x = (float)state->axis[CONTROLLER_AXIS_RSTICK_X] / 32768.0;
+    float rstick_y = (float)state->axis[CONTROLLER_AXIS_RSTICK_Y] / 32768.0;
     RenderDecal(g_decal_shader, (int)(c_x - w / 2.0f + 10.0f * rstick_x),
                 (int)(c_y - h / 2.0f + 10.0f * rstick_y), w, h,
                 tex_items[obj_rstick].x, tex_items[obj_rstick].y, w, h,
@@ -590,7 +727,8 @@ static void RenderDukeController(float frame_x, float frame_y, uint32_t primary_
                                                               secondary_color,
                 0);
 
-    glBlendFunc(GL_ONE, GL_ZERO); // Don't blend, just overwrite values in buffer
+    DecalBlendMode(
+        DECAL_BLEND_REPLACE); // Don't blend, just overwrite values in buffer
 
     // Render trigger bars
     float ltrig = state->axis[CONTROLLER_AXIS_LTRIG] / 32767.0;
@@ -605,8 +743,9 @@ static void RenderDukeController(float frame_x, float frame_y, uint32_t primary_
     // Animate trigger alpha down after a period of inactivity
     alpha = 0x80;
     if (state->animate_trigger_end > now) {
-        t = 1.0f - (float)(state->animate_trigger_end-now)/(float)animate_trigger_duration;
-        float sin_wav = (1-sin(M_PI * t / 2.0f));
+        t = 1.0f - (float)(state->animate_trigger_end - now) /
+                       (float)animate_trigger_duration;
+        float sin_wav = (1 - sin(M_PI * t / 2.0f));
         alpha += fmin(sin_wav * 0x40, 0x80);
     }
 
@@ -622,8 +761,7 @@ static void RenderDukeController(float frame_x, float frame_y, uint32_t primary_
     state->rumble_l = (int)(rumble_l * (float)0xffff);
     state->rumble_r = (int)(rumble_r * (float)0xffff);
 
-    glBindVertexArray(0);
-    glUseProgram(0);
+    DecalEnd();
 }
 
 static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_color,
@@ -653,10 +791,7 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
     uint32_t now = SDL_GetTicks();
     float t;
 
-    glUseProgram(g_decal_shader->prog);
-    glBindVertexArray(g_decal_shader->vao);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_controller_s_tex);
+    DecalBegin(WGPU_ART_S, g_controller_s_tex, false, 0);
 
     // Add a 5 pixel space around the controller so we can wiggle the controller
     // around to visualize rumble in action
@@ -669,8 +804,7 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
     float rumble_l = 0;
     float rumble_r = 0;
 
-    glBlendEquation(GL_FUNC_ADD);
-    glBlendFunc(GL_ONE, GL_ZERO);
+    DecalBlendMode(DECAL_BLEND_REPLACE);
 
     uint32_t jewel_color = secondary_color;
 
@@ -704,8 +838,7 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
                 tex_items[obj_controller].w, tex_items[obj_controller].h,
                 primary_color, secondary_color, 0);
 
-    glBlendFunc(GL_ONE_MINUS_DST_ALPHA,
-                GL_ONE); // Blend with controller cutouts
+    DecalBlendMode(DECAL_BLEND_UNDER); // Blend with controller cutouts
     RenderDecal(g_decal_shader, frame_x + jewel.x, frame_y + jewel.y, jewel.w,
                 jewel.h, 0, 0, 1, 1, 0, 0, jewel_color);
 
@@ -719,7 +852,7 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
         }
     }
 
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA); // Blend with controller
+    DecalBlendMode(DECAL_BLEND_ALPHA); // Blend with controller
 
     // Render left thumbstick
     float w = tex_items[obj_lstick].w;
@@ -728,8 +861,7 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
     float c_y = frame_y + lstick_ctr.y;
     float lstick_x = (float)state->axis[CONTROLLER_AXIS_LSTICK_X] / 32768.0;
     float lstick_y = (float)state->axis[CONTROLLER_AXIS_LSTICK_Y] / 32768.0;
-    RenderDecal(
-        g_decal_shader, (int)(c_x - w / 2.0f + 10.0f * lstick_x),
+    RenderDecal(g_decal_shader, (int)(c_x - w / 2.0f + 10.0f * lstick_x),
         (int)(c_y - h / 2.0f + 10.0f * lstick_y), w, h, tex_items[obj_lstick].x,
         tex_items[obj_lstick].y, w, h,
         (state->buttons & CONTROLLER_BUTTON_LSTICK) ? secondary_color :
@@ -745,8 +877,7 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
     c_y = frame_y + rstick_ctr.y;
     float rstick_x = (float)state->axis[CONTROLLER_AXIS_RSTICK_X] / 32768.0;
     float rstick_y = (float)state->axis[CONTROLLER_AXIS_RSTICK_Y] / 32768.0;
-    RenderDecal(
-        g_decal_shader, (int)(c_x - w / 2.0f + 10.0f * rstick_x),
+    RenderDecal(g_decal_shader, (int)(c_x - w / 2.0f + 10.0f * rstick_x),
         (int)(c_y - h / 2.0f + 10.0f * rstick_y), w, h, tex_items[obj_rstick].x,
         tex_items[obj_rstick].y, w, h,
         (state->buttons & CONTROLLER_BUTTON_RSTICK) ? secondary_color :
@@ -755,8 +886,8 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
                                                          secondary_color,
         0);
 
-    glBlendFunc(GL_ONE,
-                GL_ZERO); // Don't blend, just overwrite values in buffer
+    DecalBlendMode(
+        DECAL_BLEND_REPLACE); // Don't blend, just overwrite values in buffer
 
     // Render trigger bars
     float ltrig = state->axis[CONTROLLER_AXIS_LTRIG] / 32767.0;
@@ -789,8 +920,7 @@ static void RenderControllerS(float frame_x, float frame_y, uint32_t primary_col
     state->rumble_l = (int)(rumble_l * (float)0xffff);
     state->rumble_r = (int)(rumble_r * (float)0xffff);
 
-    glBindVertexArray(0);
-    glUseProgram(0);
+    DecalEnd();
 }
 
 void RenderController(float frame_x, float frame_y, uint32_t primary_color,
@@ -807,11 +937,8 @@ void RenderController(float frame_x, float frame_y, uint32_t primary_color,
 void RenderControllerPort(float frame_x, float frame_y, int i,
                           uint32_t port_color)
 {
-    glUseProgram(g_decal_shader->prog);
-    glBindVertexArray(g_decal_shader->vao);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_controller_duke_tex);
-    glBlendFunc(GL_ONE, GL_ZERO);
+    DecalBegin(WGPU_ART_DUKE, g_controller_duke_tex, false, 0);
+    DecalBlendMode(DECAL_BLEND_REPLACE);
 
     // Render port socket
     RenderDecal(g_decal_shader, frame_x, frame_y, tex_items[obj_port_socket].w,
@@ -819,7 +946,7 @@ void RenderControllerPort(float frame_x, float frame_y, int i,
                 tex_items[obj_port_socket].y, tex_items[obj_port_socket].w,
                 tex_items[obj_port_socket].h, port_color, port_color, 0);
 
-    frame_x += (tex_items[obj_port_socket].w-tex_items[obj_port_lbl_1].w)/2;
+    frame_x += (tex_items[obj_port_socket].w - tex_items[obj_port_lbl_1].w) / 2;
     frame_y += tex_items[obj_port_socket].h + 8;
 
     // Render port label
@@ -829,19 +956,14 @@ void RenderControllerPort(float frame_x, float frame_y, int i,
         tex_items[obj_port_lbl_1 + i].y, tex_items[obj_port_lbl_1 + i].w,
         tex_items[obj_port_lbl_1 + i].h, port_color, port_color, 0);
 
-    glBindVertexArray(0);
-    glUseProgram(0);
+    DecalEnd();
 }
 
 void RenderXmu(float frame_x, float frame_y, uint32_t primary_color,
                uint32_t secondary_color)
 {
-    glUseProgram(g_decal_shader->prog);
-    glBindVertexArray(g_decal_shader->vao);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_xmu_tex);
-    glBlendEquation(GL_FUNC_ADD);
-    glBlendFunc(GL_ONE, GL_ZERO);
+    DecalBegin(WGPU_ART_XMU, g_xmu_tex, false, 0);
+    DecalBlendMode(DECAL_BLEND_REPLACE);
 
     // Render xmu
     RenderDecal(g_decal_shader, frame_x, frame_y, 256, 256,
@@ -849,43 +971,45 @@ void RenderXmu(float frame_x, float frame_y, uint32_t primary_color,
                 tex_items[obj_xmu].w, tex_items[obj_xmu].h, primary_color,
                 secondary_color, 0);
 
-    glBindVertexArray(0);
-    glUseProgram(0);
+    DecalEnd();
 }
 
 void RenderLogo(uint32_t time)
 {
     uint32_t color = 0x62ca13ff;
 
+    if (!wgpu_helpers_active()) {
+
     g_logo_shader->time = time;
-    glUseProgram(g_logo_shader->prog);
-    glBindVertexArray(g_decal_shader->vao);
-    glBlendFunc(GL_ONE, GL_ZERO);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, g_logo_tex);
-    RenderDecal(g_logo_shader, 0, 0, 512, 512, 0, 0, 128, 128, color,
+    }
+    DecalBegin(WGPU_ART_LOGO, g_logo_tex, true, time / 1000.0f);
+    DecalBlendMode(DECAL_BLEND_REPLACE);
+    RenderDecal(wgpu_helpers_active() ? NULL : g_logo_shader, 0, 0, 512, 512, 0, 0, 128, 128, color,
         color, 0x00000000);
-    glBindVertexArray(0);
-    glUseProgram(0);
+    DecalEnd();
 }
 
 // Scale <src> proportionally to fit in <max>
 void ScaleDimensions(int src_width, int src_height, int max_width, int max_height, int *out_width, int *out_height)
 {
-    float w_ratio = (float)max_width/(float)max_height;
-    float t_ratio = (float)src_width/(float)src_height;
+    float w_ratio = (float)max_width / (float)max_height;
+    float t_ratio = (float)src_width / (float)src_height;
 
     if (w_ratio >= t_ratio) {
-        *out_width = (float)max_width * t_ratio/w_ratio;
+        *out_width = (float)max_width * t_ratio / w_ratio;
         *out_height = max_height;
     } else {
         *out_width = max_width;
-        *out_height = (float)max_height * w_ratio/t_ratio;
+        *out_height = (float)max_height * w_ratio / t_ratio;
     }
 }
 
 void RenderFramebuffer(GLint tex, int width, int height, bool flip, float scale[2])
 {
+    if (wgpu_helpers_active()) {
+        wgpu_helpers_render_framebuffer(tex, width, height, flip, scale);
+        return;
+    }
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, tex);
     
@@ -929,14 +1053,14 @@ static float GetDisplayAspectRatio(int width, int height)
 {
     switch (g_config.display.ui.aspect_ratio) {
     case CONFIG_DISPLAY_UI_ASPECT_RATIO_NATIVE:
-        return (float)width/(float)height;
+        return (float)width / (float)height;
     case CONFIG_DISPLAY_UI_ASPECT_RATIO_16X9:
-        return 16.0f/9.0f;
+        return 16.0f / 9.0f;
     case CONFIG_DISPLAY_UI_ASPECT_RATIO_4X3:
-        return 4.0f/3.0f;
+        return 4.0f / 3.0f;
     case CONFIG_DISPLAY_UI_ASPECT_RATIO_AUTO:
     default:
-        return xemu_get_widescreen() ? 16.0f/9.0f : 4.0f/3.0f;
+        return xemu_get_widescreen() ? 16.0f / 9.0f : 4.0f / 3.0f;
     }
 }
 
@@ -958,17 +1082,17 @@ void RenderFramebuffer(GLint tex, int width, int height, bool flip)
     } else if (g_config.display.ui.fit == CONFIG_DISPLAY_UI_FIT_CENTER) {
         // Centered
         float t_ratio = GetDisplayAspectRatio(tw, th);
-        scale[0] = t_ratio*(float)th/(float)width;
-        scale[1] = (float)th/(float)height;
+        scale[0] = t_ratio * (float)th / (float)width;
+        scale[1] = (float)th / (float)height;
     } else {
         float t_ratio = GetDisplayAspectRatio(tw, th);
-        float w_ratio = (float)width/(float)height;
+        float w_ratio = (float)width / (float)height;
         if (w_ratio >= t_ratio) {
-            scale[0] = t_ratio/w_ratio;
+            scale[0] = t_ratio / w_ratio;
             scale[1] = 1.0;
         } else {
             scale[0] = 1.0;
-            scale[1] = w_ratio/t_ratio;
+            scale[1] = w_ratio / t_ratio;
         }
     }
 
@@ -990,6 +1114,12 @@ bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, in
     if (!max_height) max_height = height;
     ScaleDimensions(width, height, max_width, max_height, &width, &height);
 
+    if (wgpu_helpers_active()) {
+        /* The GL path inverts flip because glReadPixels is bottom-up. The
+         * WebGPU readback is already top-down, so it uses the window flip. */
+        return wgpu_helpers_framebuffer_png(tex, flip, width, height, png);
+    }
+
     std::vector<uint8_t> pixels;
     pixels.resize(width * height * 3);
 
@@ -997,7 +1127,7 @@ bool RenderFramebufferToPng(GLuint tex, bool flip, std::vector<uint8_t> &png, in
     fbo.Target();
     bool blend = glIsEnabled(GL_BLEND);
     if (blend) glDisable(GL_BLEND);
-    float scale[2] = {1.0, 1.0};
+    float scale[2] = { 1.0, 1.0 };
     RenderFramebuffer(tex, width, height, !flip, scale);
     if (blend) glEnable(GL_BLEND);
     glPixelStorei(GL_PACK_ROW_LENGTH, width);

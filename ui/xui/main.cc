@@ -134,9 +134,8 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
     xemu_monitor_init();
     g_vsync = g_config.display.window.vsync;
 
-    InitCustomRendering();
-
-    // Setup Dear ImGui context
+    // Setup Dear ImGui context. The WebGPU backend init below needs it, and
+    // the HUD art is created after that so its textures land on the UI device.
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGuiIO& io = ImGui::GetIO();
@@ -144,10 +143,14 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     io.IniFilename = NULL;
 
+    if (g_config.display.renderer == CONFIG_DISPLAY_RENDERER_WEBGPU) {
+        xemu_wgpu_ui_init(window);
+    }
+    InitCustomRendering();
+
     // Setup Platform/Renderer bindings. WebGPU ImGui is used only when that
     // renderer is selected. OpenGL and Vulkan keep the OpenGL3 backend.
-    if (g_config.display.renderer == CONFIG_DISPLAY_RENDERER_WEBGPU &&
-        xemu_wgpu_ui_init(window)) {
+    if (xemu_wgpu_ui_active()) {
         ImGui_ImplSDL3_InitForOther(window);
     } else {
         ImGui_ImplSDL3_InitForOpenGL(window, sdl_gl_context);
@@ -168,6 +171,7 @@ void xemu_hud_init(SDL_Window* window, void* sdl_gl_context)
 
 void xemu_hud_cleanup(void)
 {
+    ShutdownCustomRendering();
     if (xemu_wgpu_ui_active()) {
         xemu_wgpu_ui_shutdown();
     } else {
