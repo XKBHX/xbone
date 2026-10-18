@@ -17,6 +17,21 @@
 
 static GPUProperties gpu_properties;
 
+#ifdef __EMSCRIPTEN__
+static bool ui_canvas_describe(void *opaque, int *width, int *height,
+                               WGPUTextureFormat *format)
+{
+    return pgraph_wgpu_display_canvas_describe(opaque, format, width, height);
+}
+
+static bool ui_canvas_acquire(void *opaque, WGPUTextureView *view, int *width,
+                              int *height, WGPUTextureFormat *format)
+{
+    return pgraph_wgpu_display_canvas_acquire(opaque, view, format, width,
+                                              height);
+}
+#endif
+
 static void pgraph_wgpu_flush(NV2AState *d)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -67,11 +82,6 @@ static void pgraph_wgpu_process_pending(NV2AState *d)
             int display_width = 0;
             int display_height = 0;
 
-            WGPUTextureView canvas = NULL;
-            int canvas_width = 0;
-            int canvas_height = 0;
-            WGPUTextureFormat canvas_format = WGPUTextureFormat_Undefined;
-
             if (xemu_wgpu_ui_needs_display()) {
                 r->display.sampleable = true;
                 pgraph_wgpu_render_display(pg);
@@ -84,20 +94,21 @@ static void pgraph_wgpu_process_pending(NV2AState *d)
             }
 #ifdef __EMSCRIPTEN__
             /*
-             * The composite above stays sampleable. The UI gamma blit
-             * writes it into this canvas texture, and ImGui follows.
+             * The composite above stays sampleable. The UI acquires the
+             * canvas after any wait, then writes the gamma blit and ImGui
+             * into that texture in one submit.
              */
-            if (!pgraph_wgpu_display_canvas_acquire(r, &canvas, &canvas_format,
-                                                    &canvas_width,
-                                                    &canvas_height)) {
-                canvas = NULL;
-            }
-#endif
+            XemuWgpuCanvasOps canvas_ops = {
+                .describe = ui_canvas_describe,
+                .acquire = ui_canvas_acquire,
+                .opaque = r,
+            };
             xemu_wgpu_ui_execute(r->instance, r->device, r->queue, display,
-                                 display_width, display_height, canvas,
-                                 canvas_width, canvas_height, canvas_format);
-#ifdef __EMSCRIPTEN__
+                                 display_width, display_height, &canvas_ops);
             pgraph_wgpu_display_canvas_release(r);
+#else
+            xemu_wgpu_ui_execute(r->instance, r->device, r->queue, display,
+                                 display_width, display_height, NULL);
 #endif
             qatomic_set(&r->ui_pending, false);
             qemu_event_set(&r->ui_complete);

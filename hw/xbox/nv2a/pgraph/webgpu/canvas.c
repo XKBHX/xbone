@@ -58,17 +58,19 @@ static bool canvas_size(int *width, int *height)
 
     w = 0;
     h = 0;
+    /* clang-format splits === inside EM_ASM, which is not valid JS. */
+    /* clang-format off */
     EM_ASM(
         {
             var c = (typeof findCanvasEventTarget === 'function') ?
-                findCanvasEventTarget('#canvas') :
-                null;
+                findCanvasEventTarget('#canvas') : null;
             if (c) {
                 setValue($0, c.width | 0, 'i32');
                 setValue($1, c.height | 0, 'i32');
             }
         },
         &w, &h);
+    /* clang-format on */
     if (w <= 0 || h <= 0) {
         return false;
     }
@@ -125,6 +127,32 @@ static bool ensure_surface(WgpuCanvas *canvas, WGPUInstance instance,
     canvas->width = width;
     canvas->height = height;
     canvas->configured = 1;
+    return true;
+}
+
+bool wgpu_canvas_describe(WgpuCanvas *canvas, WGPUInstance instance,
+                          WGPUAdapter adapter, WGPUDevice device,
+                          WGPUTextureFormat *format, uint32_t *width,
+                          uint32_t *height)
+{
+    int w = 0;
+    int h = 0;
+
+    if (!instance || !adapter || !device || !canvas_size(&w, &h)) {
+        return false;
+    }
+    if (!ensure_surface(canvas, instance, adapter, device, w, h)) {
+        return false;
+    }
+    if (format) {
+        *format = canvas->format;
+    }
+    if (width) {
+        *width = canvas->width;
+    }
+    if (height) {
+        *height = canvas->height;
+    }
     return true;
 }
 

@@ -15,11 +15,22 @@ extern "C" {
 #ifdef CONFIG_WEBGPU
 #include <webgpu/webgpu.h>
 
+/* Browser only. describe configures the canvas and reports its format.
+ * acquire calls getCurrentTexture. The UI calls acquire after every
+ * suspending wait, records the gamma blit and ImGui into one command
+ * buffer, and submits before the next wait. */
+typedef struct XemuWgpuCanvasOps {
+    bool (*describe)(void *opaque, int *width, int *height,
+                     WGPUTextureFormat *format);
+    bool (*acquire)(void *opaque, WGPUTextureView *view, int *width,
+                    int *height, WGPUTextureFormat *format);
+    void *opaque;
+} XemuWgpuCanvasOps;
+
 void xemu_wgpu_ui_execute(WGPUInstance instance, WGPUDevice device,
                           WGPUQueue queue, WGPUTextureView display,
                           int display_width, int display_height,
-                          WGPUTextureView canvas, int canvas_width,
-                          int canvas_height, WGPUTextureFormat canvas_format);
+                          const XemuWgpuCanvasOps *canvas);
 bool xemu_wgpu_ui_needs_display(void);
 
 /* Poll, then suspend through Asyncify or JSPI when the future is still

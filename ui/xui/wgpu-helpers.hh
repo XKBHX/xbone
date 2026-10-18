@@ -28,10 +28,18 @@ void wgpu_helpers_gpu_shutdown(void);
 /* Gamma blit target. RGBA8Unorm keeps the FBO pipelines. A canvas format
  * builds a second gamma pipeline for the window pass. */
 void wgpu_helpers_set_window_format(WGPUTextureFormat format);
-/* Records HUD passes, then the gamma blit of `display` or the guest
- * upload. Returns true when the window target was drawn. */
-bool wgpu_helpers_replay(WGPUTextureView display, int display_width,
-                         int display_height);
+/* FBO passes. May suspend to recycle the uniform buffer. Frame commands
+ * stay queued for wgpu_helpers_replay_window. */
+void wgpu_helpers_replay_offscreen(void);
+/* Recycles the uniform buffer before a canvas acquire. */
+void wgpu_helpers_prepare_window(void);
+/* While set, a uniform recycle fails instead of suspending. */
+void wgpu_helpers_set_no_suspend(bool on);
+/* Gamma blit. hold_submit leaves the encoder open for ImGui. */
+bool wgpu_helpers_replay_window(WGPUTextureView display, int display_width,
+                                int display_height, bool hold_submit);
+WGPUCommandEncoder wgpu_helpers_take_encoder(void);
+void wgpu_helpers_submit_pending(void);
 void wgpu_helpers_retire(void);
 void wgpu_helpers_run_png(WGPUTextureView display);
 bool wgpu_helpers_needs_display(void);
