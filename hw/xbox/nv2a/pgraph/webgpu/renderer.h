@@ -605,6 +605,19 @@ bool pgraph_wgpu_display_canvas_acquire(PGRAPHWgpuState *r,
                                         WGPUTextureFormat *format, int *width,
                                         int *height);
 void pgraph_wgpu_display_canvas_release(PGRAPHWgpuState *r);
+#else
+/* The UI thread publishes the SDL window. These run on the PFIFO thread.
+ * present calls wgpuSurfacePresent after the gamma blit and ImGui submit. */
+bool pgraph_wgpu_display_window_active(void);
+bool pgraph_wgpu_display_window_describe(PGRAPHWgpuState *r,
+                                         WGPUTextureFormat *format, int *width,
+                                         int *height);
+bool pgraph_wgpu_display_window_acquire(PGRAPHWgpuState *r,
+                                        WGPUTextureView *view,
+                                        WGPUTextureFormat *format, int *width,
+                                        int *height);
+bool pgraph_wgpu_display_window_present(PGRAPHWgpuState *r);
+void pgraph_wgpu_display_window_release(PGRAPHWgpuState *r);
 #endif
 void pgraph_wgpu_copy_adapter_text(char *vendor, size_t vendor_size,
                                    char *device, size_t device_size,

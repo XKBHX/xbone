@@ -20,6 +20,8 @@ if webgpu.found()
   )
   if host_os == 'emscripten'
     webgpu_files += files('canvas.c')
+  else
+    webgpu_files += files('window.c')
   endif
   specific_ss.add([webgpu, webgpu_files])
 endif

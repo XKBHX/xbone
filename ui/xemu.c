@@ -59,6 +59,9 @@
 #include <locale.h>
 #include <math.h>
 #include <SDL3/SDL.h>
+#ifdef __APPLE__
+#include <SDL3/SDL_metal.h>
+#endif
 
 #ifdef _WIN32
 #include "xui/win32-dxgi-present.h"
@@ -116,6 +119,13 @@ static SDL_Cursor *guest_sprite;
 static Notifier mouse_mode_notifier;
 static SDL_Window *m_window;
 static SDL_GLContext m_context;
+static int m_wgpu_kind;
+static void *m_wgpu_primary;
+static void *m_wgpu_secondary;
+static uint64_t m_wgpu_x_window;
+#ifdef __APPLE__
+static SDL_MetalView m_metal_view;
+#endif
 static QemuSemaphore display_init_sem;
 static QemuSemaphore display_shutdown_sem;
 static QEMUTimer *vblank_timer;
@@ -898,6 +908,24 @@ static uint8_t *surface_to_rgba(DisplaySurface *surface)
     return dst;
 }
 
+static void publish_wgpu_window(void)
+{
+#ifndef __EMSCRIPTEN__
+    int w = 0;
+    int h = 0;
+
+    if (!m_wgpu_kind || !m_window) {
+        return;
+    }
+    if (!SDL_GetWindowSizeInPixels(m_window, &w, &h) || w <= 0 || h <= 0) {
+        return;
+    }
+    nv2a_wgpu_set_window_target(m_wgpu_kind, m_wgpu_primary, m_wgpu_secondary,
+                                m_wgpu_x_window, (uint32_t)w, (uint32_t)h,
+                                g_config.display.window.vsync ? 1 : 0);
+#endif
+}
+
 /**
  * Renders the main interface. Usually called from the main thread,
  * but may sometimes be called from another thread.
@@ -906,6 +934,8 @@ static void render_canvas_frame(struct xemu_console *scon)
 {
     int display_w = 0;
     int display_h = 0;
+
+    publish_wgpu_window();
 
     if (nv2a_wgpu_display_size(&display_w, &display_h)) {
         xemu_hud_set_device_frame(display_w, display_h);
@@ -1153,6 +1183,74 @@ static void poll_events(struct xemu_console *scon)
     xemu_main_loop_unlock();
 }
 
+#ifndef __EMSCRIPTEN__
+static bool attach_wgpu_window(SDL_Window *window)
+{
+    const char *driver = SDL_GetCurrentVideoDriver();
+    SDL_PropertiesID props = SDL_GetWindowProperties(window);
+    int kind = 0;
+    void *primary = NULL;
+    void *secondary = NULL;
+    uint64_t x_window = 0;
+
+#ifdef __APPLE__
+    (void)driver;
+    (void)props;
+    m_metal_view = SDL_Metal_CreateView(window);
+    primary = m_metal_view ? SDL_Metal_GetLayer(m_metal_view) : NULL;
+    if (!primary) {
+        fprintf(stderr, "[WebGPU] SDL_Metal_CreateView failed: %s\n",
+                SDL_GetError());
+        return false;
+    }
+    kind = NV2A_WGPU_WINDOW_METAL;
+    fprintf(stderr, "[WebGPU] Window presents with Metal\n");
+#elif defined(_WIN32)
+    (void)driver;
+    secondary = SDL_GetPointerProperty(
+        props, SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+    primary = SDL_GetPointerProperty(
+        props, SDL_PROP_WINDOW_WIN32_INSTANCE_POINTER, NULL);
+    if (!secondary) {
+        fprintf(stderr, "[WebGPU] Window has no HWND\n");
+        return false;
+    }
+    kind = NV2A_WGPU_WINDOW_HWND;
+    fprintf(stderr, "[WebGPU] Window presents with HWND\n");
+#else
+    if (driver && !strcmp(driver, "wayland")) {
+        primary = SDL_GetPointerProperty(
+            props, SDL_PROP_WINDOW_WAYLAND_DISPLAY_POINTER, NULL);
+        secondary = SDL_GetPointerProperty(
+            props, SDL_PROP_WINDOW_WAYLAND_SURFACE_POINTER, NULL);
+        if (!primary || !secondary) {
+            fprintf(stderr, "[WebGPU] Window has no Wayland surface\n");
+            return false;
+        }
+        kind = NV2A_WGPU_WINDOW_WAYLAND;
+        fprintf(stderr, "[WebGPU] Window presents with Wayland\n");
+    } else {
+        primary = SDL_GetPointerProperty(
+            props, SDL_PROP_WINDOW_X11_DISPLAY_POINTER, NULL);
+        x_window = (uint64_t)SDL_GetNumberProperty(
+            props, SDL_PROP_WINDOW_X11_WINDOW_NUMBER, 0);
+        if (!primary || x_window == 0) {
+            fprintf(stderr, "[WebGPU] Window has no X11 window\n");
+            return false;
+        }
+        kind = NV2A_WGPU_WINDOW_XLIB;
+        fprintf(stderr, "[WebGPU] Window presents with X11\n");
+    }
+#endif
+    m_wgpu_kind = kind;
+    m_wgpu_primary = primary;
+    m_wgpu_secondary = secondary;
+    m_wgpu_x_window = x_window;
+    publish_wgpu_window();
+    return true;
+}
+#endif
+
 static void display_very_early_init(DisplayOptions *o)
 {
 #ifdef __linux__
@@ -1176,15 +1274,17 @@ static void display_very_early_init(DisplayOptions *o)
 #endif
     SDL_SetHint(SDL_HINT_VIDEO_MINIMIZE_ON_FOCUS_LOSS, "0");
 
-    bool webgpu_canvas = false;
-#ifdef __EMSCRIPTEN__
-    webgpu_canvas =
+    bool webgpu_present = false;
+#ifdef CONFIG_WEBGPU
+    webgpu_present =
         g_config.display.renderer == CONFIG_DISPLAY_RENDERER_WEBGPU;
 #endif
 
     // Initialize rendering context
-    if (webgpu_canvas) {
+    if (webgpu_present) {
+#ifdef __EMSCRIPTEN__
         fprintf(stderr, "[WebGPU] Window presents to the canvas\n");
+#endif
     } else {
     SDL_GL_SetAttribute(SDL_GL_RED_SIZE, 8);
     SDL_GL_SetAttribute(SDL_GL_GREEN_SIZE, 8);
@@ -1241,9 +1341,16 @@ static void display_very_early_init(DisplayOptions *o)
     }
 
     SDL_WindowFlags window_flags = (SDL_WindowFlags)(SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
-    if (!webgpu_canvas) {
+    if (!webgpu_present) {
         window_flags |= SDL_WINDOW_OPENGL;
     }
+#ifdef __APPLE__
+    else {
+        /* The Metal view has to be the window content, or the presented
+         * layer sits under an opaque view and the window stays black. */
+        window_flags |= SDL_WINDOW_METAL;
+    }
+#endif
 
     // Create main window
     m_window = SDL_CreateWindow(
@@ -1263,7 +1370,20 @@ static void display_very_early_init(DisplayOptions *o)
         SDL_SetWindowPosition(m_window, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED);
     }
 
-    if (webgpu_canvas) {
+    if (webgpu_present) {
+#ifndef __EMSCRIPTEN__
+        if (!attach_wgpu_window(m_window)) {
+            SDL_ShowSimpleMessageBox(
+                SDL_MESSAGEBOX_ERROR, "Unable to create WebGPU window",
+                "Unable to create a WebGPU surface for this window.\r\n"
+                "\r\n"
+                "xemu cannot continue and will now exit.",
+                m_window);
+            SDL_DestroyWindow(m_window);
+            SDL_Quit();
+            exit(1);
+        }
+#endif
         m_context = NULL;
         nv2a_context_init();
     } else {
@@ -1318,14 +1438,16 @@ static void display_very_early_init(DisplayOptions *o)
 static void display_early_init(DisplayOptions *o)
 {
     assert(o->type == DISPLAY_TYPE_XEMU);
-    display_opengl = 1;
+    display_opengl = m_context ? 1 : 0;
 
     if (m_context) {
         SDL_GL_MakeCurrent(m_window, m_context);
         SDL_GL_SetSwapInterval(g_config.display.window.vsync ? 1 : 0);
     }
 #ifdef _WIN32
-    win32_dxgi_present_init(m_window);
+    if (m_context) {
+        win32_dxgi_present_init(m_window);
+    }
 #endif
     xemu_hud_init(m_window, m_context);
 }
@@ -1422,6 +1544,12 @@ static void display_finalize(void)
         SDL_GL_MakeCurrent(NULL, NULL);
         SDL_GL_DestroyContext(m_context);
     }
+#ifdef __APPLE__
+    if (m_metal_view) {
+        SDL_Metal_DestroyView(m_metal_view);
+        m_metal_view = NULL;
+    }
+#endif
     SDL_DestroyWindow(m_window);
     SDL_Quit();
 }
