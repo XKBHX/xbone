@@ -77,8 +77,12 @@ are still open, plus what the current browser link actually does.
   Emscripten's `-lGL`, even though OpenGL is disabled.
   `OFFSCREENCANVAS_SUPPORT` needs that GL library so Emscripten can
   transfer `#canvas`. The WebGPU present does not draw with WebGL.
-- There is no file system yet for a user-supplied BIOS, MCPX, or HDD
-  image (OPFS or Emscripten's `FS`).
+- The launcher copies a user-supplied MCPX, BIOS, HDD, EEPROM, and disc
+  into Emscripten's in-memory filesystem before boot. The same files are
+  stored in the origin private file system, so the next visit can start
+  without choosing them again. Guest writes to the HDD and EEPROM are
+  copied back when xemu exits. A crash, or closing the tab, drops writes
+  since that exit. The images still reside in memory while xemu runs.
 - `tests/docker/dockerfiles/emsdk-wasm32-cross.docker` is still emsdk
   3.1.50. The local browser build uses emsdk 6.0.12. Xbox dependencies
   (SDL3, libslirp, and others) are not in that image. `emdawnwebgpu` needs

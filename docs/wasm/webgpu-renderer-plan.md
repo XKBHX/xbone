@@ -978,7 +978,9 @@ Prerequisites outside the renderer, tracked separately:
 - Make `epoxy`/OpenGL optional in `meson.build` when the WebGPU UI is
   selected.
 - Provide a file system for user-supplied BIOS, MCPX and HDD images (OPFS or
-  `FS`).
+  `FS`). The launcher does this: it writes the chosen images into
+  Emscripten's in-memory filesystem, keeps a copy in the origin private
+  file system, and copies the HDD and EEPROM back there when xemu exits.
 - Add Xbox dependencies (SDL3, libslirp, and others) to
   `tests/docker/dockerfiles/emsdk-wasm32-cross.docker`, and bump emsdk past
   the pinned 3.1.50. `emdawnwebgpu` and the wasm TCG backend

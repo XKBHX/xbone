@@ -111,6 +111,7 @@
   <ul id="checks"></ul>
 
   <h2>System files</h2>
+  <p id="saved-note" style="color: var(--muted); margin: 0 0 8px;">Choose the MCPX, BIOS, and hard disk. They are kept in this browser.</p>
   <label for="f-bootrom">MCPX Boot ROM <small>(512 bytes)</small></label>
   <input type="file" id="f-bootrom">
   <label for="f-flash">Flash ROM (BIOS)</label>
@@ -153,6 +154,7 @@
   <button id="start" disabled>Start</button>
   <div class="toolbar">
     <button id="fullscreen" disabled>Fullscreen</button>
+    <button id="forget" disabled>Forget saved files</button>
     <button id="clear-log">Clear log</button>
   </div>
 </aside>
@@ -219,11 +221,75 @@ const files = {
   eeprom: $("f-eeprom"),
   dvd: $("f-dvd"),
 };
+const OPFS_NAMES = {
+  bootrom: "mcpx.bin",
+  flash: "flash.bin",
+  hdd: "hdd.qcow2",
+  eeprom: "eeprom.bin",
+  dvd: "disc.iso",
+};
+const REQUIRED_FILES = ["bootrom", "flash", "hdd"];
+// Sizes of files already stored in this origin's private file system.
+let saved = {};
+
+function hasFile(key) {
+  return files[key].files.length > 0 || Number.isFinite(saved[key]);
+}
 
 function updateStart() {
-  const required = files.bootrom.files.length && files.flash.files.length &&
-                   files.hdd.files.length;
-  startBtn.disabled = !(envOk && required);
+  const required = REQUIRED_FILES.every(hasFile);
+  const busy = files.bootrom.disabled;
+  startBtn.disabled = busy || !(envOk && required);
+  $("forget").disabled = Object.keys(saved).length === 0;
+  const note = $("saved-note");
+  if (Object.keys(saved).length) {
+    const parts = Object.entries(saved).map(([key, size]) => `${key} (${size} bytes)`);
+    note.textContent = `Saved in this browser: ${parts.join(", ")}. Choose a file to replace it.`;
+  } else {
+    note.textContent = "Choose the MCPX, BIOS, and hard disk. They are kept in this browser.";
+  }
+}
+
+async function opfsDir(create) {
+  if (!navigator.storage?.getDirectory) return null;
+  const root = await navigator.storage.getDirectory();
+  try {
+    return await root.getDirectoryHandle("xemu", { create: !!create });
+  } catch (e) {
+    if (!create && e?.name === "NotFoundError") return null;
+    throw e;
+  }
+}
+
+async function refreshSaved() {
+  saved = {};
+  if (!navigator.storage?.getDirectory) {
+    check("Browser file storage", "warn", "not available");
+    updateStart();
+    return;
+  }
+  check("Browser file storage", "ok", "OPFS");
+  try {
+    const dir = await opfsDir(false);
+    if (dir) {
+      for (const [key, name] of Object.entries(OPFS_NAMES)) {
+        try {
+          const handle = await dir.getFileHandle(name);
+          const file = await handle.getFile();
+          saved[key] = file.size;
+        } catch (e) {
+          if (e?.name !== "NotFoundError") throw e;
+        }
+      }
+    }
+  } catch (e) {
+    log(`Could not read saved system files: ${e}`, true);
+  }
+  if (REQUIRED_FILES.every((key) => Number.isFinite(saved[key]))) {
+    setStatus("Saved system files found. Press Start, or choose files to replace them.");
+    log(`Saved system files: ${Object.entries(saved).map(([k, n]) => `${k} ${n}`).join(", ")}`);
+  }
+  updateStart();
 }
 Object.values(files).forEach((el) => el.addEventListener("change", updateStart));
 updateStart();
@@ -258,21 +324,37 @@ function buildConfig(paths) {
   ].join("\n");
 }
 
-async function readSelected() {
+async function gatherFiles() {
   const out = {};
-  let total = 0;
   for (const [key, el] of Object.entries(files)) {
     const file = el.files[0];
-    if (!file) continue;
-    total += file.size;
-    out[key] = { name: file.name, file };
+    if (file) out[key] = { name: file.name, file, fromOpfs: false };
   }
-  if (out.bootrom && out.bootrom.file.size !== 512) {
+  const dir = await opfsDir(false);
+  if (dir) {
+    for (const [key, name] of Object.entries(OPFS_NAMES)) {
+      if (out[key]) continue;
+      try {
+        const handle = await dir.getFileHandle(name);
+        const file = await handle.getFile();
+        out[key] = { name: file.name, file, fromOpfs: true };
+      } catch (e) {
+        if (e?.name !== "NotFoundError") throw e;
+      }
+    }
+  }
+  const missing = REQUIRED_FILES.filter((key) => !out[key]);
+  if (missing.length) {
+    throw new Error(`Missing system files: ${missing.join(", ")}`);
+  }
+  if (out.bootrom.file.size !== 512) {
     throw new Error(`MCPX Boot ROM must be 512 bytes, got ${out.bootrom.file.size}`);
   }
   if (out.eeprom && out.eeprom.file.size !== 256) {
     throw new Error(`EEPROM must be 256 bytes, got ${out.eeprom.file.size}`);
   }
+  let total = 0;
+  for (const entry of Object.values(out)) total += entry.file.size;
   if (total > 1.5 * 2 ** 30) {
     log(`Warning: ${(total / 2 ** 30).toFixed(2)} GiB of images will be copied ` +
         "into the in-memory filesystem. The browser may run out of memory.", true);
@@ -285,18 +367,54 @@ async function readSelected() {
   return out;
 }
 
+async function storeNewFiles(selected) {
+  const fresh = Object.entries(selected).filter(([, entry]) => !entry.fromOpfs);
+  if (!fresh.length) return;
+  const dir = await opfsDir(true);
+  if (!dir) {
+    log("This browser has no private file storage. Files last for this visit only.", true);
+    return;
+  }
+  for (const [key, entry] of fresh) {
+    setStatus(`Saving ${entry.name} in this browser...`);
+    const handle = await dir.getFileHandle(OPFS_NAMES[key], { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(entry.data);
+    await writable.close();
+    saved[key] = entry.data.length;
+    log(`Stored ${key} in browser storage (${entry.data.length} bytes)`);
+  }
+  updateStart();
+}
+
+async function persistGuestFiles(FS) {
+  const dir = await opfsDir(true);
+  if (!dir) return;
+  for (const name of ["hdd.qcow2", "eeprom.bin"]) {
+    const path = `${ROOT}/${name}`;
+    let data;
+    try {
+      data = FS.readFile(path);
+    } catch (e) {
+      continue;
+    }
+    setStatus(`Saving ${name}...`);
+    const handle = await dir.getFileHandle(name, { create: true });
+    const writable = await handle.createWritable();
+    await writable.write(data);
+    await writable.close();
+    const key = Object.keys(OPFS_NAMES).find((item) => OPFS_NAMES[item] === name);
+    if (key) saved[key] = data.length;
+    log(`Saved ${name} (${data.length} bytes) to browser storage`);
+  }
+  updateStart();
+}
+
 function installFiles(FS, selected) {
   FS.mkdirTree(ROOT);
   const paths = { eeprom: `${ROOT}/eeprom.bin` };
-  const names = {
-    bootrom: "mcpx.bin",
-    flash: "flash.bin",
-    hdd: "hdd.qcow2",
-    eeprom: "eeprom.bin",
-    dvd: "disc.iso",
-  };
   for (const [key, entry] of Object.entries(selected)) {
-    const path = `${ROOT}/${names[key]}`;
+    const path = `${ROOT}/${OPFS_NAMES[key]}`;
     FS.writeFile(path, entry.data);
     entry.data = null;
     paths[key] = path;
@@ -312,12 +430,13 @@ async function start() {
 
   let selected;
   try {
-    selected = await readSelected();
+    selected = await gatherFiles();
+    await storeNewFiles(selected);
   } catch (e) {
     log(String(e.message ?? e), true);
     setStatus("Failed to read files. See log.");
-    startBtn.disabled = false;
     Object.values(files).forEach((el) => (el.disabled = false));
+    updateStart();
     return;
   }
 
@@ -332,6 +451,7 @@ async function start() {
   }
 
   const moduleBase = new URL(MODULE_URL, location.href);
+  let runtime = null;
   const Module = {
     canvas,
     // SDL replaces this. Defining it keeps Emscripten's assertion builds
@@ -342,7 +462,10 @@ async function start() {
     print: (text) => log(text),
     printErr: (text) => log(text, true),
     setStatus: (text) => setStatus(text),
-    preRun: [(mod) => installFiles(mod.FS, selected)],
+    preRun: [(mod) => {
+      runtime = mod;
+      installFiles(mod.FS, selected);
+    }],
     onRuntimeInitialized: () => {
       setStatus(null);
       $("fullscreen").disabled = false;
@@ -354,7 +477,18 @@ async function start() {
     },
     onExit: (code) => {
       log(`xemu exited with code ${code}`);
-      setStatus(`Exited (${code}).`);
+      const fs = runtime?.FS;
+      if (!fs) {
+        setStatus(`Exited (${code}).`);
+        return;
+      }
+      setStatus(`Exited (${code}). Saving disk...`);
+      persistGuestFiles(fs).then(() => {
+        setStatus(`Exited (${code}). Disk saved in this browser.`);
+      }).catch((err) => {
+        log(`Could not save the disk: ${err}`, true);
+        setStatus(`Exited (${code}). Disk was not saved.`);
+      });
     },
   };
 
@@ -367,6 +501,23 @@ async function start() {
 }
 
 startBtn.addEventListener("click", start);
+$("forget").addEventListener("click", async () => {
+  $("forget").disabled = true;
+  try {
+    if (navigator.storage?.getDirectory) {
+      const root = await navigator.storage.getDirectory();
+      await root.removeEntry("xemu", { recursive: true });
+    }
+    saved = {};
+    log("Forgot saved system files");
+    setStatus("Select the system files, then press Start.");
+  } catch (e) {
+    if (e?.name !== "NotFoundError") log(`Could not forget saved files: ${e}`, true);
+    saved = {};
+  }
+  updateStart();
+});
+refreshSaved();
 
 if (params.get("autostart") === "1") {
   const fixtures = {
