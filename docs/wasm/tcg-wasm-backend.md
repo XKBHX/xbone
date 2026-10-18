@@ -176,13 +176,15 @@ emmake make -j$(nproc)
 The summary prints `TCG backend: native (WebAssembly module per TB)`. Add
 `--enable-tcg-interpreter` to get TCI again, for comparison.
 
-A full xemu WebAssembly build is still blocked by the desktop OpenGL UI and
-renderer (`epoxy` is required). See [README.md](README.md).
+A full xemu WebAssembly build now links. See [README.md](README.md). The
+browser host work that is still open is in
+[remaining-work.md](remaining-work.md).
 
 ## Validation
 
-Since xemu itself cannot link for the web yet, the backend was tested on an
-upstream QEMU 10.2.0 tree with the same changes. xemu's `tcg/tcg.c`,
+This validation predates the xemu browser link in [README.md](README.md).
+The backend was tested on an upstream QEMU 10.2.0 tree with the same
+changes. xemu's `tcg/tcg.c`,
 `tcg/region.c` and `tcg/wasm.c` were also compiled with `-DXBOX` against
 the backend, with no warnings. Both trees were built with `--enable-debug`
 (TCG assertions on) and emsdk 3.1.50, and `qemu-system-i386` was run under

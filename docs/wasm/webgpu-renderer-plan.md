@@ -23,10 +23,12 @@ Goals:
 
 Non-goals for this plan:
 
-- Making the guest CPU fast enough in the browser. Under WASM, xemu runs x86
-  code through the TCG interpreter (TCI); see [README.md](README.md). That is
-  a separate project. A WebGPU renderer is worth having natively even if
-  browser performance stays poor.
+- Making the guest CPU fast enough in the browser. `tcg/wasm` replaces TCI
+  on `wasm32` and is still short of real time; see
+  [cpu-realtime.md](cpu-realtime.md) and
+  [remaining-work.md](remaining-work.md). That is a separate project. A
+  WebGPU renderer is worth having natively even if browser performance stays
+  poor.
 - Replacing the OpenGL or Vulkan renderers.
 
 ## 2. Key design decisions

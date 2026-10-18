@@ -2,21 +2,27 @@
 
 The Xbox CPU is a single-core, 32-bit x86 Pentium III-class chip at
 733 MHz, with MMX and SSE. Natively, xemu runs it with QEMU's TCG JIT, which
-translates x86 into host machine code. Under Emscripten, this tree can only
-use **TCI**, the TCG interpreter. This document explains why that is slow,
-lists the options in order of payoff, and gives a measurement plan so each
-option is judged by numbers.
+translates x86 into host machine code. Under Emscripten, `tcg/wasm` replaces
+TCI unless the build is configured with `--enable-tcg-interpreter`. Guest
+speed is still short of real time. This document explains where the time
+goes, lists the options in order of payoff, and gives a measurement plan so
+each option is judged by numbers. What is left is summarized in
+[remaining-work.md](remaining-work.md).
 
 ## 1. Where the time goes today
 
-1. **TCI interprets every TCG op.** The front end still translates guest
-   x86 into TCG IR, but instead of emitting host code, `tcg/tci.c` decodes
-   and dispatches each IR op in a C loop. That costs a decode and an
-   indirect branch per op, plus register-file traffic through memory. TCI is
+1. **TCI interprets every TCG op,** when the build uses
+   `--enable-tcg-interpreter`. The front end still translates guest x86
+   into TCG IR, but instead of emitting host code, `tcg/tci.c` decodes and
+   dispatches each IR op in a C loop. That costs a decode and an indirect
+   branch per op, plus register-file traffic through memory. TCI is
    commonly an order of magnitude or more slower than a native TCG backend.
+   The default wasm32 build uses `tcg/wasm` instead. Its remaining cost is
+   one module per translation block and a return to C between blocks. See
+   [tcg-wasm-backend.md](tcg-wasm-backend.md).
 2. **Software MMU on every memory access.** Every guest load and store goes
    through the soft-TLB. Native backends inline the fast path. TCI pays a
-   helper-style lookup for each access.
+   helper-style lookup for each access. `tcg/wasm` inlines that fast path.
 3. **WebAssembly can't jump into code it generates.** A wasm module can't
    create and run new code inside itself. Generated code has to become a new
    `WebAssembly.Module` that JavaScript compiles and instantiates, so each
