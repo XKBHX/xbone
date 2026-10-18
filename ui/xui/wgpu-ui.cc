@@ -4,7 +4,9 @@
  * The UI thread builds ImDrawData and HUD commands. It posts a copy to the
  * PFIFO thread, which records the game composite and the UI pass into one
  * image. Natively that image is read back into the OpenGL window. In the
- * browser the passes are recorded into the canvas current texture. Texture
+ * browser the gamma blit and ImGui are one submit into the canvas current
+ * texture. That texture is acquired after any suspending wait, because the
+ * browser expires it when the worker's JavaScript task ends. Texture
  * ids in the draw lists are handles into the PFIFO-side texture table.
  *
  * Copyright (c) 2026 xemu Project
@@ -131,15 +133,14 @@ static bool create_overlay_gl(void)
      * compile an overlay into, and epoxy would dlopen libEGL.so.1. */
     return true;
 #endif
-    static const char *vs_src =
-        "#version 150 core\n"
-        "in vec2 a_pos;\n"
-        "in vec2 a_uv;\n"
-        "out vec2 v_uv;\n"
-        "void main() {\n"
-        "    v_uv = a_uv;\n"
-        "    gl_Position = vec4(a_pos, 0.0, 1.0);\n"
-        "}\n";
+    static const char *vs_src = "#version 150 core\n"
+                                "in vec2 a_pos;\n"
+                                "in vec2 a_uv;\n"
+                                "out vec2 v_uv;\n"
+                                "void main() {\n"
+                                "    v_uv = a_uv;\n"
+                                "    gl_Position = vec4(a_pos, 0.0, 1.0);\n"
+                                "}\n";
     static const char *fs_src =
         "#version 150 core\n"
         "in vec2 v_uv;\n"
@@ -835,11 +836,13 @@ static void record_imgui(bool scene)
     int height;
     bool same_target;
     size_t bytes;
+    WGPUCommandEncoder encoder = NULL;
 
     bool to_canvas = g_canvas_view != NULL;
 
     g_present_ok = false;
     if (!draw_data->Valid) {
+        wgpu_helpers_submit_pending();
         return;
     }
     width = (int)(draw_data->DisplaySize.x * draw_data->FramebufferScale.x);
@@ -847,9 +850,11 @@ static void record_imgui(bool scene)
     same_target = to_canvas || (g_target && g_target_width == width &&
                                 g_target_height == height);
     if (width <= 0 || height <= 0) {
+        wgpu_helpers_submit_pending();
         return;
     }
     if (!to_canvas && !ensure_target(width, height)) {
+        wgpu_helpers_submit_pending();
         return;
     }
     if (!same_target) {
@@ -857,20 +862,30 @@ static void record_imgui(bool scene)
     }
     translate_draw_textures(draw_data);
 
-    /* The canvas has no pixel readback. An error-scope wait would suspend
-     * the worker on every present. Uncaptured errors still log. */
-    if (!to_canvas) {
-        wgpuDevicePushErrorScope(g_device, WGPUErrorFilter_Validation);
-    }
-
     WGPUCommandEncoderDescriptor encoder_desc =
         WGPU_COMMAND_ENCODER_DESCRIPTOR_INIT;
     WGPURenderPassColorAttachment color =
         WGPU_RENDER_PASS_COLOR_ATTACHMENT_INIT;
     WGPURenderPassDescriptor pass_desc = WGPU_RENDER_PASS_DESCRIPTOR_INIT;
-    encoder_desc.label = wgpu_label("ImGui");
-    WGPUCommandEncoder encoder =
-        wgpuDeviceCreateCommandEncoder(g_device, &encoder_desc);
+    if (to_canvas) {
+        /* Gamma is already recorded here, so ImGui joins that submit. */
+        encoder = wgpu_helpers_take_encoder();
+    } else {
+        wgpu_helpers_submit_pending();
+    }
+    if (!encoder) {
+        encoder_desc.label = wgpu_label("ImGui");
+        encoder = wgpuDeviceCreateCommandEncoder(g_device, &encoder_desc);
+    }
+    if (!encoder) {
+        return;
+    }
+
+    /* The canvas has no pixel readback. An error-scope wait would suspend
+     * the worker and expire the canvas texture. Uncaptured errors still log. */
+    if (!to_canvas) {
+        wgpuDevicePushErrorScope(g_device, WGPUErrorFilter_Validation);
+    }
 
     color.view = to_canvas ? g_canvas_view : g_target_view;
     color.loadOp = scene ? WGPULoadOp_Load : WGPULoadOp_Clear;
@@ -882,11 +897,13 @@ static void record_imgui(bool scene)
 
     WGPURenderPassEncoder pass =
         wgpuCommandEncoderBeginRenderPass(encoder, &pass_desc);
-    ImGui_ImplWGPU_RenderDrawData(draw_data, pass);
-    wgpuRenderPassEncoderEnd(pass);
-    wgpuRenderPassEncoderRelease(pass);
+    if (pass) {
+        ImGui_ImplWGPU_RenderDrawData(draw_data, pass);
+        wgpuRenderPassEncoderEnd(pass);
+        wgpuRenderPassEncoderRelease(pass);
+    }
 
-    if (!to_canvas) {
+    if (!to_canvas && encoder) {
         WGPUTexelCopyTextureInfo src = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
         WGPUTexelCopyBufferInfo dst = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
         WGPUExtent3D extent = { (uint32_t)width, (uint32_t)height, 1 };
@@ -900,17 +917,22 @@ static void record_imgui(bool scene)
 
     WGPUCommandBufferDescriptor command_desc =
         WGPU_COMMAND_BUFFER_DESCRIPTOR_INIT;
-    WGPUCommandBuffer commands =
-        wgpuCommandEncoderFinish(encoder, &command_desc);
-    wgpuCommandEncoderRelease(encoder);
-    wgpuQueueSubmit(g_queue, 1, &commands);
-    wgpuCommandBufferRelease(commands);
+    WGPUCommandBuffer commands = NULL;
+    if (encoder) {
+        commands = wgpuCommandEncoderFinish(encoder, &command_desc);
+        wgpuCommandEncoderRelease(encoder);
+    }
+    if (commands) {
+        wgpuQueueSubmit(g_queue, 1, &commands);
+        wgpuCommandBufferRelease(commands);
+        if (to_canvas) {
+            g_canvas_presented.store(true, std::memory_order_release);
+        }
+    }
 
-    MapState map_state = {};
-    WGPUBufferMapCallbackInfo map_cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
-    if (to_canvas) {
-        g_canvas_presented.store(true, std::memory_order_release);
-    } else {
+    if (!to_canvas) {
+        MapState map_state = {};
+        WGPUBufferMapCallbackInfo map_cb = WGPU_BUFFER_MAP_CALLBACK_INFO_INIT;
         bytes = (size_t)g_target_stride * (size_t)height;
         map_cb.mode = WGPUCallbackMode_WaitAnyOnly;
         map_cb.callback = buffer_map_callback;
@@ -932,9 +954,7 @@ static void record_imgui(bool scene)
             }
             wgpuBufferUnmap(g_readback);
         }
-    }
 
-    if (!to_canvas) {
         ErrorState error_state = {};
         WGPUPopErrorScopeCallbackInfo pop_cb =
             WGPU_POP_ERROR_SCOPE_CALLBACK_INFO_INIT;
@@ -968,51 +988,78 @@ extern "C" bool xemu_wgpu_ui_needs_display(void)
 extern "C" void xemu_wgpu_ui_execute(WGPUInstance instance, WGPUDevice device,
                                      WGPUQueue queue, WGPUTextureView display,
                                      int display_width, int display_height,
-                                     WGPUTextureView canvas, int canvas_width,
-                                     int canvas_height,
-                                     WGPUTextureFormat canvas_format)
+                                     const XemuWgpuCanvasOps *canvas)
 {
     static bool logged;
     int job = g_job.load(std::memory_order_acquire);
+    bool canvas_view = false;
 
     g_instance = instance;
     g_device = device;
     g_queue = queue;
+    g_canvas_view = NULL;
     g_canvas_presented.store(false, std::memory_order_release);
-    if (canvas && canvas_width > 0 && canvas_height > 0 &&
-        canvas_format != WGPUTextureFormat_Undefined) {
-        g_canvas_view = canvas;
-        g_target_format = canvas_format;
-    } else {
-        g_canvas_view = NULL;
-        g_target_format = WGPUTextureFormat_RGBA8Unorm;
-    }
+    wgpu_helpers_set_no_suspend(false);
     if (job == XEMU_WGPU_UI_JOB_SHUTDOWN) {
         release_ui_gpu();
-    } else if (!ensure_backend()) {
-        /* The NV2A device is created on the PFIFO thread after UI init.
-         * The next frame retries. */
     } else {
-        if (!logged) {
-            fprintf(stderr,
-                    "[WebGPU] UI pass is recorded on the PFIFO device\n");
-            logged = true;
+        WGPUTextureFormat canvas_format = WGPUTextureFormat_Undefined;
+
+        /* Format only. getCurrentTexture waits until the passes that can
+         * suspend have finished. */
+        if (canvas && canvas->describe &&
+            canvas->describe(canvas->opaque, NULL, NULL, &canvas_format) &&
+            canvas_format != WGPUTextureFormat_Undefined) {
+            g_target_format = canvas_format;
         }
-        wgpu_helpers_set_window_format(g_target_format);
-        if (g_fonts_dirty) {
-            ImGui_ImplWGPU_CreateDeviceObjects();
-            adopt_font();
-            g_fonts_dirty = false;
-        }
-        if (job == XEMU_WGPU_UI_JOB_FRAME) {
-            bool scene =
-                wgpu_helpers_replay(display, display_width, display_height);
-            record_imgui(scene);
-            wgpu_helpers_retire();
-        } else if (job == XEMU_WGPU_UI_JOB_PNG) {
-            wgpu_helpers_run_png(display);
+        if (!ensure_backend()) {
+            /* The NV2A device is created on the PFIFO thread after UI init.
+             * The next frame retries. */
+        } else {
+            if (!logged) {
+                fprintf(stderr,
+                        "[WebGPU] UI pass is recorded on the PFIFO device\n");
+                logged = true;
+            }
+            wgpu_helpers_set_window_format(g_target_format);
+            if (g_fonts_dirty) {
+                ImGui_ImplWGPU_CreateDeviceObjects();
+                adopt_font();
+                g_fonts_dirty = false;
+            }
+            if (job == XEMU_WGPU_UI_JOB_FRAME) {
+                bool scene;
+
+                wgpu_helpers_replay_offscreen();
+                wgpu_helpers_prepare_window();
+                if (canvas && canvas->acquire) {
+                    WGPUTextureView view = NULL;
+                    int width = 0;
+                    int height = 0;
+                    WGPUTextureFormat format = WGPUTextureFormat_Undefined;
+
+                    wgpu_helpers_set_no_suspend(true);
+                    if (canvas->acquire(canvas->opaque, &view, &width, &height,
+                                        &format) &&
+                        view && width > 0 && height > 0 &&
+                        format == g_target_format) {
+                        g_canvas_view = view;
+                        canvas_view = true;
+                    } else {
+                        wgpu_helpers_set_no_suspend(false);
+                    }
+                }
+                scene = wgpu_helpers_replay_window(display, display_width,
+                                                   display_height, canvas_view);
+                record_imgui(scene);
+                wgpu_helpers_set_no_suspend(false);
+                wgpu_helpers_retire();
+            } else if (job == XEMU_WGPU_UI_JOB_PNG) {
+                wgpu_helpers_run_png(display);
+            }
         }
     }
+    wgpu_helpers_set_no_suspend(false);
     g_canvas_view = NULL;
     g_instance = NULL;
     g_device = NULL;

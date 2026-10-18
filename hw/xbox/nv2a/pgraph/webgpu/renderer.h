@@ -592,9 +592,14 @@ void pgraph_wgpu_init_display(PGRAPHState *pg);
 void pgraph_wgpu_finalize_display(PGRAPHState *pg);
 void pgraph_wgpu_render_display(PGRAPHState *pg);
 #ifdef __EMSCRIPTEN__
-/* Binds #canvas on the PFIFO thread. The view is owned by the display
- * until pgraph_wgpu_display_canvas_release. wgpuSurfacePresent is not
- * called. */
+/* Configures #canvas and reports its format. Does not call
+ * getCurrentTexture, so a later wait does not expire a canvas texture. */
+bool pgraph_wgpu_display_canvas_describe(PGRAPHWgpuState *r,
+                                         WGPUTextureFormat *format, int *width,
+                                         int *height);
+/* The view is owned by the display until pgraph_wgpu_display_canvas_release.
+ * Submit the passes that use it before any suspending wait.
+ * wgpuSurfacePresent is not called. */
 bool pgraph_wgpu_display_canvas_acquire(PGRAPHWgpuState *r,
                                         WGPUTextureView *view,
                                         WGPUTextureFormat *format, int *width,

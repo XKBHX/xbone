@@ -1,10 +1,13 @@
 /*
  * Browser canvas for the WebGPU display.
  *
- * The PFIFO thread owns the transferred OffscreenCanvas. Acquire returns
- * the current texture view. The caller records the PCRTC composite and the
- * UI into that view, then releases it. wgpuSurfacePresent aborts in
- * emdawnwebgpu; submitting the canvas texture is the present.
+ * The PFIFO thread owns the transferred OffscreenCanvas. Describe configures
+ * the surface and reports its format without calling getCurrentTexture.
+ * Acquire returns the current texture view. Call it only after any
+ * suspending wait: the browser expires that texture when the worker's
+ * JavaScript task ends. The caller records every canvas pass into one
+ * command buffer and submits once, then releases the view. wgpuSurfacePresent
+ * aborts in emdawnwebgpu; that submit is the present.
  *
  * Copyright (c) 2026 xemu Project
  *
@@ -38,7 +41,14 @@ typedef struct WgpuCanvas {
 
 void wgpu_canvas_init(WgpuCanvas *canvas);
 
-/* The returned view stays owned by `canvas` until wgpu_canvas_release. */
+/* Configures #canvas when its size changes. Does not call getCurrentTexture. */
+bool wgpu_canvas_describe(WgpuCanvas *canvas, WGPUInstance instance,
+                          WGPUAdapter adapter, WGPUDevice device,
+                          WGPUTextureFormat *format, uint32_t *width,
+                          uint32_t *height);
+
+/* The returned view stays owned by `canvas` until wgpu_canvas_release.
+ * A wait between this and the submit expires the texture. */
 bool wgpu_canvas_acquire(WgpuCanvas *canvas, WGPUInstance instance,
                          WGPUAdapter adapter, WGPUDevice device,
                          WGPUTextureFormat *format, uint32_t *width,

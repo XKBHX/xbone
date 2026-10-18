@@ -167,6 +167,7 @@ static WGPUCommandEncoder g_encoder;
 static WGPURenderPassEncoder g_pass;
 static std::vector<uint8_t> g_pass_uniforms;
 static uint32_t g_pass_base;
+static bool g_no_suspend;
 static int g_target_w;
 static int g_target_h;
 static int g_art_index;
@@ -615,8 +616,23 @@ static bool reserve_uniforms(void)
 {
     uint32_t need = g_uniform_stride * 64u;
 
+    if (g_uniform_stride == 0) {
+        return false;
+    }
     if (g_uniform_cursor > g_uniform_capacity ||
         g_uniform_capacity - g_uniform_cursor < need) {
+        /* A wait ends the worker's JavaScript task and expires the canvas
+         * texture. The canvas present sets g_no_suspend around that window. */
+        if (g_no_suspend) {
+            static int logged;
+
+            if (!logged) {
+                fprintf(stderr,
+                        "[WebGPU] Skipped a canvas pass that would suspend\n");
+                logged = 1;
+            }
+            return false;
+        }
         if (!wait_idle()) {
             return false;
         }
@@ -691,11 +707,13 @@ static bool begin_pass(WGPUTextureView view, float clear_alpha)
     if (!reserve_uniforms()) {
         return false;
     }
-    encoder_desc.label = wgpu_label("UI decal");
-    g_encoder =
-        wgpuDeviceCreateCommandEncoder(xemu_wgpu_ui_device(), &encoder_desc);
     if (!g_encoder) {
-        return false;
+        encoder_desc.label = wgpu_label("UI decal");
+        g_encoder = wgpuDeviceCreateCommandEncoder(xemu_wgpu_ui_device(),
+                                                   &encoder_desc);
+        if (!g_encoder) {
+            return false;
+        }
     }
     color.view = view;
     color.loadOp = WGPULoadOp_Clear;
@@ -1266,8 +1284,8 @@ static void rebuild_window_gamma(void)
         g_window_format == WGPUTextureFormat_RGBA8Unorm) {
         return;
     }
-    g_gamma_window = make_pipeline("fs_gamma", DECAL_BLEND_REPLACE,
-                                   g_window_format);
+    g_gamma_window =
+        make_pipeline("fs_gamma", DECAL_BLEND_REPLACE, g_window_format);
 }
 
 void wgpu_helpers_set_window_format(WGPUTextureFormat format)
@@ -1483,7 +1501,7 @@ static void replay_draw(const UiCmd &cmd)
     draw_quad(pipeline, g_art[cmd.art].group, uniform);
 }
 
-static bool replay_frame(const UiCmd &cmd, WGPUTextureView display)
+static bool replay_frame(const UiCmd &cmd, WGPUTextureView display, bool hold)
 {
     WGPUTextureView target = xemu_wgpu_ui_prepare_target(cmd.width, cmd.height);
     WGPUBindGroup source = NULL;
@@ -1513,22 +1531,20 @@ static bool replay_frame(const UiCmd &cmd, WGPUTextureView display)
         draw_gamma(source, scale, cmd.flip, window_gamma_pipeline());
     }
     end_render_pass();
-    submit_encoder();
+    /* Hold the encoder so the caller can record ImGui into this submit. */
+    if (!hold) {
+        submit_encoder();
+    }
     if (external) {
         wgpuBindGroupRelease(external);
     }
     return true;
 }
 
-bool wgpu_helpers_replay(WGPUTextureView display, int display_width,
-                         int display_height)
+void wgpu_helpers_replay_offscreen(void)
 {
-    bool scene = false;
-
-    (void)display_width;
-    (void)display_height;
     if (!g_gpu) {
-        return false;
+        return;
     }
     realize_images();
     for (const UiCmd &cmd : g_cmds) {
@@ -1545,14 +1561,61 @@ bool wgpu_helpers_replay(WGPUTextureView display, int display_width,
         } else if (cmd.op == UiOp::End) {
             end_render_pass();
             submit_encoder();
-        } else if (cmd.op == UiOp::Frame) {
-            if (replay_frame(cmd, display)) {
+        }
+    }
+    if (g_pass || g_encoder) {
+        end_render_pass();
+        submit_encoder();
+    }
+}
+
+void wgpu_helpers_prepare_window(void)
+{
+    if (!g_gpu) {
+        return;
+    }
+    /* Recycle the uniform buffer before getCurrentTexture. */
+    reserve_uniforms();
+}
+
+void wgpu_helpers_set_no_suspend(bool on)
+{
+    g_no_suspend = on;
+}
+
+bool wgpu_helpers_replay_window(WGPUTextureView display, int display_width,
+                                int display_height, bool hold_submit)
+{
+    bool scene = false;
+
+    (void)display_width;
+    (void)display_height;
+    if (g_gpu) {
+        for (const UiCmd &cmd : g_cmds) {
+            if (cmd.op == UiOp::Frame &&
+                replay_frame(cmd, display, hold_submit)) {
                 scene = true;
             }
         }
     }
     g_cmds.clear();
     return scene;
+}
+
+WGPUCommandEncoder wgpu_helpers_take_encoder(void)
+{
+    WGPUCommandEncoder encoder = g_encoder;
+
+    g_encoder = NULL;
+    return encoder;
+}
+
+void wgpu_helpers_submit_pending(void)
+{
+    if (g_pass) {
+        end_render_pass();
+    }
+    submit_encoder();
 }
 
 void wgpu_helpers_retire(void)

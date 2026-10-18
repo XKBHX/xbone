@@ -392,7 +392,8 @@ static void finalize_shared_os(WgpuDisplayState *disp)
     (void)disp;
 }
 
-static void ensure_display_pipeline(PGRAPHWgpuState *r, WGPUTextureFormat format);
+static void ensure_display_pipeline(PGRAPHWgpuState *r,
+                                    WGPUTextureFormat format);
 
 static bool adopt_shared_texture(PGRAPHWgpuState *r,
                                  WGPUSharedTextureMemory memory,
@@ -1111,7 +1112,8 @@ static WGPUBindGroupLayoutEntry sampler_entry(uint32_t binding)
     return entry;
 }
 
-static void ensure_display_pipeline(PGRAPHWgpuState *r, WGPUTextureFormat format)
+static void ensure_display_pipeline(PGRAPHWgpuState *r,
+                                    WGPUTextureFormat format)
 {
     WgpuDisplayState *disp = &r->display;
     WGPUPipelineLayoutDescriptor layout_desc =
@@ -1198,6 +1200,31 @@ void pgraph_wgpu_init_display(PGRAPHState *pg)
 }
 
 #ifdef __EMSCRIPTEN__
+bool pgraph_wgpu_display_canvas_describe(PGRAPHWgpuState *r,
+                                         WGPUTextureFormat *format, int *width,
+                                         int *height)
+{
+    uint32_t w = 0;
+    uint32_t h = 0;
+    WGPUTextureFormat fmt = WGPUTextureFormat_Undefined;
+
+    if (!r->instance || !r->adapter || !r->device ||
+        !wgpu_canvas_describe(&display_canvas, r->instance, r->adapter,
+                              r->device, &fmt, &w, &h)) {
+        return false;
+    }
+    if (format) {
+        *format = fmt;
+    }
+    if (width) {
+        *width = (int)w;
+    }
+    if (height) {
+        *height = (int)h;
+    }
+    return true;
+}
+
 bool pgraph_wgpu_display_canvas_acquire(PGRAPHWgpuState *r,
                                         WGPUTextureView *view,
                                         WGPUTextureFormat *format, int *width,
