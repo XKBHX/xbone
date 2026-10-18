@@ -13,6 +13,7 @@
 #include "qapi/error.h"
 #include "features.h"
 #include "renderer.h"
+#include "validation.h"
 #include "ui/xemu-settings.h"
 #include "ui/xui/wgpu-ui-pfifo.h"
 
@@ -453,14 +454,25 @@ static WGPUDevice request_device(PGRAPHWgpuState *r, Error **errp)
     descriptor.deviceLostCallbackInfo.callback = device_lost_callback;
 
 #ifndef __EMSCRIPTEN__
+    /* skip_validation turns frontend checks off. Disabling that toggle
+     * keeps them on when display.webgpu.validation is set. */
+    WGPUDawnTogglesDescriptor toggles = WGPU_DAWN_TOGGLES_DESCRIPTOR_INIT;
+    static const char *const skip_validation[] = { "skip_validation" };
     WGPUDawnCacheDeviceDescriptor cache =
         WGPU_DAWN_CACHE_DEVICE_DESCRIPTOR_INIT;
+
+    if (g_config.display.webgpu.validation) {
+        toggles.disabledToggleCount = ARRAY_SIZE(skip_validation);
+        toggles.disabledToggles = skip_validation;
+        descriptor.nextInChain = &toggles.chain;
+    }
     if (r->blob_cache && r->blob_cache->dir) {
         cache.isolationKey = pgraph_wgpu_str("xemu-nv2a");
         cache.dawnLoadCacheDataCallbackInfo.callback = blob_cache_load;
         cache.dawnLoadCacheDataCallbackInfo.userdata1 = r->blob_cache;
         cache.dawnStoreCacheDataCallbackInfo.callback = blob_cache_store;
         cache.dawnStoreCacheDataCallbackInfo.userdata1 = r->blob_cache;
+        cache.chain.next = descriptor.nextInChain;
         descriptor.nextInChain = &cache.chain;
     }
 #endif
@@ -660,8 +672,21 @@ bool pgraph_wgpu_init_instance(PGRAPHState *pg, Error **errp)
         return false;
     }
     fprintf(stderr, "[WebGPU] Blocking waits: %s\n", wgpu_wait_backend());
-#endif
+    if (g_config.display.webgpu.validation) {
+        fprintf(stderr,
+                "[WebGPU] display.webgpu.validation: the browser validates "
+                "commands. Dawn backend layers are not available.\n");
+    }
     r->instance = wgpuCreateInstance(&descriptor);
+#else
+    if (g_config.display.webgpu.validation) {
+        fprintf(stderr, "[WebGPU] Backend validation enabled. Expect "
+                        "performance impact.\n");
+        r->instance = pgraph_wgpu_create_validated_instance(&descriptor);
+    } else {
+        r->instance = wgpuCreateInstance(&descriptor);
+    }
+#endif
     if (!r->instance) {
         error_setg(errp, "Failed to create WebGPU instance");
         return false;
