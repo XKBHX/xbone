@@ -672,8 +672,10 @@ Phase 2 notes (step 7, reports and surface scale):
 - The WebGPU spec only requires an occlusion query to tell zero from
   non-zero. Dawn's Metal backend records
   `MTLVisibilityResultModeBoolean`, so a passing query comes back as 1.
-  That value is stored as returned. Dividing it by the scale factor
-  squared is wrong when the scale is greater than 1.
+  A query that returns more than one sample is a real count and is
+  divided by the scale factor squared, as in Vulkan. A result that never
+  exceeds 1 is written as 0 or 1, including when the scale is greater
+  than 1. The exact pixel count is still unavailable from a boolean query.
 - The scale factor comes from `display.quality.surface_scale`. Changing it
   downloads dirty surfaces at the old factor, then flushes and reloads, as
   in Vulkan. Surfaces, viewports, scissors, the display target, and
@@ -1226,8 +1228,9 @@ Phase 5 notes (browser step 2, canvas present):
   worker is where the device and the canvas are created.
   `configs/meson/emscripten.txt` adds
   `-sOFFSCREENCANVAS_SUPPORT=1` and forces the GL library in, which
-  Emscripten requires before it will transfer a canvas. The present path
-  does not draw with WebGL.
+  Emscripten requires before it will transfer a canvas. It also sets
+  `-sMAX_WEBGL_VERSION=2` so GLES3 entry points the UI still references
+  resolve from that library. The present path does not draw with WebGL.
 - On Emscripten, when `display.renderer` is `WEBGPU`, the SDL window is
   created without `SDL_WINDOW_OPENGL`. An OpenGL context would call
   `getContext` on the canvas and the later transfer would fail. Frames

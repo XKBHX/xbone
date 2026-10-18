@@ -117,8 +117,10 @@ What exists:
   `python3 wasm/serve.py --check` checks the headers without a browser.
 
 `build/wasm/xemu/qemu-system-i386.js` links with the local emsdk 6.0.12,
-WebGPU enabled, and OpenGL disabled. The browser UI still includes epoxy,
-so the link pulls in `libepoxy` and Emscripten's `-lGL`. The Rust DSP JIT
+WebGPU enabled, and OpenGL disabled. That link does not include
+`libepoxy`. Emscripten's `-lGL` stays so `OFFSCREENCANVAS_SUPPORT` can
+transfer `#canvas`, and `-sMAX_WEBGL_VERSION=2` supplies the GLES3
+entry points the UI still references. The Rust DSP JIT
 has no wasm32 archive, so this build uses the C interpreter. Guest CPU
 performance is not yet real time for a 733 MHz Pentium III. The wasm
 backend removes the interpreter, but still compiles one module per TB and

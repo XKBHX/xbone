@@ -1,3 +1,4 @@
+if opengl.found()
 specific_ss.add([sdl, gloffscreen, files(
 	'blit.c',
 	'debug.c',
@@ -11,3 +12,4 @@ specific_ss.add([sdl, gloffscreen, files(
 	'texture.c',
 	'vertex.c',
 	)])
+endif

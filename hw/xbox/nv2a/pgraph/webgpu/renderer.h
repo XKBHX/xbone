@@ -308,6 +308,10 @@ typedef struct PGRAPHWgpuState {
     bool occlusion_readback_pending;
     uint64_t occlusion_readback_bytes;
     uint32_t zpass_pixel_count_result;
+    /* True once a query returns more than one sample. A 0 or 1 result is
+     * the boolean occlusion query the spec allows, and must not be divided
+     * by the surface scale. */
+    bool zpass_pixel_count_is_samples;
 
     WGPUBuffer readback_buffer;
     uint64_t readback_buffer_size;

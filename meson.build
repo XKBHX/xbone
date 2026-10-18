@@ -1883,11 +1883,11 @@ if not get_option('coreaudio').auto() or (host_os == 'darwin' and have_system)
                          required: get_option('coreaudio'))
 endif
 
-epoxy = dependency('epoxy', required: true)
-# The browser UI includes epoxy headers even when the OpenGL renderer is
-# disabled. Emscripten's GL entry points come from -lGL.
-if host_os == 'emscripten'
-  epoxy = declare_dependency(dependencies: epoxy, link_args: ['-lGL'])
+# The browser build does not use libepoxy. OFFSCREENCANVAS_SUPPORT still
+# links Emscripten's GL library so the page can transfer #canvas.
+epoxy = not_found
+if host_os != 'emscripten'
+  epoxy = dependency('epoxy', required: true)
 endif
 
 opengl = not_found

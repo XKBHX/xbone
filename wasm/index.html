@@ -387,7 +387,11 @@ async function storeNewFiles(selected) {
   updateStart();
 }
 
-async function persistGuestFiles(FS) {
+let guestFs = null;
+let persistChain = Promise.resolve();
+let persistTimer = 0;
+
+async function persistGuestFiles(FS, quiet) {
   const dir = await opfsDir(true);
   if (!dir) return;
   for (const name of ["hdd.qcow2", "eeprom.bin"]) {
@@ -398,7 +402,7 @@ async function persistGuestFiles(FS) {
     } catch (e) {
       continue;
     }
-    setStatus(`Saving ${name}...`);
+    if (!quiet) setStatus(`Saving ${name}...`);
     const handle = await dir.getFileHandle(name, { create: true });
     const writable = await handle.createWritable();
     await writable.write(data);
@@ -409,6 +413,41 @@ async function persistGuestFiles(FS) {
   }
   updateStart();
 }
+
+function noteGuestFs(fs) {
+  guestFs = fs;
+  if (!persistTimer) {
+    persistTimer = setInterval(() => flushGuestFiles(true), 60000);
+  }
+}
+
+function flushGuestFiles(quiet) {
+  const fs = guestFs;
+  if (!fs) return Promise.resolve(false);
+  const done = persistChain
+    .then(() => persistGuestFiles(fs, quiet))
+    .then(() => true);
+  persistChain = done.catch((err) => {
+    log(`Could not save the disk: ${err}`, true);
+    return false;
+  });
+  return persistChain;
+}
+
+function stopGuestFs() {
+  const pending = flushGuestFiles(false);
+  guestFs = null;
+  if (persistTimer) {
+    clearInterval(persistTimer);
+    persistTimer = 0;
+  }
+  return pending;
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") flushGuestFiles(true);
+});
+window.addEventListener("pagehide", () => flushGuestFiles(true));
 
 function installFiles(FS, selected) {
   FS.mkdirTree(ROOT);
@@ -451,7 +490,6 @@ async function start() {
   }
 
   const moduleBase = new URL(MODULE_URL, location.href);
-  let runtime = null;
   const Module = {
     canvas,
     // SDL replaces this. Defining it keeps Emscripten's assertion builds
@@ -463,7 +501,7 @@ async function start() {
     printErr: (text) => log(text, true),
     setStatus: (text) => setStatus(text),
     preRun: [(mod) => {
-      runtime = mod;
+      noteGuestFs(mod.FS);
       installFiles(mod.FS, selected);
     }],
     onRuntimeInitialized: () => {
@@ -477,17 +515,11 @@ async function start() {
     },
     onExit: (code) => {
       log(`xemu exited with code ${code}`);
-      const fs = runtime?.FS;
-      if (!fs) {
-        setStatus(`Exited (${code}).`);
-        return;
-      }
       setStatus(`Exited (${code}). Saving disk...`);
-      persistGuestFiles(fs).then(() => {
-        setStatus(`Exited (${code}). Disk saved in this browser.`);
-      }).catch((err) => {
-        log(`Could not save the disk: ${err}`, true);
-        setStatus(`Exited (${code}). Disk was not saved.`);
+      stopGuestFs().then((ok) => {
+        setStatus(ok
+          ? `Exited (${code}). Disk saved in this browser.`
+          : `Exited (${code}). Disk was not saved.`);
       });
     },
   };
@@ -569,6 +601,7 @@ if (params.get("autostart") === "1") {
       printErr: (text) => log(text, true),
       setStatus: (text) => setStatus(text),
       preRun: [(mod) => {
+        noteGuestFs(mod.FS);
         installFiles(mod.FS, selected);
         mod.FS.writeFile("/xemu/xbox_hdd.qcow2", backing);
         backing = null;
@@ -585,7 +618,12 @@ if (params.get("autostart") === "1") {
       },
       onExit: (code) => {
         log(`xemu exited with code ${code}`);
-        setStatus(`Exited (${code}).`);
+        setStatus(`Exited (${code}). Saving disk...`);
+        stopGuestFs().then((ok) => {
+          setStatus(ok
+            ? `Exited (${code}). Disk saved in this browser.`
+            : `Exited (${code}). Disk was not saved.`);
+        });
       },
     };
     try {
