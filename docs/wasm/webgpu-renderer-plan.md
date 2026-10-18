@@ -38,7 +38,7 @@ Non-goals for this plan:
 | Threading | The device is created and used **only on the PFIFO thread**, like the Vulkan backend | Matches the existing locking model. In the browser, WebGPU objects can't move between workers, so this is mandatory there. |
 | Shader language | **Bring-up only**: reuse the GLSL generator, compile to SPIR-V with the existing glslang code, and feed SPIR-V to Dawn natively. **Then a native WGSL generator** (phase 3), built before the performance work | Gets pixels quickly while keeping the long-term path free of translation layers. The browser only accepts WGSL, and no Tint has to ship inside the WASM binary. |
 | Primitives that need geometry shaders | CPU index rewriting, plus instanced quads for point sprites | WebGPU has no geometry stage, no quads, no fans, and no polygon mode. |
-| Display (native) | Composite on the GPU into memory GL samples. Read the image back only when that share cannot be created | macOS uses an IOSurface, Linux a dma-buf, and Windows a DXGI shared handle. The UI already displays a returned GL texture, so it needs no changes. Without OpenGL, fall back to the VGA read of guest RAM. |
+| Display (native) | When the renderer is WebGPU, present the game composite and the UI into the SDL window with a Dawn surface. The OpenGL readback remains only when that surface was not created | macOS uses a Metal layer (`SDL_WINDOW_METAL`). Windows uses an HWND. Linux uses Wayland or X11. `wgpuSurfacePresent` runs on the PFIFO thread. The IOSurface, dma-buf, and DXGI share remain the path that feeds an OpenGL window. |
 | Display and UI (browser) | **The UI moves to WebGPU.** One device and one canvas (`OffscreenCanvas`), both owned by the PFIFO worker. ImGui draw data is built on the UI thread and handed to the PFIFO thread, which records the UI pass after the game frame | Avoids WebGPU↔WebGL interop, which browsers don't offer, and the game frame never leaves the GPU. WebGPU objects can't cross workers, so the UI pass has to be recorded on the device's thread. |
 | Native CI dependency | **Prebuilt Dawn**, pinned by version and checksum | Building Dawn from source makes CI much slower. A pinned prebuilt keeps builds reproducible. |
 
@@ -142,8 +142,9 @@ hw/xbox/nv2a/pgraph/webgpu/
   draw.c                    PipelineKey, pipeline cache, draw_begin/draw_end, clear
   blit.c                    NV09F image blit
   reports.c                 occlusion queries, report write-back
-  display.c                 PCRTC/PVIDEO composite, presentation (readback or canvas)
+  display.c                 PCRTC/PVIDEO composite, presentation (window, canvas, or readback)
   canvas.c                  browser OffscreenCanvas surface (Emscripten only)
+  window.c                  native SDL window surface (Dawn only)
   debug.c                   labels, debug groups, validation hooks
 hw/xbox/nv2a/pgraph/wgsl/   WGSL translation of the WebGPU-targeted GLSL vertex and pixel shaders
 ```
@@ -161,7 +162,7 @@ How the `PGRAPHRenderer` ops map to the Vulkan implementation they model:
 | `flip_stall` | `command.c` finish + submit |
 | `process_pending` | deferred downloads, display sync and flush, and the WebGPU UI job (`pgraph_vk_process_pending`) |
 | `pre_savevm_*` / `pre_shutdown_*` | download every dirty surface and signal the `QemuEvent` |
-| `get_framebuffer_surface` | native: composite into a GL texture, shared when the platform allows it, otherwise read back. The WebGPU UI does not call this for an accelerated frame. It samples a separate `rgba8unorm` target on the PFIFO device and still reads the combined image back into the window. No color surface, or no OpenGL: download and return `0`. In the browser this returns `0`. The PFIFO thread presents the composite and the UI into the canvas |
+| `get_framebuffer_surface` | Returns `0` when the frame is presented to the browser canvas or the native Dawn window. Otherwise, native builds composite into a GL texture, shared when the platform allows it, and read the image back when that share cannot be created. The WebGPU UI samples a separate `rgba8unorm` target on the PFIFO device. No color surface: download and return `0` |
 | `set/get_surface_scale_factor` | `surface.c` |
 | `get_gpu_properties` | `instance.c` (constant winding, since there is no geometry shader) |
 
@@ -178,7 +179,7 @@ Each phase ends with a demonstrable exit criterion.
 | 2. Feature completeness | Steps 1–7 are done. Step 1 is primitive assembly, with host unit tests in `tests/xbox/prim`. Step 2 is point size and point sprites. Step 3 is textures (border colour, LOD bias, `x8y24` sampling, CPU texture updates, and the format table checked against hardware). Step 4 is the WGSL pack and unpack kernels for 16-bit colour, `Z16` and `Z24S8`. Step 5 copies a compatible render target into a texture on the GPU. Step 6 is the PCRTC/PVIDEO composite. Phase 4 step 5 shares that image with GL; the readback remains the fallback. The NV09F image blit was already in phase 1. Step 7 is ZPASS occlusion queries, the surface scale factor, and the snapshot download. NV2A semaphore release already downloads dirty surfaces before the semaphore is written. The phase 2 exit check (full nxdk_pgraph_tests parity, commercial titles, and a save-state round trip) has not been run. |
 | 3. WGSL generator | Steps 1–3 are done. Step 1 translates draw shaders from the WebGPU-targeted GLSL. Step 2 did not need new shaders: the pack and unpack kernels and the display composite were already WGSL in phase 2. Step 3 creates every shader module with `WGPUShaderSourceWGSL`. The WebGPU backend no longer links glslang and does not request `ShaderSourceSPIRV`. glslang remains for Vulkan. A translation or Tint failure skips that draw. |
 | 4. Performance | Steps 1–5 are done. Step 1 keeps Dawn's blob cache under the xemu base path in `webgpu-pipeline-cache`. A draw waits for its pipeline. Blend color and the stencil reference stay dynamic. Step 2 coalesces surface readbacks into one submit and one map, and reads a surface back only when a draw has made it dirty and a consumer needs RAM. Step 3 caches texture bind groups and keeps a guest-RAM vertex buffer, uploaded in 64 KiB blocks. Attributes WebGPU cannot fetch stay on the CPU packer. Step 4 expands packed texture texels in a compute shader. Step 5 imports the display composite into the GL texture the UI already samples. Frame times have not been compared with Vulkan. |
-| 5. WebGPU UI and browser | Steps 1–4 are done. When `display.renderer` is `WEBGPU`, the UI thread records ImGui and the HUD and posts that work to the PFIFO thread. The PFIFO thread samples the display composite and records the UI pass on the NV2A device. Natively the window present is still a readback of that combined image into OpenGL. Browser steps 1 and 2 are done. Step 1 (`tests/wasm/webgpu-offscreen-spike`) creates an emdawnwebgpu device on a pthread and clears a transferred `OffscreenCanvas`. Step 2 presents on that canvas: `canvas.c` binds `#canvas` on the PFIFO thread, the UI gamma blit writes the PCRTC composite into the current texture, and ImGui follows in the next pass. `get_framebuffer_surface` returns 0. `wgpuSurfacePresent` is not called. In Chromium on macOS arm64 the step 2 page was green with a red corner, and the readback matched. The xemu WASM binary links. In Chromium on macOS arm64 it boots the bundled disc and draws an nxdk pgraph test frame onto the canvas. The menu bar is on that canvas together with the guest frame. Browser step 6 acquires the canvas texture after any suspending wait and submits the gamma blit and ImGui together. See the browser step 6 notes. Browser step 3 is done. A pending `wgpuInstanceWaitAny` suspends through Asyncify. JSPI works in the standalone present test and is not the xemu link, because coroutine fibers still use Asyncify stacks. A finished future is polled and does not suspend. The browser does not map the display image. Browser step 4 is done. Optional features are requested when the adapter has them. `depth32float-stencil8` is no longer required: Z16 falls back to `depth32float`, and Z24S8 falls back to `depth24plus-stencil8` plus an `r32float` depth copy. Stencil readback on that fallback is 0. DXT uses `texture-compression-bc` for 2D and cube textures whose base size is a multiple of 4, and `s3tc_decompress` otherwise. `clip-distances` is detected and left off; clip planes stay a fragment discard. Without `depth-clip-control` the vertex shader clamps clip Z. `XEMU_WEBGPU_DISABLE_FEATURES` forces a fallback. The host test `test-nv2a-webgpu-features` passes. The fallbacks were not booted. Browser step 5 is done. `wasm/serve.py` sends `COOP: same-origin` and `COEP: require-corp`, plus `CORP: cross-origin` as emrun does, and the JavaScript and WebAssembly MIME types. `wasm/index.html` will not start unless the page is a secure context and `crossOriginIsolated`. `python3 wasm/serve.py --check` passes. In Chromium on macOS arm64 the page served by that script was isolated and had `SharedArrayBuffer`. The same page from `python3 -m http.server` was not isolated, and `SharedArrayBuffer` was missing. The xemu module was not started. |
+| 5. WebGPU UI and browser | Steps 1–4 are done. When `display.renderer` is `WEBGPU`, the UI thread records ImGui and the HUD and posts that work to the PFIFO thread. The PFIFO thread samples the display composite and records the UI pass on the NV2A device. The native window present is done. A WebGPU SDL window has no OpenGL context. The PFIFO thread calls `wgpuSurfacePresent` after the gamma blit and ImGui. On macOS arm64 a boot logged `Presenting to the window (2560x1440, bgra8unorm)` with no validation errors. Linux and Windows were not booted. See the native window notes. Browser steps 1 and 2 are done. Step 1 (`tests/wasm/webgpu-offscreen-spike`) creates an emdawnwebgpu device on a pthread and clears a transferred `OffscreenCanvas`. Step 2 presents on that canvas: `canvas.c` binds `#canvas` on the PFIFO thread, the UI gamma blit writes the PCRTC composite into the current texture, and ImGui follows in the next pass. `get_framebuffer_surface` returns 0. `wgpuSurfacePresent` is not called. In Chromium on macOS arm64 the step 2 page was green with a red corner, and the readback matched. The xemu WASM binary links. In Chromium on macOS arm64 it boots the bundled disc and draws an nxdk pgraph test frame onto the canvas. The menu bar is on that canvas together with the guest frame. Browser step 6 acquires the canvas texture after any suspending wait and submits the gamma blit and ImGui together. See the browser step 6 notes. Browser step 3 is done. A pending `wgpuInstanceWaitAny` suspends through Asyncify. JSPI works in the standalone present test and is not the xemu link, because coroutine fibers still use Asyncify stacks. A finished future is polled and does not suspend. The browser does not map the display image. Browser step 4 is done. Optional features are requested when the adapter has them. `depth32float-stencil8` is no longer required: Z16 falls back to `depth32float`, and Z24S8 falls back to `depth24plus-stencil8` plus an `r32float` depth copy. Stencil readback on that fallback is 0. DXT uses `texture-compression-bc` for 2D and cube textures whose base size is a multiple of 4, and `s3tc_decompress` otherwise. `clip-distances` is detected and left off; clip planes stay a fragment discard. Without `depth-clip-control` the vertex shader clamps clip Z. `XEMU_WEBGPU_DISABLE_FEATURES` forces a fallback. The host test `test-nv2a-webgpu-features` passes. The fallbacks were not booted. Browser step 5 is done. `wasm/serve.py` sends `COOP: same-origin` and `COEP: require-corp`, plus `CORP: cross-origin` as emrun does, and the JavaScript and WebAssembly MIME types. `wasm/index.html` will not start unless the page is a secure context and `crossOriginIsolated`. `python3 wasm/serve.py --check` passes. In Chromium on macOS arm64 the page served by that script was isolated and had `SharedArrayBuffer`. The same page from `python3 -m http.server` was not isolated, and `SharedArrayBuffer` was missing. The xemu module was not started. |
 
 Phase 0 notes:
 
@@ -1024,6 +1025,14 @@ Browser renderer work:
    FBO passes, and the uniform-buffer recycle. Record the gamma blit and
    ImGui into one command buffer and submit once.
 
+Native window (the remaining half of the exit):
+
+1. Present the SDL window from the PFIFO thread. The UI thread publishes
+   the platform handle and the pixel size. Dawn creates the surface there:
+   a Metal layer on macOS, an HWND on Windows, and a Wayland or X11 window
+   on Linux. The gamma blit and ImGui are one submit into the current
+   texture, then `wgpuSurfacePresent`. The window is not an OpenGL window.
+
 Phase 5 notes (step 1, ImGui WebGPU backend):
 
 - The imgui wrap enables `webgpu` when Dawn is found. A build directory
@@ -1432,8 +1441,39 @@ Phase 5 notes (browser boot):
   and `UI decal` then failed validation because the canvas texture had
   been destroyed, so the menu was not on the later frame.
 - The step 6 boot above shows the guest frame and the menu bar on the
-  same canvas. Natively the window present is still a readback into
-  OpenGL, so the native half of the phase exit is still open.
+  same canvas.
+
+Phase 5 notes (native window present):
+
+- `window.c` is the native counterpart of `canvas.c`. The UI thread
+  stores the platform handle and, before each frame, the size from
+  `SDL_GetWindowSizeInPixels` and the vsync flag. The PFIFO thread copies
+  that under a mutex and creates the Dawn surface. macOS requests
+  `SDL_WINDOW_METAL` and passes `SDL_Metal_GetLayer`. Windows passes the
+  HWND and module instance. Linux passes the Wayland display and surface
+  when that video driver is current, and otherwise the X11 display and
+  window. Startup exits if none of those handles can be taken.
+- Describe configures the surface and does not call `getCurrentTexture`.
+  Acquire runs after shader init, the font upload, FBO passes, and the
+  uniform recycle, the same order as the canvas. The gamma blit and ImGui
+  are one submit. `wgpuSurfacePresent` follows that submit, and the view
+  is released after it returns. Vsync selects `FIFO` when the surface
+  offers it, and otherwise `Mailbox` or the first listed mode. With vsync
+  off the preference is `Immediate`. The format is the first of
+  `bgra8unorm` and `rgba8unorm` in the surface list. A missing or lost
+  texture reconfigures once.
+- The WebGPU SDL window is created without `SDL_WINDOW_OPENGL`, so this
+  path does not call `SDL_GL_SwapWindow` or upload a readback.
+  `get_framebuffer_surface` returns 0. The OpenGL overlay and the shared
+  GL texture stay in the binary for a WebGPU device that was not given a
+  window target.
+- `qemu-system-i386-unsigned` links in `build/webgpu-native-check` on
+  macOS arm64. A boot of the pgraph comparison disc logged
+  `[WebGPU] Window presents with Metal` and
+  `[WebGPU] Presenting to the window (2560x1440, bgra8unorm)`. That size
+  is the 1280×720 window at the display scale. The log recorded no
+  validation error while the guest ran. The window picture was not
+  compared by eye. Linux and Windows were not booted.
 
 **Exit**: natively, the xemu UI runs entirely on WebGPU with no OpenGL. In
 the browser, an nxdk test XBE renders in Chrome with the game and UI on one

@@ -14,6 +14,14 @@
 #include "hw/xbox/nv2a/nv2a_int.h"
 #include "renderer.h"
 #include "ui/xui/wgpu-ui-pfifo.h"
+#ifndef __EMSCRIPTEN__
+#include "window.h"
+
+_Static_assert(NV2A_WGPU_WINDOW_METAL == WGPU_WINDOW_METAL, "metal kind");
+_Static_assert(NV2A_WGPU_WINDOW_HWND == WGPU_WINDOW_HWND, "hwnd kind");
+_Static_assert(NV2A_WGPU_WINDOW_XLIB == WGPU_WINDOW_XLIB, "xlib kind");
+_Static_assert(NV2A_WGPU_WINDOW_WAYLAND == WGPU_WINDOW_WAYLAND, "wayland kind");
+#endif
 
 static GPUProperties gpu_properties;
 
@@ -29,6 +37,24 @@ static bool ui_canvas_acquire(void *opaque, WGPUTextureView *view, int *width,
 {
     return pgraph_wgpu_display_canvas_acquire(opaque, view, format, width,
                                               height);
+}
+#else
+static bool ui_window_describe(void *opaque, int *width, int *height,
+                               WGPUTextureFormat *format)
+{
+    return pgraph_wgpu_display_window_describe(opaque, format, width, height);
+}
+
+static bool ui_window_acquire(void *opaque, WGPUTextureView *view, int *width,
+                              int *height, WGPUTextureFormat *format)
+{
+    return pgraph_wgpu_display_window_acquire(opaque, view, format, width,
+                                              height);
+}
+
+static bool ui_window_present(void *opaque)
+{
+    return pgraph_wgpu_display_window_present(opaque);
 }
 #endif
 
@@ -107,8 +133,24 @@ static void pgraph_wgpu_process_pending(NV2AState *d)
                                  display_width, display_height, &canvas_ops);
             pgraph_wgpu_display_canvas_release(r);
 #else
-            xemu_wgpu_ui_execute(r->instance, r->device, r->queue, display,
-                                 display_width, display_height, NULL);
+            /*
+             * Same recording order as the canvas. present is
+             * wgpuSurfacePresent, after that submit and before the view
+             * is released.
+             */
+            XemuWgpuCanvasOps window_ops = {
+                .describe = ui_window_describe,
+                .acquire = ui_window_acquire,
+                .present = ui_window_present,
+                .opaque = r,
+            };
+            xemu_wgpu_ui_execute(
+                r->instance, r->device, r->queue, display, display_width,
+                display_height,
+                pgraph_wgpu_display_window_active() ? &window_ops : NULL);
+            if (pgraph_wgpu_display_window_active()) {
+                pgraph_wgpu_display_window_release(r);
+            }
 #endif
             qatomic_set(&r->ui_pending, false);
             qemu_event_set(&r->ui_complete);
@@ -195,6 +237,11 @@ static int pgraph_wgpu_get_framebuffer_surface(NV2AState *d)
     (void)d;
     return 0;
 #else
+    if (pgraph_wgpu_display_window_active()) {
+        /* The window present in process_pending is the framebuffer. */
+        (void)d;
+        return 0;
+    }
     PGRAPHState *pg = &d->pgraph;
     PGRAPHWgpuState *r = pg->wgpu_renderer_state;
 
@@ -276,6 +323,33 @@ static PGRAPHRenderer pgraph_wgpu_renderer = {
 static void __attribute__((constructor)) register_renderer(void)
 {
     pgraph_renderer_register(&pgraph_wgpu_renderer);
+}
+
+void nv2a_wgpu_set_window_target(int kind, void *primary, void *secondary,
+                                 uint64_t x_window, uint32_t width,
+                                 uint32_t height, int vsync)
+{
+#ifdef __EMSCRIPTEN__
+    (void)kind;
+    (void)primary;
+    (void)secondary;
+    (void)x_window;
+    (void)width;
+    (void)height;
+    (void)vsync;
+#else
+    WgpuWindowTarget target = {
+        .kind = kind,
+        .primary = primary,
+        .secondary = secondary,
+        .x_window = x_window,
+        .width = width,
+        .height = height,
+        .vsync = vsync,
+    };
+
+    wgpu_window_set_target(&target);
+#endif
 }
 
 int nv2a_wgpu_display_size(int *width, int *height)

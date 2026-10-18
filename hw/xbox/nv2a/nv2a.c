@@ -217,6 +217,19 @@ bool nv2a_wgpu_submit_ui(void)
     return false;
 }
 
+void nv2a_wgpu_set_window_target(int kind, void *primary, void *secondary,
+                                 uint64_t x_window, uint32_t width,
+                                 uint32_t height, int vsync)
+{
+    (void)kind;
+    (void)primary;
+    (void)secondary;
+    (void)x_window;
+    (void)width;
+    (void)height;
+    (void)vsync;
+}
+
 void nv2a_wgpu_copy_adapter(char *vendor, size_t vendor_size, char *name,
                             size_t name_size, char *description,
                             size_t description_size)

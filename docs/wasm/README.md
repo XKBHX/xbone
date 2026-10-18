@@ -21,9 +21,13 @@ WebAssembly TCG backend. When `display.renderer` is `WEBGPU`, the UI
 thread records Dear ImGui, the logo, controller and memory-unit art, the
 icon, the scaled gamma blit, snapshot thumbnails, and the VGA fallback.
 The PFIFO thread plays that recording on the NV2A Dawn device and samples
-the display composite directly. Natively the combined image is read back
-into the OpenGL window. In the browser the same passes are recorded into
-the page canvas. A Chromium boot of the bundled disc draws an nxdk pgraph
+the display composite directly. Natively that thread presents the combined
+image into the SDL window with `wgpuSurfacePresent`. The window is not an
+OpenGL window. On macOS arm64 a boot logged a `bgra8unorm` present at the
+window's pixel size and recorded no validation errors. See the native
+window notes in
+[webgpu-renderer-plan.md](webgpu-renderer-plan.md#implementation-status).
+In the browser the same passes are recorded into the page canvas. A Chromium boot of the bundled disc draws an nxdk pgraph
 test frame on that canvas, and the menu bar is on the same canvas after
 the pointer moves. The canvas texture is acquired after any suspending
 wait, and the gamma blit and ImGui are one submit. See the phase 5
@@ -66,7 +70,9 @@ What exists:
   when the platform can import it (an IOSurface on macOS, a dma-buf on
   Linux, a DXGI shared handle on Windows). Otherwise it is read back. The
   WebGPU UI does not use that GL texture for an accelerated frame. It
-  samples a separate `rgba8unorm` composite on the NV2A device. Every
+  samples a separate `rgba8unorm` composite on the NV2A device. A WebGPU
+  window presents that image with `wgpuSurfacePresent` and has no OpenGL
+  context. Every
   shader module is WGSL. Draw shaders are translated from the GLSL
   generator. Pack, unpack, clears,
   depth upload, texture upload, and the display composite are written in

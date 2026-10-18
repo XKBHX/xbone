@@ -3,11 +3,13 @@
  *
  * The UI thread builds ImDrawData and HUD commands. It posts a copy to the
  * PFIFO thread, which records the game composite and the UI pass into one
- * image. Natively that image is read back into the OpenGL window. In the
- * browser the gamma blit and ImGui are one submit into the canvas current
- * texture. That texture is acquired after any suspending wait, because the
- * browser expires it when the worker's JavaScript task ends. Texture
- * ids in the draw lists are handles into the PFIFO-side texture table.
+ * image. In the browser, and on a native Dawn surface, the gamma blit and
+ * ImGui are one submit into the current texture. That texture is acquired
+ * after any suspending wait, because the browser expires it when the
+ * worker's JavaScript task ends. Native then calls wgpuSurfacePresent.
+ * Without a surface the image is read back into the OpenGL window.
+ * Texture ids in the draw lists are handles into the PFIFO-side texture
+ * table.
  *
  * Copyright (c) 2026 xemu Project
  *
@@ -128,11 +130,6 @@ static void release_gl_images(void)
 
 static bool create_overlay_gl(void)
 {
-#ifdef __EMSCRIPTEN__
-    /* The browser presents into the canvas. There is no GL context to
-     * compile an overlay into, and epoxy would dlopen libEGL.so.1. */
-    return true;
-#endif
     static const char *vs_src = "#version 150 core\n"
                                 "in vec2 a_pos;\n"
                                 "in vec2 a_uv;\n"
@@ -154,12 +151,24 @@ static bool create_overlay_gl(void)
         -1.f, -1.f, 0.f, 1.f, 1.f, -1.f, 1.f, 1.f,
         -1.f, 1.f,  0.f, 0.f, 1.f, 1.f,  1.f, 0.f,
     };
-    GLuint vs = glCreateShader(GL_VERTEX_SHADER);
-    GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+    GLuint vs;
+    GLuint fs;
     GLint ok = 0;
     char log[512] = { 0 };
     GLsizei len = 0;
 
+#ifdef __EMSCRIPTEN__
+    /* The browser presents into the canvas. There is no GL context to
+     * compile an overlay into, and epoxy would dlopen libEGL.so.1. */
+    return true;
+#else
+    /* A native Dawn surface presents the window. There is no GL context. */
+    if (!SDL_GL_GetCurrentContext()) {
+        return true;
+    }
+#endif
+    vs = glCreateShader(GL_VERTEX_SHADER);
+    fs = glCreateShader(GL_FRAGMENT_SHADER);
     glShaderSource(vs, 1, &vs_src, NULL);
     glCompileShader(vs);
     glGetShaderiv(vs, GL_COMPILE_STATUS, &ok);
@@ -1052,6 +1061,10 @@ extern "C" void xemu_wgpu_ui_execute(WGPUInstance instance, WGPUDevice device,
                 scene = wgpu_helpers_replay_window(display, display_width,
                                                    display_height, canvas_view);
                 record_imgui(scene);
+                if (canvas_view && canvas->present &&
+                    !canvas->present(canvas->opaque)) {
+                    fprintf(stderr, "[WebGPU] Window present failed\n");
+                }
                 wgpu_helpers_set_no_suspend(false);
                 wgpu_helpers_retire();
             } else if (job == XEMU_WGPU_UI_JOB_PNG) {
@@ -1080,7 +1093,8 @@ void xemu_wgpu_ui_render(void)
         free_copied_draw();
         return;
     }
-    if (!g_canvas_presented.load(std::memory_order_acquire) && g_present_ok) {
+    if (!g_canvas_presented.load(std::memory_order_acquire) && g_present_ok &&
+        SDL_GL_GetCurrentContext()) {
         draw_overlay(g_present.data(), g_present_w, g_present_h,
                      g_present_stride, g_present_blend);
     }

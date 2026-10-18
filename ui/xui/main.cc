@@ -373,7 +373,9 @@ void xemu_hud_render()
 
     if (g_vsync != g_config.display.window.vsync) {
         g_vsync = g_config.display.window.vsync;
-        SDL_GL_SetSwapInterval(g_vsync ? 1 : 0);
+        if (SDL_GL_GetCurrentContext()) {
+            SDL_GL_SetSwapInterval(g_vsync ? 1 : 0);
+        }
     }
 
     if (g_screenshot_pending) {

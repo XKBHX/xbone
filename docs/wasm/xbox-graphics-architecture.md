@@ -250,12 +250,13 @@ Backend use:
     the WebGPU UI is active and a colour surface exists, the UI does not
     take the GL texture. The PFIFO thread renders the composite into a
     separate `rgba8unorm` image and samples it in the same device pass as
-    ImGui. The combined image is still read back into the OpenGL window.
-    `get_framebuffer_surface` still shares an IOSurface (macOS), a dma-buf
-    (Linux), or a DXGI handle (Windows) when something asks for the GL
-    texture. Otherwise that path reads the composite back and uploads it
-    with `glTexImage2D`. Without OpenGL it downloads the surface and
-    returns `0`.
+    ImGui. In the browser that pass is the canvas texture. Natively it is
+    the SDL window's Dawn surface, and `wgpuSurfacePresent` shows it. The
+    window is created without an OpenGL context, and
+    `get_framebuffer_surface` returns `0`. The IOSurface, dma-buf, and
+    DXGI share, and the CPU readback into a GL texture, remain for a
+    WebGPU device that was not given a window target. Without a colour
+    surface the UI uploads the VGA pixels.
   - A return value of `0` makes the UI use the **VGA fallback**. With the
     WebGPU UI, those guest pixels are uploaded and sampled on the PFIFO
     device. Otherwise the scanout is a GL texture

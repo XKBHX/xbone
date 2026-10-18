@@ -23,6 +23,10 @@
 #include "canvas.h"
 
 static WgpuCanvas display_canvas;
+#else
+#include "window.h"
+
+static WgpuWindow display_window;
 #endif
 
 #ifdef CONFIG_OPENGL
@@ -1164,6 +1168,9 @@ void pgraph_wgpu_init_display(PGRAPHState *pg)
     disp->drm_fd = -1;
     disp->prime_fd = -1;
 #endif
+#ifndef __EMSCRIPTEN__
+    wgpu_window_init(&display_window);
+#endif
 
     disp->module = pgraph_wgpu_create_wgsl_module(r, "Display", display_wgsl);
 
@@ -1265,6 +1272,78 @@ void pgraph_wgpu_display_canvas_release(PGRAPHWgpuState *r)
     (void)r;
     wgpu_canvas_release(&display_canvas);
 }
+#else
+bool pgraph_wgpu_display_window_active(void)
+{
+    return wgpu_window_active();
+}
+
+bool pgraph_wgpu_display_window_describe(PGRAPHWgpuState *r,
+                                         WGPUTextureFormat *format, int *width,
+                                         int *height)
+{
+    uint32_t w = 0;
+    uint32_t h = 0;
+    WGPUTextureFormat fmt = WGPUTextureFormat_Undefined;
+
+    if (!r->instance || !r->adapter || !r->device ||
+        !wgpu_window_describe(&display_window, r->instance, r->adapter,
+                              r->device, &fmt, &w, &h)) {
+        return false;
+    }
+    if (format) {
+        *format = fmt;
+    }
+    if (width) {
+        *width = (int)w;
+    }
+    if (height) {
+        *height = (int)h;
+    }
+    return true;
+}
+
+bool pgraph_wgpu_display_window_acquire(PGRAPHWgpuState *r,
+                                        WGPUTextureView *view,
+                                        WGPUTextureFormat *format, int *width,
+                                        int *height)
+{
+    uint32_t w = 0;
+    uint32_t h = 0;
+    WGPUTextureFormat fmt = WGPUTextureFormat_Undefined;
+    WGPUTextureView acquired = NULL;
+
+    if (!r->instance || !r->adapter || !r->device ||
+        !wgpu_window_acquire(&display_window, r->instance, r->adapter,
+                             r->device, &fmt, &w, &h, &acquired)) {
+        return false;
+    }
+    if (view) {
+        *view = acquired;
+    }
+    if (format) {
+        *format = fmt;
+    }
+    if (width) {
+        *width = (int)w;
+    }
+    if (height) {
+        *height = (int)h;
+    }
+    return true;
+}
+
+bool pgraph_wgpu_display_window_present(PGRAPHWgpuState *r)
+{
+    (void)r;
+    return wgpu_window_present(&display_window);
+}
+
+void pgraph_wgpu_display_window_release(PGRAPHWgpuState *r)
+{
+    (void)r;
+    wgpu_window_release(&display_window);
+}
 #endif
 
 void pgraph_wgpu_finalize_display(PGRAPHState *pg)
@@ -1274,6 +1353,8 @@ void pgraph_wgpu_finalize_display(PGRAPHState *pg)
 
 #ifdef __EMSCRIPTEN__
     wgpu_canvas_fini(&display_canvas);
+#else
+    wgpu_window_fini(&display_window);
 #endif
     release_bind_group(disp);
 #ifndef __EMSCRIPTEN__

@@ -15,15 +15,18 @@ extern "C" {
 #ifdef CONFIG_WEBGPU
 #include <webgpu/webgpu.h>
 
-/* Browser only. describe configures the canvas and reports its format.
+/* Present target. describe configures the surface and reports its format.
  * acquire calls getCurrentTexture. The UI calls acquire after every
  * suspending wait, records the gamma blit and ImGui into one command
- * buffer, and submits before the next wait. */
+ * buffer, and submits before the next wait. present is NULL in the
+ * browser, where that submit is the present. Natively it is
+ * wgpuSurfacePresent. */
 typedef struct XemuWgpuCanvasOps {
     bool (*describe)(void *opaque, int *width, int *height,
                      WGPUTextureFormat *format);
     bool (*acquire)(void *opaque, WGPUTextureView *view, int *width,
                     int *height, WGPUTextureFormat *format);
+    bool (*present)(void *opaque);
     void *opaque;
 } XemuWgpuCanvasOps;
 
