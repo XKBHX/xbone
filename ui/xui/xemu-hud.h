@@ -24,7 +24,11 @@
 #define XEMU_HUD_H
 
 #include <SDL3/SDL.h>
+#ifdef __EMSCRIPTEN__
+#include <GLES3/gl3.h>
+#else
 #include <epoxy/gl.h>
+#endif
 #include <stdint.h>
 
 #ifdef __cplusplus

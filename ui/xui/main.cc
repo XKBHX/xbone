@@ -18,7 +18,9 @@
 //
 
 #include <SDL3/SDL.h>
+#ifndef __EMSCRIPTEN__
 #include <epoxy/gl.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <math.h>

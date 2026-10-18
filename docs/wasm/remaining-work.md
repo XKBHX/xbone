@@ -41,12 +41,13 @@ defects:
 
 - Some PGRAPH shaders still fail WGSL parsing. The test frame is drawn
   anyway. A shader the translator or Tint rejects is skipped.
-- A ZPASS report fails: the guest reads `0` where the test expects
-  `16448`. Dawn's Metal backend records
-  `MTLVisibilityResultModeBoolean`, so a passing occlusion query comes
-  back as `1`. Dividing that count by `surface_scale` squared is wrong
-  once the scale is greater than 1. The WebGPU spec only requires an
-  occlusion query to tell zero from non-zero.
+- A ZPASS report still cannot return the pixel count `16448`. Dawn's
+  Metal backend records `MTLVisibilityResultModeBoolean`, so a passing
+  occlusion query comes back as `1`. That 0-or-1 result is no longer
+  divided by `surface_scale` squared, so a pass stays `1` when the scale
+  is greater than 1. The WebGPU spec only requires an occlusion query to
+  tell zero from non-zero. A backend that returns a real sample count is
+  still divided, as in Vulkan.
 
 Documented accuracy gaps that are still the behavior of the renderer:
 
@@ -77,16 +78,22 @@ Documented accuracy gaps that are still the behavior of the renderer:
 These sit outside the renderer. They are the phase 5 prerequisites that
 are still open, plus what the current browser link actually does.
 
-- The browser UI still links epoxy, so the link pulls in `libepoxy` and
-  Emscripten's `-lGL`, even though OpenGL is disabled.
-  `OFFSCREENCANVAS_SUPPORT` needs that GL library so Emscripten can
-  transfer `#canvas`. The WebGPU present does not draw with WebGL.
+- The browser link does not include `libepoxy`. OpenGL and gloffscreen
+  are left out of that build. The UI includes `GLES3/gl3.h` there, and
+  desktop-only GL entry points that the WebGPU path does not call are
+  empty inline stubs so the fallback still compiles. Emscripten's
+  `-lGL` stays, because `OFFSCREENCANVAS_SUPPORT` needs it to transfer
+  `#canvas`. The link also sets `-sMAX_WEBGL_VERSION=2` so the GLES3
+  calls that remain in the UI (`glUniform1ui`) resolve. The WebGPU
+  present does not draw with WebGL.
 - The launcher copies a user-supplied MCPX, BIOS, HDD, EEPROM, and disc
   into Emscripten's in-memory filesystem before boot. The same files are
   stored in the origin private file system, so the next visit can start
   without choosing them again. Guest writes to the HDD and EEPROM are
-  copied back when xemu exits. A crash, or closing the tab, drops writes
-  since that exit. The images still reside in memory while xemu runs.
+  copied back when xemu exits. The page also copies them when it is
+  hidden, when the tab closes, and once a minute while xemu is running.
+  A crash can still drop writes made after the last copy. The images
+  still reside in memory while xemu runs.
 - `tests/docker/dockerfiles/emsdk-wasm32-cross.docker` is still emsdk
   3.1.50. The local browser build uses emsdk 6.0.12. Xbox dependencies
   (SDL3, libslirp, and others) are not in that image. `emdawnwebgpu` needs

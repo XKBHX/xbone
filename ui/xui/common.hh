@@ -19,7 +19,51 @@
 #pragma once
 
 #include <SDL3/SDL.h>
+#ifdef __EMSCRIPTEN__
+#include <GLES3/gl3.h>
+/* The WebGPU UI does not call these. The desktop GL fallback in this file
+ * still has to compile, and WebGL has no names for them. */
+#ifndef GL_CLAMP_TO_BORDER
+#define GL_CLAMP_TO_BORDER 0x812D
+#endif
+#ifndef GL_TEXTURE_WIDTH
+#define GL_TEXTURE_WIDTH 0x1000
+#endif
+#ifndef GL_TEXTURE_HEIGHT
+#define GL_TEXTURE_HEIGHT 0x1001
+#endif
+#ifndef GL_PACK_IMAGE_HEIGHT
+#define GL_PACK_IMAGE_HEIGHT 0x806C
+#endif
+static inline void glBindFragDataLocation(GLuint program, GLuint color,
+                                          const GLchar *name)
+{
+    (void)program;
+    (void)color;
+    (void)name;
+}
+static inline void glGetTexLevelParameteriv(GLenum target, GLint level,
+                                            GLenum pname, GLint *params)
+{
+    (void)target;
+    (void)level;
+    (void)pname;
+    if (params) {
+        *params = 0;
+    }
+}
+static inline void glGetTexImage(GLenum target, GLint level, GLenum format,
+                                 GLenum type, void *pixels)
+{
+    (void)target;
+    (void)level;
+    (void)format;
+    (void)type;
+    (void)pixels;
+}
+#else
 #include <epoxy/gl.h>
+#endif
 #include "ui/xemu-settings.h"
 
 #define IMGUI_DEFINE_MATH_OPERATORS

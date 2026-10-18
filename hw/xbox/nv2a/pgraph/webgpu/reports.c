@@ -18,9 +18,11 @@
 /*
  * ZPASS_PIXEL_CNT. WebGPU occlusion queries count samples that pass the
  * depth and stencil tests, but the spec only requires zero versus non-zero.
- * Dawn's native backends generally return the real count. A binary result
- * is left as-is and then divided by the surface scale, which is wrong when
- * the scale is greater than 1. That gap is documented in the plan.
+ * Dawn's Metal backend records MTLVisibilityResultModeBoolean, so a passing
+ * query comes back as 1. A real sample count is divided by the surface
+ * scale squared, as in Vulkan. A result that never exceeds 1 is reported
+ * as 0 or 1, so that division cannot turn a pass into 0. The exact pixel
+ * count is still unavailable from a boolean query.
  *
  * A query has to begin and end inside one render pass. Ending the pass ends
  * the query, and the next counted draw starts another. The sums match a
@@ -40,6 +42,7 @@ void pgraph_wgpu_init_reports(PGRAPHState *pg)
     r->occlusion_collect_pending = false;
     r->occlusion_readback_pending = false;
     r->zpass_pixel_count_result = 0;
+    r->zpass_pixel_count_is_samples = false;
 
     WGPUQuerySetDescriptor query_desc = WGPU_QUERY_SET_DESCRIPTOR_INIT;
     query_desc.label = pgraph_wgpu_str("ZPASS");
@@ -197,6 +200,27 @@ void pgraph_wgpu_occlusion_before_submit(PGRAPHState *pg)
     r->occlusion_readback_pending = true;
 }
 
+static void accumulate_occlusion(PGRAPHWgpuState *r, uint64_t samples)
+{
+    if (samples > 1) {
+        r->zpass_pixel_count_is_samples = true;
+    }
+    r->zpass_pixel_count_result += samples;
+}
+
+/* A boolean query is 0 or 1. Dividing that by the scale squared is 0 once
+ * the scale is greater than 1, which fails a guest that only checks
+ * non-zero. A counted query of a scaled draw is greater than 1. */
+static uint32_t occlusion_report_value(const PGRAPHWgpuState *r, int divisor)
+{
+    uint32_t count = r->zpass_pixel_count_result;
+
+    if (!r->zpass_pixel_count_is_samples && divisor > 1) {
+        return count > 0 ? 1 : 0;
+    }
+    return count / divisor;
+}
+
 static void collect_reports(NV2AState *d, const uint64_t *query_results)
 {
     PGRAPHState *pg = &d->pgraph;
@@ -212,15 +236,16 @@ static void collect_reports(NV2AState *d, const uint64_t *query_results)
         assert(report->query_count <= r->num_queries_in_flight);
 
         while (num_results_counted < (int)report->query_count) {
-            r->zpass_pixel_count_result += query_results[num_results_counted++];
+            accumulate_occlusion(r, query_results[num_results_counted++]);
         }
 
         if (report->clear) {
             r->zpass_pixel_count_result = 0;
+            r->zpass_pixel_count_is_samples = false;
         } else {
-            pgraph_write_zpass_pixel_cnt_report(d, report->parameter,
-                                                r->zpass_pixel_count_result /
-                                                    result_divisor);
+            pgraph_write_zpass_pixel_cnt_report(
+                d, report->parameter,
+                occlusion_report_value(r, result_divisor));
         }
 
         QSIMPLEQ_REMOVE_HEAD(&r->report_queue, entry);
@@ -228,7 +253,7 @@ static void collect_reports(NV2AState *d, const uint64_t *query_results)
     }
 
     while (num_results_counted < (int)r->num_queries_in_flight) {
-        r->zpass_pixel_count_result += query_results[num_results_counted++];
+        accumulate_occlusion(r, query_results[num_results_counted++]);
     }
 
     r->num_queries_in_flight = 0;

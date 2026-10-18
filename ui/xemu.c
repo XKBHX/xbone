@@ -1389,11 +1389,13 @@ static void display_very_early_init(DisplayOptions *o)
     } else {
         m_context = SDL_GL_CreateContext(m_window);
 
+#ifndef __EMSCRIPTEN__
         if (m_context != NULL && epoxy_gl_version() < 40) {
             SDL_GL_MakeCurrent(NULL, NULL);
             SDL_GL_DestroyContext(m_context);
             m_context = NULL;
         }
+#endif
 
         if (m_context == NULL) {
             SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR,
