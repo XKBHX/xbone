@@ -10,6 +10,7 @@ WebAssembly (WASM) and to rendering Xbox graphics through WebGPU.
 | [prior-art-qemu-wasm-vs-jslinux.md](prior-art-qemu-wasm-vs-jslinux.md) | Comparison of QEMU-on-wasm (qemu-wasm-sample) with Fabrice Bellard's JSLinux, and what xemu should take from each. |
 | [cpu-realtime.md](cpu-realtime.md) | How to get the guest x86 CPU to real time under WebAssembly (a wasm TCG backend, JIT improvements, measurement plan). |
 | [tcg-wasm-backend.md](tcg-wasm-backend.md) | Design of xemu's native WebAssembly TCG backend (`tcg/wasm`), which replaces TCI on `wasm32`. |
+| [remaining-work.md](remaining-work.md) | What is left after the renderer phases: exit checks, the browser host, and guest CPU speed. |
 
 These files are plain Markdown and are intentionally not part of the Sphinx
 manual under `docs/` (which only builds `.rst`).
@@ -122,3 +123,5 @@ has no wasm32 archive, so this build uses the C interpreter. Guest CPU
 performance is not yet real time for a 733 MHz Pentium III. The wasm
 backend removes the interpreter, but still compiles one module per TB and
 returns to C between TBs. See [cpu-realtime.md](cpu-realtime.md).
+What is left, including the exit checks that have not been run, is in
+[remaining-work.md](remaining-work.md).
