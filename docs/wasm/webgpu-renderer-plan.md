@@ -1497,10 +1497,15 @@ WebGPU canvas. Performance is reported, not gated, until the CPU work in
 - **Differential shader testing** in phase 3: `tests/xbox/wgsl` checks the
   translator without a device. Before the SPIR-V path was removed, the same
   guest frame was drawn both ways and compared on screen.
-- **Validation.** Run Dawn with backend validation and the WebGPU error
-  scopes (`wgpuDevicePushErrorScope`) enabled in debug builds. A
-  `display.webgpu.validation` config flag would mirror
-  `display.vulkan.validation_layers`.
+- **Validation.** Shader creation already uses a WebGPU validation error
+  scope (`wgpuDevicePushErrorScope`). `display.webgpu.validation` matches
+  `display.vulkan.validation_layers` and is off by default. When it is set,
+  the instance is created with Dawn's backend validation level Full, and
+  the device disables the `skip_validation` toggle. That is Metal shader
+  validation, Vulkan validation layers, or the D3D debug layer. The
+  browser build logs that the browser validates commands and that Dawn
+  backend layers are not available. A boot with the flag on has not been
+  run.
 - **CI.** Download a pinned prebuilt Dawn release (version and SHA-256 kept
   in `scripts/download-dawn.py`, with archives for Linux x86_64 and macOS
   x86_64/arm64). Build the native WebGPU backend against it. Windows builds

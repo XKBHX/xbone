@@ -28,8 +28,12 @@ The testing plan in
 still open as well. Golden-image CI on SwiftShader is described there and
 is not running. Windows CI still needs a MinGW build of Dawn, because the
 official release is MSVC and the Windows build cross-compiles with MinGW.
-A `display.webgpu.validation` config flag, matching
-`display.vulkan.validation_layers`, is proposed and not implemented.
+`display.webgpu.validation` matches `display.vulkan.validation_layers`.
+It is off by default. When it is set, Dawn's backend validation level is
+Full (Metal shader validation, Vulkan validation layers, or the D3D debug
+layer) and the `skip_validation` device toggle is disabled. In the browser
+the flag logs that the browser validates commands and that Dawn backend
+layers are not available. A boot with the flag on has not been run.
 
 A Chromium boot of the bundled disc, on macOS arm64, draws an nxdk pgraph
 test frame and the menu bar on the same canvas. That log also records two

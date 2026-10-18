@@ -233,6 +233,8 @@ display:
     debug_shaders: bool
     assert_on_validation_msg: bool
     preferred_physical_device: string
+  webgpu:
+    validation: bool
   quality:
     surface_scale:
       type: integer
