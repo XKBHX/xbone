@@ -119,13 +119,14 @@ wasm32 backend instead):
   `wasm-opt` on the result. Make sure link-time optimization flags reach the
   final link. The v4 series includes a meson fix for exactly this.
 - **Keep the vCPU worker dedicated.** `-sPROXY_TO_PTHREAD` is already set.
-  Check that the PFIFO, APU and voice-worker threads land on their own
-  workers. Use a fixed Emscripten pthread pool (`-sPTHREAD_POOL_SIZE`) so
-  thread creation doesn't block, and keep the BQL hold times short on the
-  vCPU path.
-- **Lighter defaults for the browser build.** Leave `audio.use_dsp`
-  off, cap `audio.vp.num_workers` to the available cores, and keep
-  `display.quality.surface_scale = 1`.
+  The emulator link pre-creates `(navigator.hardwareConcurrency||4)+8`
+  workers, and `c_thread_count` / `cpp_thread_count` are 0 so Meson does
+  not append a pool of 4 after that. Check that the PFIFO, APU and
+  voice-worker threads land on their own workers, and keep the BQL hold
+  times short on the vCPU path.
+- **Lighter defaults for the browser build.** The launcher writes
+  `audio.use_dsp` false, `audio.vp.num_workers` at one per core (capped
+  at 16), and `display.quality.surface_scale = 1`.
 
 ### 2.4 Research directions (large, uncertain)
 

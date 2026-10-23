@@ -298,6 +298,13 @@ function tomlString(s) {
   return JSON.stringify(s);
 }
 
+// One voice worker per core, and never more than the APU's own cap.
+function voiceWorkers() {
+  const cores = navigator.hardwareConcurrency;
+  const n = Number.isFinite(cores) && cores > 0 ? cores : 4;
+  return Math.min(n, 16);
+}
+
 function buildConfig(paths) {
   return [
     "[general]",
@@ -309,6 +316,15 @@ function buildConfig(paths) {
     "",
     "[display]",
     `renderer = ${tomlString($("renderer").value)}`,
+    "",
+    "[display.quality]",
+    "surface_scale = 1",
+    "",
+    "[audio]",
+    "use_dsp = false",
+    "",
+    "[audio.vp]",
+    `num_workers = ${voiceWorkers()}`,
     "",
     "[sys]",
     `mem_limit = ${tomlString($("mem").value)}`,

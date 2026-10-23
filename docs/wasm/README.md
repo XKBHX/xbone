@@ -49,6 +49,7 @@ What exists:
 - `configs/meson/emscripten.txt` sets link flags: `-pthread`,
   `-sASYNCIFY=1`, `-sASYNCIFY_STACK_SIZE=65536`, `-sPROXY_TO_PTHREAD=1`,
   `-sOFFSCREENCANVAS_SUPPORT=1`, `-sASYNCIFY_IMPORTS=ffi_call_js,emwgpuWaitAny`,
+  `-sPTHREAD_POOL_SIZE=(navigator.hardwareConcurrency||4)+8`,
   `-sTOTAL_MEMORY=2GB`, `-sWASM_BIGINT`, `-sEXPORT_ES6=1`, and others.
   `OFFSCREENCANVAS_SUPPORT` pulls in the GL library so Emscripten can
   transfer `#canvas`. The WebGPU present does not draw with WebGL.

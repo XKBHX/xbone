@@ -33,7 +33,10 @@ It is off by default. When it is set, Dawn's backend validation level is
 Full (Metal shader validation, Vulkan validation layers, or the D3D debug
 layer) and the `skip_validation` device toggle is disabled. In the browser
 the flag logs that the browser validates commands and that Dawn backend
-layers are not available. A boot with the flag on has not been run.
+layers are not available. On macOS arm64, a boot of the pgraph comparison
+disc with the flag set logged `Backend validation enabled` and
+`Presenting to the window (2560x1920, bgra8unorm)`, and recorded no
+validation error. The window picture was not compared by eye.
 
 A Chromium boot of the bundled disc, on macOS arm64, draws an nxdk pgraph
 test frame and the menu bar on the same canvas. That log also records two
@@ -139,11 +142,14 @@ time. The order below is the one in
    Asyncify with `ASYNCIFY_ONLY` or `ASYNCIFY_REMOVE`, limited to the
    coroutine and blocking-wait paths. JSPI was timed on the present test
    and was not faster on those short waits. The xemu link stays on
-   Asyncify because coroutine fibers use Asyncify stacks. Then build with
-   `-O3` and LTO, run `wasm-opt`, keep a fixed Emscripten pthread pool,
-   and use lighter browser defaults: `audio.use_dsp` off,
-   `audio.vp.num_workers` capped to the available cores, and
-   `display.quality.surface_scale` at 1.
+   Asyncify because coroutine fibers use Asyncify stacks. That narrowing
+   has not been done. The release build is still `-O2` without LTO.
+   Emscripten runs `wasm-opt` as part of an `-O2` link. The emulator link
+   pre-creates `(navigator.hardwareConcurrency||4)+8` workers.
+   `c_thread_count` and `cpp_thread_count` are 0 so Meson does not append
+   its own pool of 4 after that expression. The launcher writes
+   `display.quality.surface_scale` 1, `audio.use_dsp` false, and
+   `audio.vp.num_workers` at one per core, capped at 16.
 4. **Ops the backend does not emit.** TCG expands these generically:
    `extract2`, `divs2` and `divu2`, 64-bit `mulu2`, `muls2`, `muluh` and
    `mulsh`, 128-bit guest memory ops, 64-bit guest addresses, and xemu's
