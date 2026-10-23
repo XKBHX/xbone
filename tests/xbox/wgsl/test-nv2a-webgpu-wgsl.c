@@ -105,7 +105,16 @@ static void test_vertex(void)
     assert_has(wgsl, "@group(0) @binding(0) var<uniform> u_blk: VshUniforms");
     assert_has(wgsl, "u_blk.c[3]");
     assert_has(wgsl, "v2.xyz");
-    assert_has(wgsl, "oPos.xyzw = _MOV(_in_vec4f(v0)).xyzw");
+    assert_has(wgsl, "_MOV(_in_vec4f(v0)).xyzw");
+    assert_has(wgsl,
+               "oPos = vec4f(_swz_new.x, _swz_new.y, _swz_new.z, _swz_new.w)");
+    assert_has(wgsl, "let _swz_new = (oPos.xyz + v2.xyz)");
+    assert_has(wgsl,
+               "oPos = vec4f(_swz_new.x, _swz_new.y, _swz_new.z, oPos.w)");
+    assert_has(wgsl, "oPos = vec4f(oPos.x, oPos.y, oPos.z, _swz_new)");
+    assert_lacks(wgsl, "oPos.xyzw =");
+    assert_lacks(wgsl, "oPos.xyz +=");
+    assert_lacks(wgsl, "oPos.w =");
     assert_has(wgsl, "fn _in(");
     assert_has(wgsl, "fn _in_vec4f(");
     assert_has(wgsl, "0xDF800000u");
