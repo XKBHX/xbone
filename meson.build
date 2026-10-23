@@ -861,6 +861,16 @@ coref = []
 iokit = []
 pvg = not_found
 emulator_link_args = []
+# Pre-create one worker per core plus the vCPU, PFIFO, APU, and a few
+# others. configs/meson/emscripten.txt sets c_thread_count and
+# cpp_thread_count to 0 so Meson does not append its own pool of 4
+# after this flag. Emscripten keeps the last -sPTHREAD_POOL_SIZE.
+emscripten_pthread_pool = []
+if host_os == 'emscripten'
+  emscripten_pthread_pool = [declare_dependency(link_args: [
+    '-sPTHREAD_POOL_SIZE=(navigator.hardwareConcurrency||4)+8',
+  ])]
+endif
 midl = not_found
 widl = not_found
 pathcch = not_found
@@ -4705,7 +4715,7 @@ foreach target : target_dirs
     emulator = executable(exe_name, exe['sources'],
                install: true,
                c_args: c_args,
-               dependencies: arch_deps + exe['dependencies'],
+               dependencies: arch_deps + exe['dependencies'] + emscripten_pthread_pool,
                objects: lib.extract_all_objects(recursive: true),
                link_depends: [block_syms, qemu_syms],
                link_args: link_args,
