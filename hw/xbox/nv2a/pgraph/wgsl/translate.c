@@ -73,6 +73,12 @@ typedef struct Expr {
     int skind;
     char *tex;
     char *smp;
+    /* Set when text is a swizzle of base. Chrome rejects stores through a
+     * swizzle, so an assignment rebuilds the whole vector. */
+    bool swizzle;
+    int base_ty;
+    char sw[5];
+    char *base;
 } Expr;
 
 typedef struct Macro {
@@ -175,6 +181,7 @@ static void e_clear(Expr *e)
     g_free(e->text);
     g_free(e->tex);
     g_free(e->smp);
+    g_free(e->base);
     memset(e, 0, sizeof(*e));
 }
 
@@ -1677,15 +1684,24 @@ static Expr parse_primary(Tr *t)
         bool array = e.array;
         bool samp = e.is_sampler;
         int skind = e.skind;
+        bool swizzle = e.swizzle;
+        int base_ty = e.base_ty;
+        char sw[5];
+        memcpy(sw, e.sw, sizeof(sw));
         char *tex = e.tex ? g_strdup(e.tex) : NULL;
         char *smp = e.smp ? g_strdup(e.smp) : NULL;
+        char *base = e.base ? g_strdup(e.base) : NULL;
         e_clear(&e);
         Expr out = e_take(ty, text);
         out.array = array;
         out.is_sampler = samp;
         out.skind = skind;
+        out.swizzle = swizzle;
+        out.base_ty = base_ty;
+        memcpy(out.sw, sw, sizeof(out.sw));
         out.tex = tex;
         out.smp = smp;
+        out.base = base;
         return out;
     }
     if (g_ascii_isdigit(c) || (c == '.' && g_ascii_isdigit(t->s[t->i + 1]))) {
@@ -1725,10 +1741,33 @@ static Expr parse_postfix(Tr *t)
                 g_free(field);
                 break;
             }
-            char *text = g_strdup_printf("%s.%s", e.text, sw);
+            char composed[5];
+            char *base;
+            int base_ty;
+            if (e.swizzle && e.base) {
+                base = g_strdup(e.base);
+                base_ty = e.base_ty;
+                size_t n = strlen(sw);
+                for (size_t i = 0; i < n; i++) {
+                    int comp = sw[i] - 'x';
+                    composed[i] = (comp >= 0 && comp < (int)strlen(e.sw)) ?
+                                      e.sw[comp] :
+                                      'x';
+                }
+                composed[n] = 0;
+            } else {
+                base = g_strdup(e.text ? e.text : "");
+                base_ty = e.ty;
+                g_strlcpy(composed, sw, sizeof(composed));
+            }
+            char *text = g_strdup_printf("%s.%s", base, composed);
             int ty = swizzle_ty(e.ty, sw);
             e_clear(&e);
             e = e_take(ty, text);
+            e.swizzle = width_of(base_ty) > 1;
+            e.base_ty = base_ty;
+            memcpy(e.sw, composed, sizeof(e.sw));
+            e.base = base;
             g_free(field);
             continue;
         }
@@ -2121,6 +2160,45 @@ static void parse_for(Tr *t)
     pop_scope(t);
 }
 
+/* Chrome rejects `v.xyz =` and `v.xy *=`. Write the whole vector instead.
+ * A repeated swizzle component keeps the last write. */
+static void emit_swizzle_store(Tr *t, const Expr *lhs, const char *op,
+                               const Expr *rhs)
+{
+    int width = width_of(lhs->base_ty);
+    int n = strlen(lhs->sw);
+    if (!lhs->base || n < 1 || n > 4 || width < n || width > 4) {
+        emit(t, "%s %s %s;\n", lhs->text, op, rhs->text);
+        return;
+    }
+    emit(t, "{\n");
+    if (!strcmp(op, "=")) {
+        emit(t, "let _swz_new = %s;\n", rhs->text);
+    } else {
+        emit(t, "let _swz_new = (%s %c %s);\n", lhs->text, op[0], rhs->text);
+    }
+    emit(t, "%s = %s(", lhs->base, ty_wgsl(lhs->base_ty));
+    for (int i = 0; i < width; i++) {
+        int src = -1;
+        if (i) {
+            emit(t, ", ");
+        }
+        for (int j = 0; j < n; j++) {
+            if (lhs->sw[j] == "xyzw"[i]) {
+                src = j;
+            }
+        }
+        if (src < 0) {
+            emit(t, "%s.%c", lhs->base, "xyzw"[i]);
+        } else if (n == 1) {
+            emit(t, "_swz_new");
+        } else {
+            emit(t, "_swz_new.%c", "xyzw"[src]);
+        }
+    }
+    emit(t, ");\n}\n");
+}
+
 static void parse_stmt(Tr *t)
 {
     if (t->failed) {
@@ -2218,7 +2296,11 @@ static void parse_stmt(Tr *t)
             }
         }
         expect(t, ';');
-        emit(t, "%s %s %s;\n", e.text, op, rhs.text);
+        if (e.swizzle) {
+            emit_swizzle_store(t, &e, op, &rhs);
+        } else {
+            emit(t, "%s %s %s;\n", e.text, op, rhs.text);
+        }
         e_clear(&rhs);
     } else {
         expect(t, ';');

@@ -1420,8 +1420,11 @@ Phase 5 notes (browser step 6, canvas texture lifetime):
   click on the canvas shows the menu bar on that same frame. The menu
   still hides after 5 seconds without input. The log records
   `Presenting to the canvas (2560x1920)` and does not record a destroyed
-  canvas texture on the `ImGui` or `UI decal` submits. Some PGRAPH
-  shaders still fail WGSL parsing, and the test frame is drawn anyway.
+  canvas texture on the `ImGui` or `UI decal` submits. Chromium rejected
+  PGRAPH shaders that stored into a vector swizzle. The translator now
+  writes the whole vector, covered by `tests/xbox/wgsl`. A Chromium boot
+  of that translator has not been run. A shader that still fails to parse
+  is skipped, and the test frame is drawn anyway.
 
 Phase 5 notes (browser boot):
 

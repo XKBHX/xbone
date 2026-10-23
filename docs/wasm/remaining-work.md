@@ -39,8 +39,13 @@ A Chromium boot of the bundled disc, on macOS arm64, draws an nxdk pgraph
 test frame and the menu bar on the same canvas. That log also records two
 defects:
 
-- Some PGRAPH shaders still fail WGSL parsing. The test frame is drawn
-  anyway. A shader the translator or Tint rejects is skipped.
+- Chromium rejects a store into a vector swizzle (`fragColor.xyz =`,
+  `oPos.xy *=`, `oPos.xyzw =`). Dawn's Tint accepts those stores, so a
+  native boot did not show this. The translator now writes the whole
+  vector. `tests/xbox/wgsl` covers those three assignments. A Chromium
+  boot of this translator has not been run. A shader the translator or
+  the browser still rejects is skipped, and the test frame is drawn
+  anyway.
 - A ZPASS report still cannot return the pixel count `16448`. Dawn's
   Metal backend records `MTLVisibilityResultModeBoolean`, so a passing
   occlusion query comes back as `1`. That 0-or-1 result is no longer
